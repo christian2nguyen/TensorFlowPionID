@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+artifacts/
+pion_scores.csv
+annie_pion_scores.csv
+annie_ring_event.png
+annie_ring_scores.csv
+model_a_images/
