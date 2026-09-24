@@ -251,13 +251,14 @@ inputs. Training also writes `annie_ring_pion.history.csv`, containing the
 per-epoch training and validation metrics used to identify the best stopping
 point.
 
-By default, Model A uses the same reconstructed-event selection as
-`Fit_indivdiualPMT_Gaussian_Convolution.cpp`:
+By default, Model A uses the reconstructed-event selection from
+`Fit_indivdiualPMT_Gaussian_Convolution.cpp`, with the charge-balance threshold
+intentionally loosened from `0.30` to `0.20` for training:
 
 ```text
 sel_CC0pi_wc
 && sel_promptMuonTotalPE_pmt_filtered
-&& clusterChargeBalance_tankcluster_pmt_filtered > 0.30
+&& clusterChargeBalance_tankcluster_pmt_filtered > 0.20
 && sel_clusterHist_tankcluster_branch
 && clusterHits_tankcluster > 55
 && match_found

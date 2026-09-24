@@ -33,8 +33,11 @@ BDT_CUT_BRANCHES = [
     "NoVeto",
 ]
 
-# Event selection used to derive the per-PMT response calibration in
-# Fit_indivdiualPMT_Gaussian_Convolution.cpp (kRecoSelectionExpression).
+# Event selection based on the one used to derive the per-PMT response
+# calibration in Fit_indivdiualPMT_Gaussian_Convolution.cpp.  The charge-balance
+# threshold is intentionally loosened from 0.30 to 0.20 for model training.
+FIT_INDIVIDUAL_PMT_CHARGE_BALANCE_MIN = 0.20
+
 FIT_INDIVIDUAL_PMT_CUT_BRANCHES = [
     "sel_CC0pi_wc",
     "sel_promptMuonTotalPE_pmt_filtered",
@@ -46,7 +49,8 @@ FIT_INDIVIDUAL_PMT_CUT_BRANCHES = [
 
 FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION = (
     "sel_CC0pi_wc && sel_promptMuonTotalPE_pmt_filtered && "
-    "clusterChargeBalance_tankcluster_pmt_filtered > 0.30 && "
+    f"clusterChargeBalance_tankcluster_pmt_filtered > "
+    f"{FIT_INDIVIDUAL_PMT_CHARGE_BALANCE_MIN:.2f} && "
     "sel_clusterHist_tankcluster_branch && clusterHits_tankcluster > 55 && "
     "match_found"
 )
@@ -134,13 +138,13 @@ def build_bdt_selection(arrays) -> np.ndarray:
 
 
 def build_fit_individual_pmt_selection(arrays) -> np.ndarray:
-    """Match Fit_indivdiualPMT_Gaussian_Convolution.cpp event cuts."""
+    """Apply the fit-derived event cuts with the looser training threshold."""
     return (
         (_to_numpy(arrays["sel_CC0pi_wc"]) != 0)
         & (_to_numpy(arrays["sel_promptMuonTotalPE_pmt_filtered"]) != 0)
         & (
             _to_numpy(arrays["clusterChargeBalance_tankcluster_pmt_filtered"])
-            > 0.30
+            > FIT_INDIVIDUAL_PMT_CHARGE_BALANCE_MIN
         )
         & (_to_numpy(arrays["sel_clusterHist_tankcluster_branch"]) != 0)
         & (_to_numpy(arrays["clusterHits_tankcluster"]) > 55)
