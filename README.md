@@ -249,7 +249,13 @@ This command is **Model A**, the PE-only, dual-view baseline. Each view uses
 exactly two channels (`hitPE` and `hitPE_tankcluster`) and no charge or timing
 inputs. Training also writes `annie_ring_pion.history.csv`, containing the
 per-epoch training and validation metrics used to identify the best stopping
-point.
+point. Evaluation includes count and true-class-normalized confusion matrices
+at the requested `--threshold`, plus corresponding matrices at a fixed pion
+score threshold of `0.20` (`score < 0.20` is classified as no pion).
+It also writes an efficiency/purity threshold scan as both PNG and CSV. Here,
+pion efficiency is `TP/(TP+FN)`, pion purity is `TP/(TP+FP)`, and the third
+curve is their product. The plot highlights score `0.20` and the configured
+`--threshold`.
 
 By default, Model A uses the reconstructed-event selection from
 `Fit_indivdiualPMT_Gaussian_Convolution.cpp`, with the charge-balance threshold

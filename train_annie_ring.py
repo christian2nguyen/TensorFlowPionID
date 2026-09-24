@@ -353,37 +353,164 @@ def plot_efficiency_rejection_vs_threshold(
     return path.name
 
 
+def pion_operating_point(
+    y_true: np.ndarray, scores: np.ndarray, threshold: float
+) -> Dict[str, object]:
+    """Return pion efficiency and purity for score >= threshold."""
+    predictions = scores >= threshold
+    truth_pion = y_true.astype(bool)
+    true_positive = int(np.count_nonzero(predictions & truth_pion))
+    false_positive = int(np.count_nonzero(predictions & ~truth_pion))
+    false_negative = int(np.count_nonzero(~predictions & truth_pion))
+    true_negative = int(np.count_nonzero(~predictions & ~truth_pion))
+    efficiency_denominator = true_positive + false_negative
+    purity_denominator = true_positive + false_positive
+    efficiency = (
+        true_positive / efficiency_denominator
+        if efficiency_denominator
+        else 0.0
+    )
+    purity = true_positive / purity_denominator if purity_denominator else 0.0
+    return {
+        "threshold": float(threshold),
+        "efficiency": float(efficiency),
+        "purity": float(purity),
+        "efficiency_x_purity": float(efficiency * purity),
+        "true_positive": true_positive,
+        "false_positive": false_positive,
+        "false_negative": false_negative,
+        "true_negative": true_negative,
+    }
+
+
+def plot_efficiency_purity_vs_threshold(
+    y_test: np.ndarray,
+    test_scores: np.ndarray,
+    output: Path,
+    evaluation_threshold: float,
+) -> Tuple[str, str, Dict[str, object], Dict[str, object]]:
+    """Plot and tabulate pion efficiency, purity, and their product."""
+    scan_thresholds = np.unique(
+        np.concatenate(
+            [
+                np.linspace(0.0, 1.0, 201),
+                np.array([evaluation_threshold, 0.20], dtype=np.float64),
+            ]
+        )
+    )
+    operating_points = [
+        pion_operating_point(y_test, test_scores, value)
+        for value in scan_thresholds
+    ]
+    efficiencies = np.array(
+        [point["efficiency"] for point in operating_points], dtype=np.float64
+    )
+    purities = np.array(
+        [point["purity"] for point in operating_points], dtype=np.float64
+    )
+    products = np.array(
+        [point["efficiency_x_purity"] for point in operating_points],
+        dtype=np.float64,
+    )
+
+    csv_path = output.with_suffix(".efficiency_purity_vs_threshold.csv")
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(operating_points[0]))
+        writer.writeheader()
+        writer.writerows(operating_points)
+
+    fig, axis = plt.subplots(figsize=(7, 5))
+    axis.plot(scan_thresholds, efficiencies, label="Pion efficiency")
+    axis.plot(scan_thresholds, purities, label="Pion purity")
+    axis.plot(scan_thresholds, products, label="Efficiency x purity")
+    axis.axvline(0.20, color="black", linestyle="--", alpha=0.7, label="score = 0.20")
+    if not np.isclose(evaluation_threshold, 0.20):
+        axis.axvline(
+            evaluation_threshold,
+            color="gray",
+            linestyle=":",
+            alpha=0.8,
+            label=f"configured score = {evaluation_threshold:.2f}",
+        )
+    axis.set_xlim(0.0, 1.0)
+    axis.set_ylim(0.0, 1.05)
+    axis.set_xlabel("Minimum pion_score (pion if score >= threshold)")
+    axis.set_ylabel("Fraction")
+    axis.set_title("Pion efficiency and purity vs. score threshold")
+    axis.legend()
+    fig.tight_layout()
+    plot_path = output.with_suffix(".efficiency_purity_vs_threshold.png")
+    fig.savefig(plot_path, dpi=160)
+    plt.close(fig)
+
+    return (
+        plot_path.name,
+        csv_path.name,
+        pion_operating_point(y_test, test_scores, evaluation_threshold),
+        pion_operating_point(y_test, test_scores, 0.20),
+    )
+
+
 def plot_confusion_matrix(
-    y_test: np.ndarray, test_scores: np.ndarray, threshold: float, output: Path
+    y_test: np.ndarray,
+    test_scores: np.ndarray,
+    threshold: float,
+    output: Path,
+    *,
+    normalize: bool = False,
+    filename_suffix: str = ".confusion_matrix.png",
 ) -> str:
     predictions = (test_scores >= threshold).astype(int)
-    matrix = confusion_matrix(y_test, predictions, labels=[0, 1])
+    counts = confusion_matrix(y_test, predictions, labels=[0, 1])
+    if normalize:
+        denominators = counts.sum(axis=1, keepdims=True)
+        matrix = np.divide(
+            counts,
+            denominators,
+            out=np.zeros_like(counts, dtype=np.float64),
+            where=denominators != 0,
+        )
+    else:
+        matrix = counts
     fig, axis = plt.subplots(figsize=(5, 5))
-    image = axis.imshow(matrix, cmap="Blues")
+    image = axis.imshow(
+        matrix,
+        cmap="Blues",
+        vmin=0.0,
+        vmax=1.0 if normalize else None,
+    )
     axis.set_xticks([0, 1])
     axis.set_xticklabels(["no pion", "pion"])
     axis.set_yticks([0, 1])
     axis.set_yticklabels(["no pion", "pion"])
     axis.set_xlabel("Predicted")
     axis.set_ylabel("Truth")
-    axis.set_title(f"Confusion matrix (threshold = {threshold:.2f})")
+    title = (
+        "True-class-normalized confusion matrix"
+        if normalize
+        else "Confusion matrix"
+    )
+    axis.set_title(f"{title}\n(pion if score >= {threshold:.2f})")
     for row in range(2):
         for column in range(2):
+            value = matrix[row, column]
+            label = f"{value:.1%}" if normalize else str(int(value))
             axis.text(
                 column,
                 row,
-                str(matrix[row, column]),
+                label,
                 ha="center",
                 va="center",
                 color=(
                     "white"
-                    if matrix[row, column] > matrix.max() / 2
+                    if value > (0.5 if normalize else matrix.max() / 2)
                     else "black"
                 ),
             )
-    fig.colorbar(image, ax=axis, label="Event count")
+    colorbar_label = "Fraction within truth class" if normalize else "Event count"
+    fig.colorbar(image, ax=axis, label=colorbar_label)
     fig.tight_layout()
-    path = output.with_suffix(".confusion_matrix.png")
+    path = output.with_suffix(filename_suffix)
     fig.savefig(path, dpi=160)
     plt.close(fig)
     return path.name
@@ -745,6 +872,14 @@ def evaluate_and_plot(
     pr_name, average_precision = plot_precision_recall(
         y_test, test_scores, output
     )
+    (
+        efficiency_purity_plot,
+        efficiency_purity_csv,
+        configured_operating_point,
+        threshold_0p20_operating_point,
+    ) = plot_efficiency_purity_vs_threshold(
+        y_test, test_scores, output, threshold
+    )
     return {
         "test_predictions": predictions_path.name,
         "roc_curve": roc_name,
@@ -759,8 +894,35 @@ def evaluate_and_plot(
                 fpr, tpr, thresholds, output
             )
         ),
+        "efficiency_purity_vs_threshold": efficiency_purity_plot,
+        "efficiency_purity_vs_threshold_csv": efficiency_purity_csv,
+        "pion_metrics_at_configured_threshold": configured_operating_point,
+        "pion_metrics_at_threshold_0p20": threshold_0p20_operating_point,
         "confusion_matrix": plot_confusion_matrix(
             y_test, test_scores, threshold, output
+        ),
+        "confusion_matrix_normalized": plot_confusion_matrix(
+            y_test,
+            test_scores,
+            threshold,
+            output,
+            normalize=True,
+            filename_suffix=".confusion_matrix_normalized.png",
+        ),
+        "confusion_matrix_threshold_0p20": plot_confusion_matrix(
+            y_test,
+            test_scores,
+            0.20,
+            output,
+            filename_suffix=".confusion_matrix_threshold_0p20.png",
+        ),
+        "confusion_matrix_threshold_0p20_normalized": plot_confusion_matrix(
+            y_test,
+            test_scores,
+            0.20,
+            output,
+            normalize=True,
+            filename_suffix=".confusion_matrix_threshold_0p20_normalized.png",
         ),
         "calibration_curve": plot_calibration_curve(y_test, test_scores, output),
         "training_curves": plot_training_curves(history_path, output),
@@ -984,6 +1146,18 @@ def main() -> None:
     for name, value in evaluation_files.items():
         if isinstance(value, str) and value:
             print(f"  {name}: {value}")
+    print("Pion operating points (score >= threshold):")
+    for name in (
+        "pion_metrics_at_configured_threshold",
+        "pion_metrics_at_threshold_0p20",
+    ):
+        point = evaluation_files[name]
+        print(
+            f"  threshold={point['threshold']:.2f}: "
+            f"efficiency={point['efficiency']:.5f}, "
+            f"purity={point['purity']:.5f}, "
+            f"efficiency*purity={point['efficiency_x_purity']:.5f}"
+        )
 
 
 if __name__ == "__main__":
