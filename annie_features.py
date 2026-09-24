@@ -35,8 +35,8 @@ BDT_CUT_BRANCHES = [
 
 # Event selection based on the one used to derive the per-PMT response
 # calibration in Fit_indivdiualPMT_Gaussian_Convolution.cpp.  The charge-balance
-# threshold is intentionally loosened from 0.30 to 0.20 for model training.
-FIT_INDIVIDUAL_PMT_CHARGE_BALANCE_MIN = 0.20
+# threshold is intentionally loosened from 0.30 to 0.25 for model training.
+FIT_INDIVIDUAL_PMT_CHARGE_BALANCE_MIN = 0.25
 
 FIT_INDIVIDUAL_PMT_CUT_BRANCHES = [
     "sel_CC0pi_wc",

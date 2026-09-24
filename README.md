@@ -259,12 +259,12 @@ curve is their product. The plot highlights score `0.20` and the configured
 
 By default, Model A uses the reconstructed-event selection from
 `Fit_indivdiualPMT_Gaussian_Convolution.cpp`, with the charge-balance threshold
-intentionally loosened from `0.30` to `0.20` for training:
+intentionally loosened from `0.30` to `0.25` for training:
 
 ```text
 sel_CC0pi_wc
 && sel_promptMuonTotalPE_pmt_filtered
-&& clusterChargeBalance_tankcluster_pmt_filtered > 0.20
+&& clusterChargeBalance_tankcluster_pmt_filtered > 0.25
 && sel_clusterHist_tankcluster_branch
 && clusterHits_tankcluster > 55
 && match_found
