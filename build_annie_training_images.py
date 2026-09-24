@@ -11,7 +11,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from annie_features import FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION
-from annie_pmt_response import PMT_RESPONSE_CHOICES, PMTResponse
+from annie_pmt_response import (
+    PMT_RESPONSE_CHOICES,
+    PMT_TUNE_VARIANT_CHOICES,
+    PMTResponse,
+)
 from annie_ring_images import (
     DEFAULT_GEOMETRY,
     DEFAULT_DETECTOR_HEIGHT,
@@ -46,6 +50,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="all-PMT calibration ROOT file required for --pmt-response tuned",
     )
+    parser.add_argument(
+        "--pmt-tune-variant",
+        choices=PMT_TUNE_VARIANT_CHOICES,
+        default="final",
+        help="response: Gain/Delta/Sigma only; final: also replay residual hits",
+    )
     parser.add_argument("--charged-only", action="store_true")
     parser.add_argument(
         "--no-event-cuts",
@@ -71,7 +81,7 @@ def save_preview(
     truth_pion_counts: np.ndarray,
     source_name: str,
     entry: int,
-    response_mode: str,
+    response_description: str,
     output: Path,
 ) -> None:
     # The first and last image columns are periodic copies used only by the CNN.
@@ -112,7 +122,7 @@ def save_preview(
     fig.suptitle(
         f"{source_name}, entry {entry} — truth: {truth}; "
         f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}; "
-        f"PMT response: {response_mode}"
+        f"PMT response: {response_description}"
     )
     fig.tight_layout()
     fig.savefig(output, dpi=160)
@@ -135,7 +145,12 @@ def main() -> None:
     if args.preview_count:
         preview_dir.mkdir(parents=True, exist_ok=True)
     geometry = PMTGeometry(args.geometry, args.pmt_mask)
-    response = PMTResponse(args.pmt_response, args.pmt_response_calibration)
+    response = PMTResponse(
+        args.pmt_response,
+        args.pmt_response_calibration,
+        args.pmt_tune_variant,
+    )
+    print(response.describe())
     source_indices = {path: index for index, path in enumerate(args.root_files)}
     shards = []
     total_read = 0
@@ -221,7 +236,10 @@ def main() -> None:
                 pion_counts,
                 Path(chunk["path"]).name,
                 int(entry),
-                response.mode,
+                (
+                    f"{response.mode}; variant={response.tune_variant}; "
+                    f"payload={response.payload_format}"
+                ),
                 preview_path,
             )
             preview_written += 1
@@ -246,12 +264,19 @@ def main() -> None:
         "pmt_mask": args.pmt_mask,
         "excluded_pmt_ids": geometry.excluded_ids,
         "pmt_response": response.mode,
-        "pmt_response_scope": "hitPE_and_hitPE_tankcluster",
+        "pmt_response_scope": (
+            "separate_branch_kind_0_hitPE_and_branch_kind_1_tankcluster"
+            if response.payload_format == "final_pmt_tuning_parameters"
+            else "shared_legacy_map_hitPE_and_hitPE_tankcluster"
+        ),
         "pmt_response_calibration_file": (
             response.calibration_path.name if response.calibration_path else None
         ),
         "pmt_response_calibration_sha256": response.calibration_sha256,
-        "pmt_response_mapped_pmt_count": len(response.maps),
+        "pmt_response_payload_format": response.payload_format,
+        "pmt_tune_variant": response.tune_variant,
+        "pmt_tune_random_stream_version": response.random_stream_version,
+        "pmt_response_mapped_pmt_count": response.mapped_pmt_count,
         "hitpe_branch": args.hitpe_branch,
         "hitid_branch": args.hitid_branch,
         "tankcluster_branch": tank_branch,

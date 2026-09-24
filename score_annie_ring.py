@@ -10,7 +10,11 @@ from pathlib import Path
 
 import tensorflow as tf
 
-from annie_pmt_response import PMT_RESPONSE_CHOICES, PMTResponse
+from annie_pmt_response import (
+    PMT_RESPONSE_CHOICES,
+    PMT_TUNE_VARIANT_CHOICES,
+    PMTResponse,
+)
 from annie_ring_images import DEFAULT_GEOMETRY, PMTGeometry, iterate_ring_images
 
 
@@ -33,6 +37,11 @@ def main() -> None:
         type=Path,
         help="all-PMT calibration ROOT file required for --pmt-response tuned",
     )
+    parser.add_argument(
+        "--pmt-tune-variant",
+        choices=PMT_TUNE_VARIANT_CHOICES,
+        help="Defaults to the tune variant stored with the trained model",
+    )
     args = parser.parse_args()
 
     metadata = json.loads(args.model.with_suffix(".json").read_text(encoding="utf-8"))
@@ -40,11 +49,22 @@ def main() -> None:
         raise ValueError("The supplied model is not an ANNIE ring CNN")
     model = tf.keras.models.load_model(args.model)
     geometry = PMTGeometry(args.geometry, metadata.get("pmt_mask", "bdt"))
-    response = PMTResponse(args.pmt_response, args.pmt_response_calibration)
+    tune_variant = args.pmt_tune_variant or metadata.get("pmt_tune_variant", "final")
+    response = PMTResponse(
+        args.pmt_response,
+        args.pmt_response_calibration,
+        tune_variant,
+    )
+    print(response.describe())
     training_response = metadata.get("training_pmt_response", "raw")
     if response.mode == "tuned" and training_response != "tuned":
         raise ValueError(
             "Cannot apply tuned PMT response to a model trained with raw response"
+        )
+    training_variant = metadata.get("pmt_tune_variant", "final")
+    if response.mode == "tuned" and tune_variant != training_variant:
+        raise ValueError(
+            "The scoring tune variant differs from the variant used for training"
         )
     expected_hash = metadata.get("pmt_response_calibration_sha256")
     if response.mode == "tuned" and expected_hash and (
@@ -80,6 +100,8 @@ def main() -> None:
                 "source_file",
                 "tree_entry",
                 "pmt_response",
+                "pmt_tune_variant",
+                "pmt_response_payload_format",
                 "pion_score",
                 "pion_prediction",
             ],
@@ -120,6 +142,8 @@ def main() -> None:
                         "source_file": str(chunk["path"]),
                         "tree_entry": int(entry),
                         "pmt_response": response.mode,
+                        "pmt_tune_variant": response.tune_variant,
+                        "pmt_response_payload_format": response.payload_format,
                         "pion_score": float(score),
                         "pion_prediction": int(score >= threshold),
                     }

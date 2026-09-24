@@ -23,7 +23,11 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
-from annie_pmt_response import PMT_RESPONSE_CHOICES, PMTResponse
+from annie_pmt_response import (
+    PMT_RESPONSE_CHOICES,
+    PMT_TUNE_VARIANT_CHOICES,
+    PMTResponse,
+)
 from annie_features import FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION
 from annie_ring_images import (
     DEFAULT_GEOMETRY,
@@ -76,6 +80,12 @@ def parse_args() -> argparse.Namespace:
         "--pmt-response-calibration",
         type=Path,
         help="all-PMT calibration ROOT file required for --pmt-response tuned",
+    )
+    parser.add_argument(
+        "--pmt-tune-variant",
+        choices=PMT_TUNE_VARIANT_CHOICES,
+        default="final",
+        help="response: Gain/Delta/Sigma only; final: also replay residual hits",
     )
     parser.add_argument("--charged-only", action="store_true")
     parser.add_argument(
@@ -130,7 +140,12 @@ def load_data(
     PMTResponse,
 ]:
     geometry = PMTGeometry(args.geometry, args.pmt_mask)
-    response = PMTResponse(args.pmt_response, args.pmt_response_calibration)
+    response = PMTResponse(
+        args.pmt_response,
+        args.pmt_response_calibration,
+        args.pmt_tune_variant,
+    )
+    print(response.describe())
     image_chunks: List[np.ndarray] = []
     detector_chunks: List[np.ndarray] = []
     label_chunks: List[np.ndarray] = []
@@ -900,18 +915,26 @@ def main() -> None:
         "model_type": "annie_pion_ring_cnn",
         "model_variant": "A_PE_dual_view",
         "tensorflow_version": tf.__version__,
+        "training_sources": [str(path) for path in args.root_files],
         "tree": args.tree,
         "geometry_file": args.geometry.name,
         "pmt_mask": args.pmt_mask,
         "pmt_count_included": geometry.included_count,
         "excluded_pmt_ids": geometry.excluded_ids,
         "training_pmt_response": response.mode,
-        "pmt_response_scope": "hitPE_and_hitPE_tankcluster",
+        "pmt_response_scope": (
+            "separate_branch_kind_0_hitPE_and_branch_kind_1_tankcluster"
+            if response.payload_format == "final_pmt_tuning_parameters"
+            else "shared_legacy_map_hitPE_and_hitPE_tankcluster"
+        ),
         "pmt_response_calibration_file": (
             response.calibration_path.name if response.calibration_path else None
         ),
         "pmt_response_calibration_sha256": response.calibration_sha256,
-        "pmt_response_mapped_pmt_count": len(response.maps),
+        "pmt_response_payload_format": response.payload_format,
+        "pmt_tune_variant": response.tune_variant,
+        "pmt_tune_random_stream_version": response.random_stream_version,
+        "pmt_response_mapped_pmt_count": response.mapped_pmt_count,
         "hitpe_branch": args.hitpe_branch,
         "hitid_branch": args.hitid_branch,
         "tankcluster_branch": tank_branch,

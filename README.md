@@ -161,6 +161,47 @@ python view_annie_ring.py simulation.root 42 \
   --output ring_event_42.png
 ```
 
+To see exactly what the per-PMT response tune changes for one simulated event,
+draw raw PE, tuned PE, and their difference with a shared color scale:
+
+```bash
+python view_annie_ring.py simulation.root 42 \
+  --compare-pmt-response \
+  --pmt-response-calibration individual_pmt_fit_output.root \
+  --pmt-tune-variant final \
+  --output ring_event_42_raw_vs_tuned.png
+```
+
+The four figure rows cover angular full-event PE, angular tank-cluster PE,
+unfolded full-event PE, and unfolded tank-cluster PE. Each row reports raw and
+tuned total accumulated PE and their percentage change. Simulation pion truth
+counts are added to the title when those branches are present.
+
+To automatically find and draw ten truth-pion events that pass the same event
+selection used for training:
+
+```bash
+python view_annie_ring.py simulation.root -n 10 \
+  --output-dir pion_event_plots
+```
+
+To search the ordered MC list used for training and compare raw and tuned PE:
+
+```bash
+python view_annie_ring.py \
+  --file-list training_mc_files.txt \
+  -n 10 \
+  --compare-pmt-response \
+  --pmt-response-calibration individual_pmt_fit_output.root \
+  --pmt-tune-variant response \
+  --output-dir pion_response_comparisons
+```
+
+By default, π⁺, π⁻, or π⁰ makes an event a pion event. Add `--charged-only` to
+require π⁺ or π⁻, or `--no-event-cuts` to scan truth pions without the training
+selection. The output directory also contains `pion_plots.csv` with each PNG's
+source file, local tree entry, chain entry, and three truth-pion counts.
+
 To build a complete, inspectable Model A image dataset from one or more ROOT
 files, use:
 
@@ -268,32 +309,49 @@ python view_annie_ring.py simulation.root 42 --pmt-mask all
 
 ### Optional per-PMT response tuning
 
-Model A uses raw PE by default. For simulated events, the tank-cluster channel
-can instead use the per-PMT MC-to-beam-on quantile maps produced by
-`Test_PMT_HitPE_Hybrid_Tune.cpp` in all-PMT mode:
+Model A uses raw PE by default. For simulated events it can replay the
+`final_pmt_tuning_parameters` payload written by
+`Fit_indivdiualPMT_Gaussian_Convolution.cpp`. This payload has independent
+regional parameters for full-event `hitPE` (`branch_kind=0`) and tank-cluster
+`hitPE` (`branch_kind=1`):
 
 ```bash
 python build_annie_training_images.py simulation.root \
   --pmt-response tuned \
-  --pmt-response-calibration PMT_hitPE_hybrid_test_allPMTs.root \
+  --pmt-response-calibration individual_pmt_fit_output.root \
+  --pmt-tune-variant final \
   --output-dir model_a_tuned_images
 
 python train_annie_ring.py simulation.root \
   --pmt-response tuned \
-  --pmt-response-calibration PMT_hitPE_hybrid_test_allPMTs.root \
+  --pmt-response-calibration individual_pmt_fit_output.root \
+  --pmt-tune-variant final \
   --output artifacts/annie_ring_pion_tuned.h5
 ```
 
-The tune is applied to both `hitPE` and `hitPE_tankcluster`, in both image
-projections. Mapping uses piecewise-linear interpolation in the inclusive
-0--350 PE interval. PMTs without a usable response map and hits outside that
-interval are unchanged. The calibration filename, SHA-256 digest, and number
-of loaded PMT maps are saved in the manifest/model metadata.
+For each hit, Python selects the saved row matching PMT ID, branch kind, and
+original PE region `[region_min, region_max_exclusive)`, then applies
+`Gain*PE + Delta + Normal(0,Sigma)`. The deterministic Gaussian stream matches
+the C++ `ordered-field-mixing-v2` implementation. `--pmt-tune-variant response`
+stops there. The default, `--pmt-tune-variant final`, additionally replays the
+stored residual hit weights as deterministic hit rejection or duplication;
+the weights are never multiplied into PE as scale factors. In the image,
+duplicated hits are equivalent to accumulating the transformed PE repeatedly
+in the same PMT pixel.
 
-The maps were derived using selected tank-cluster hits. Applying them to the
-full-event `hitPE` collection assumes that the same PMT response mismatch also
-applies outside that selected cluster. Compare raw and tuned full-event PE
-distributions on independent data before treating this extension as nominal.
+For multiple ROOT inputs, the deterministic random stream uses the files in
+the exact command-line or `--file-list` order, matching their TChain entry
+ordering. Keep that order fixed when reproducing the same tuned simulation.
+
+Older calibration ROOT files containing
+`PMT_Calibrations/PMT_<id>/response_map` TGraphs remain supported. Those files
+have one shared per-PMT map rather than separate full/tank payloads, and the
+tune variant has no effect on them.
+
+The calibration filename, SHA-256 digest, payload format, tune variant, random
+stream version, source-file list, and mapped PMT count are saved in the
+manifest/model metadata. This permits the exact calibration file to be checked
+when tuned simulation is scored later.
 
 The response map transforms **simulation toward detector data**. Therefore:
 
@@ -306,13 +364,15 @@ For example, scoring tuned simulation requires:
 ```bash
 python score_annie_ring.py artifacts/annie_ring_pion_tuned.h5 simulation.root \
   --pmt-response tuned \
-  --pmt-response-calibration PMT_hitPE_hybrid_test_allPMTs.root \
+  --pmt-response-calibration individual_pmt_fit_output.root \
   --output tuned_mc_scores.csv
 ```
 
-Do not use the residual-fit hit weights as PE corrections here; the STV study
-identifies those as diagnostic histogram importance weights rather than a
-validated detector-response transformation.
+Scoring defaults to the tune variant stored with the model and rejects a
+different calibration checksum or tune variant. Detector data remains raw.
+The stored six event-selection branches are not recomputed after tuning, so
+this replay changes the CNN images but does not model migration across those
+preselection boundaries.
 
 This is an event-level, weakly supervised ring classifier: the available truth
 labels say whether a pion is present, but do not give a ring center or radius.
