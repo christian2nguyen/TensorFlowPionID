@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import uproot
 
 from annie_features import resolve_tankcluster_branch
+from annie_pmt_response import PMT_RESPONSE_CHOICES, PMTResponse
 from annie_ring_images import (
     DEFAULT_GEOMETRY,
     DEFAULT_DETECTOR_HEIGHT,
@@ -39,6 +40,14 @@ def main() -> None:
     parser.add_argument("--image-width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--detector-height", type=int, default=DEFAULT_DETECTOR_HEIGHT)
     parser.add_argument("--detector-width", type=int, default=DEFAULT_DETECTOR_WIDTH)
+    parser.add_argument(
+        "--pmt-response", choices=PMT_RESPONSE_CHOICES, default="raw"
+    )
+    parser.add_argument(
+        "--pmt-response-calibration",
+        type=Path,
+        help="all-PMT calibration ROOT file required for --pmt-response tuned",
+    )
     parser.add_argument("--output", type=Path, default=Path("annie_ring_event.png"))
     args = parser.parse_args()
 
@@ -61,6 +70,7 @@ def main() -> None:
     if len(arrays) != 1:
         raise ValueError(f"Entry {args.entry} does not exist")
     geometry = PMTGeometry(args.geometry, args.pmt_mask)
+    response = PMTResponse(args.pmt_response, args.pmt_response_calibration)
     images, valid = build_ring_images(
         arrays,
         geometry,
@@ -70,6 +80,7 @@ def main() -> None:
         args.tankcluster_id_branch,
         args.image_height,
         args.image_width,
+        response,
     )
     detector_images, detector_valid = build_unfolded_detector_images(
         arrays,
@@ -80,6 +91,7 @@ def main() -> None:
         args.tankcluster_id_branch,
         args.detector_height,
         args.detector_width,
+        response,
     )
     if not (valid[0] and detector_valid[0]):
         raise ValueError("PE and detector-ID vectors are not aligned for this event")
@@ -112,7 +124,10 @@ def main() -> None:
         axis.set_xlabel("Unfolded detector x-bin")
         fig.colorbar(plotted, ax=axis, label="log(1 + accumulated PE)")
     axes[1, 0].set_ylabel("Bottom / barrel / top layout")
-    fig.suptitle(f"{args.root_file.name}, {args.tree} entry {args.entry}")
+    fig.suptitle(
+        f"{args.root_file.name}, {args.tree} entry {args.entry} "
+        f"— PMT response: {response.mode}"
+    )
     fig.tight_layout()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=160)

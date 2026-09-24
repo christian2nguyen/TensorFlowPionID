@@ -10,6 +10,7 @@ from pathlib import Path
 
 import tensorflow as tf
 
+from annie_pmt_response import PMT_RESPONSE_CHOICES, PMTResponse
 from annie_ring_images import DEFAULT_GEOMETRY, PMTGeometry, iterate_ring_images
 
 
@@ -21,6 +22,17 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("annie_ring_scores.csv"))
     parser.add_argument("--chunk-size", default="100 MB")
     parser.add_argument("--all-events", action="store_true")
+    parser.add_argument(
+        "--pmt-response",
+        choices=PMT_RESPONSE_CHOICES,
+        default="raw",
+        help="Use raw for detector data; tuned may be used for simulated input",
+    )
+    parser.add_argument(
+        "--pmt-response-calibration",
+        type=Path,
+        help="all-PMT calibration ROOT file required for --pmt-response tuned",
+    )
     args = parser.parse_args()
 
     metadata = json.loads(args.model.with_suffix(".json").read_text(encoding="utf-8"))
@@ -28,12 +40,49 @@ def main() -> None:
         raise ValueError("The supplied model is not an ANNIE ring CNN")
     model = tf.keras.models.load_model(args.model)
     geometry = PMTGeometry(args.geometry, metadata.get("pmt_mask", "bdt"))
+    response = PMTResponse(args.pmt_response, args.pmt_response_calibration)
+    training_response = metadata.get("training_pmt_response", "raw")
+    if response.mode == "tuned" and training_response != "tuned":
+        raise ValueError(
+            "Cannot apply tuned PMT response to a model trained with raw response"
+        )
+    expected_hash = metadata.get("pmt_response_calibration_sha256")
+    if response.mode == "tuned" and expected_hash and (
+        response.calibration_sha256 != expected_hash
+    ):
+        raise ValueError(
+            "The scoring calibration differs from the calibration used for training"
+        )
+    if training_response == "tuned" and response.mode == "raw":
+        print(
+            "Using raw PMT response with a tuned-MC model; this is intended for "
+            "detector data. Use --pmt-response tuned for simulated input."
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     written = 0
+    if args.all_events:
+        event_selection = "none"
+    elif "event_selection" in metadata:
+        event_selection = (
+            str(metadata["event_selection"])
+            if metadata.get("event_selection_applied", True)
+            else "none"
+        )
+    else:
+        # Models written before event_selection metadata used the old BDT cuts.
+        event_selection = (
+            "legacy_bdt" if metadata.get("bdt_preselection", False) else "none"
+        )
     with args.output.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["source_file", "tree_entry", "pion_score", "pion_prediction"],
+            fieldnames=[
+                "source_file",
+                "tree_entry",
+                "pmt_response",
+                "pion_score",
+                "pion_prediction",
+            ],
         )
         writer.writeheader()
         for chunk in iterate_ring_images(
@@ -48,7 +97,8 @@ def main() -> None:
             int(metadata["image_width"]),
             int(metadata["detector_height"]),
             int(metadata["detector_width"]),
-            bool(metadata["bdt_preselection"]) and not args.all_events,
+            response,
+            event_selection,
             False,
             False,
             args.chunk_size,
@@ -69,6 +119,7 @@ def main() -> None:
                     {
                         "source_file": str(chunk["path"]),
                         "tree_entry": int(entry),
+                        "pmt_response": response.mode,
                         "pion_score": float(score),
                         "pion_prediction": int(score >= threshold),
                     }

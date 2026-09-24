@@ -176,8 +176,13 @@ contains compressed `shard_*.npz` tensors, a `manifest.json` describing every
 branch and preprocessing choice, and PNG files under `previews/`. Each shard
 contains `angular_images` with shape `(N, 16, 34, 2)` and `detector_images` with
 shape `(N, 48, 32, 2)`. The two channels are full-event PE and tank-cluster PE.
-The angular width contains 32 physical bins plus two periodic edge-copy columns.
-Preview creation targets an even split between pion and no-pion truth labels.
+The shards also retain `truth_pion_counts` in the order `truePiPlusCher`,
+`truePiMinusCher`, `truePi0`, plus source and tree-entry provenance. The angular
+width contains 32 physical bins plus two periodic edge-copy columns. Preview
+creation targets an even split between pion and no-pion truth labels, and each
+preview title reports the three pion counts. When an odd number is requested,
+the extra preview is assigned to the pion class; therefore `--preview-count 1`
+requests one pion example.
 
 Train and score the ring model:
 
@@ -190,18 +195,58 @@ python score_annie_ring.py artifacts/annie_ring_pion.h5 sample.root \
   --output annie_ring_scores.csv
 ```
 
+For long input lists, place one ROOT path per line in a text file. Blank lines
+and comments beginning with `#` are ignored; relative paths are resolved from
+the list file's directory:
+
+```bash
+python train_annie_ring.py --file-list simulation_files.txt \
+  --output artifacts/annie_ring_pion.h5
+```
+
 This command is **Model A**, the PE-only, dual-view baseline. Each view uses
 exactly two channels (`hitPE` and `hitPE_tankcluster`) and no charge or timing
 inputs. Training also writes `annie_ring_pion.history.csv`, containing the
 per-epoch training and validation metrics used to identify the best stopping
 point.
 
+By default, Model A uses the same reconstructed-event selection as
+`Fit_indivdiualPMT_Gaussian_Convolution.cpp`:
+
+```text
+sel_CC0pi_wc
+&& sel_promptMuonTotalPE_pmt_filtered
+&& clusterChargeBalance_tankcluster_pmt_filtered > 0.30
+&& sel_clusterHist_tankcluster_branch
+&& clusterHits_tankcluster > 55
+&& match_found
+```
+
+Use `--no-event-cuts` to disable this selection. The older spelling
+`--no-bdt-cuts` remains available as an alias. Image construction also follows
+the calibration feature ranges: full-event PE must be finite and non-negative,
+while tank-cluster PE must be finite and in the half-open range `[0, 350)` PE.
+
+Training also writes test-set diagnostic products beside the model: ROC and
+precision-recall curves, score distributions, efficiency/background rejection
+versus threshold, a confusion matrix, a probability-calibration curve, training
+history plots, the most confident misclassified events, Grad-CAM examples for
+both image towers, and `annie_ring_pion.pion_examples.png`. The pion-example
+figure shows the full-event and tank-cluster PE channels in both angular and
+unfolded views for high-scoring held-out pion events; each row includes the
+source file, tree entry, model score, and the truth counts for pi+, pi-, and pi0.
+The test CSV contains the same truth counts together with each event's source,
+entry, binary truth label, and pion score. Their filenames and summary metrics
+are stored under `evaluation` in the model JSON.
+
 The unfolded tensor deliberately does not copy presentation-only objects from
 the C++ event display. It excludes PMT number labels, titles, axes, legends,
 event/run text, charge-histogram insets, detector outlines, region labels, and
 truth information. Only the PMT position and accumulated PE are retained. This
 prevents the network from learning annotations or other information that will
-not be available when scoring data.
+not be available when scoring data. Pion truth counts are used only for labels,
+metadata, and diagnostic figure annotations; they are never image channels or
+model inputs.
 
 The angular map uses 16 × 32 bins by default and duplicates the periodic
 azimuth edge before convolution. PE is accumulated per angular bin and
@@ -220,6 +265,54 @@ python train_annie_ring.py simulation.root --pmt-mask on
 # Include every geometry PMT (diagnostics only)
 python view_annie_ring.py simulation.root 42 --pmt-mask all
 ```
+
+### Optional per-PMT response tuning
+
+Model A uses raw PE by default. For simulated events, the tank-cluster channel
+can instead use the per-PMT MC-to-beam-on quantile maps produced by
+`Test_PMT_HitPE_Hybrid_Tune.cpp` in all-PMT mode:
+
+```bash
+python build_annie_training_images.py simulation.root \
+  --pmt-response tuned \
+  --pmt-response-calibration PMT_hitPE_hybrid_test_allPMTs.root \
+  --output-dir model_a_tuned_images
+
+python train_annie_ring.py simulation.root \
+  --pmt-response tuned \
+  --pmt-response-calibration PMT_hitPE_hybrid_test_allPMTs.root \
+  --output artifacts/annie_ring_pion_tuned.h5
+```
+
+The tune is applied to both `hitPE` and `hitPE_tankcluster`, in both image
+projections. Mapping uses piecewise-linear interpolation in the inclusive
+0--350 PE interval. PMTs without a usable response map and hits outside that
+interval are unchanged. The calibration filename, SHA-256 digest, and number
+of loaded PMT maps are saved in the manifest/model metadata.
+
+The maps were derived using selected tank-cluster hits. Applying them to the
+full-event `hitPE` collection assumes that the same PMT response mismatch also
+applies outside that selected cluster. Compare raw and tuned full-event PE
+distributions on independent data before treating this extension as nominal.
+
+The response map transforms **simulation toward detector data**. Therefore:
+
+- train or preview simulated input with `--pmt-response tuned`;
+- score simulated input with the same tuned calibration; and
+- score beam-on detector data with the default `--pmt-response raw`.
+
+For example, scoring tuned simulation requires:
+
+```bash
+python score_annie_ring.py artifacts/annie_ring_pion_tuned.h5 simulation.root \
+  --pmt-response tuned \
+  --pmt-response-calibration PMT_hitPE_hybrid_test_allPMTs.root \
+  --output tuned_mc_scores.csv
+```
+
+Do not use the residual-fit hit weights as PE corrections here; the STV study
+identifies those as diagnostic histogram importance weights rather than a
+validated detector-response transformation.
 
 This is an event-level, weakly supervised ring classifier: the available truth
 labels say whether a pion is present, but do not give a ring center or radius.

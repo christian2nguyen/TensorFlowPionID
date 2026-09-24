@@ -33,6 +33,24 @@ BDT_CUT_BRANCHES = [
     "NoVeto",
 ]
 
+# Event selection used to derive the per-PMT response calibration in
+# Fit_indivdiualPMT_Gaussian_Convolution.cpp (kRecoSelectionExpression).
+FIT_INDIVIDUAL_PMT_CUT_BRANCHES = [
+    "sel_CC0pi_wc",
+    "sel_promptMuonTotalPE_pmt_filtered",
+    "clusterChargeBalance_tankcluster_pmt_filtered",
+    "sel_clusterHist_tankcluster_branch",
+    "clusterHits_tankcluster",
+    "match_found",
+]
+
+FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION = (
+    "sel_CC0pi_wc && sel_promptMuonTotalPE_pmt_filtered && "
+    "clusterChargeBalance_tankcluster_pmt_filtered > 0.30 && "
+    "sel_clusterHist_tankcluster_branch && clusterHits_tankcluster > 55 && "
+    "match_found"
+)
+
 TANKCLUSTER_ALIASES = [
     "hitPE_tankcluster",
     "hitPE_tankclusters",
@@ -115,6 +133,21 @@ def build_bdt_selection(arrays) -> np.ndarray:
     )
 
 
+def build_fit_individual_pmt_selection(arrays) -> np.ndarray:
+    """Match Fit_indivdiualPMT_Gaussian_Convolution.cpp event cuts."""
+    return (
+        (_to_numpy(arrays["sel_CC0pi_wc"]) != 0)
+        & (_to_numpy(arrays["sel_promptMuonTotalPE_pmt_filtered"]) != 0)
+        & (
+            _to_numpy(arrays["clusterChargeBalance_tankcluster_pmt_filtered"])
+            > 0.30
+        )
+        & (_to_numpy(arrays["sel_clusterHist_tankcluster_branch"]) != 0)
+        & (_to_numpy(arrays["clusterHits_tankcluster"]) > 55)
+        & (_to_numpy(arrays["match_found"]) != 0)
+    )
+
+
 def iterate_root_features(
     paths: List[Path],
     tree_name: str,
@@ -171,4 +204,3 @@ def iterate_root_features(
                     result["labels"] = build_pion_labels(arrays, charged_only)[selected]
                 yield result
                 entry_offset += n_entries
-

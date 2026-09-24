@@ -10,6 +10,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from annie_features import FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION
+from annie_pmt_response import PMT_RESPONSE_CHOICES, PMTResponse
 from annie_ring_images import (
     DEFAULT_GEOMETRY,
     DEFAULT_DETECTOR_HEIGHT,
@@ -36,8 +38,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--detector-height", type=int, default=DEFAULT_DETECTOR_HEIGHT)
     parser.add_argument("--detector-width", type=int, default=DEFAULT_DETECTOR_WIDTH)
+    parser.add_argument(
+        "--pmt-response", choices=PMT_RESPONSE_CHOICES, default="raw"
+    )
+    parser.add_argument(
+        "--pmt-response-calibration",
+        type=Path,
+        help="all-PMT calibration ROOT file required for --pmt-response tuned",
+    )
     parser.add_argument("--charged-only", action="store_true")
-    parser.add_argument("--no-bdt-cuts", action="store_true")
+    parser.add_argument(
+        "--no-event-cuts",
+        "--no-bdt-cuts",
+        dest="no_event_cuts",
+        action="store_true",
+        help=(
+            "Disable the Fit_indivdiualPMT_Gaussian_Convolution event selection; "
+            "--no-bdt-cuts is retained as a compatibility alias"
+        ),
+    )
     parser.add_argument("--chunk-size", default="100 MB")
     parser.add_argument("--max-events", type=int)
     parser.add_argument("--preview-count", type=int, default=12)
@@ -49,8 +68,10 @@ def save_preview(
     angular_image: np.ndarray,
     detector_image: np.ndarray,
     label: int,
+    truth_pion_counts: np.ndarray,
     source_name: str,
     entry: int,
+    response_mode: str,
     output: Path,
 ) -> None:
     # The first and last image columns are periodic copies used only by the CNN.
@@ -87,7 +108,12 @@ def save_preview(
         fig.colorbar(plotted, ax=axis, label="log(1 + accumulated PE)")
     axes[1, 0].set_ylabel("Bottom / barrel / top layout")
     truth = "pion" if label == 1 else "no pion"
-    fig.suptitle(f"{source_name}, entry {entry} — truth: {truth}")
+    pi_plus, pi_minus, pi_zero = (int(value) for value in truth_pion_counts)
+    fig.suptitle(
+        f"{source_name}, entry {entry} — truth: {truth}; "
+        f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}; "
+        f"PMT response: {response_mode}"
+    )
     fig.tight_layout()
     fig.savefig(output, dpi=160)
     plt.close(fig)
@@ -109,6 +135,7 @@ def main() -> None:
     if args.preview_count:
         preview_dir.mkdir(parents=True, exist_ok=True)
     geometry = PMTGeometry(args.geometry, args.pmt_mask)
+    response = PMTResponse(args.pmt_response, args.pmt_response_calibration)
     source_indices = {path: index for index, path in enumerate(args.root_files)}
     shards = []
     total_read = 0
@@ -118,7 +145,7 @@ def main() -> None:
     preview_written = 0
     preview_class_counts = np.zeros(2, dtype=np.int64)
     preview_class_limits = np.array(
-        [(args.preview_count + 1) // 2, args.preview_count // 2], dtype=np.int64
+        [args.preview_count // 2, (args.preview_count + 1) // 2], dtype=np.int64
     )
     tank_branch = ""
 
@@ -134,7 +161,8 @@ def main() -> None:
         args.image_width,
         args.detector_height,
         args.detector_width,
-        not args.no_bdt_cuts,
+        response,
+        not args.no_event_cuts,
         True,
         args.charged_only,
         args.chunk_size,
@@ -144,6 +172,7 @@ def main() -> None:
         images = chunk["images"]
         detector_images = chunk["detector_images"]
         labels = chunk["labels"].astype(np.int8)
+        truth_pion_counts = chunk["truth_pion_counts"].astype(np.int32)
         entries = chunk["entries"]
         if args.max_events is not None:
             remaining = args.max_events - total_selected
@@ -152,6 +181,7 @@ def main() -> None:
             images = images[:remaining]
             detector_images = detector_images[:remaining]
             labels = labels[:remaining]
+            truth_pion_counts = truth_pion_counts[:remaining]
             entries = entries[:remaining]
         if len(images) == 0:
             continue
@@ -164,6 +194,7 @@ def main() -> None:
             angular_images=images.astype(np.float32, copy=False),
             detector_images=detector_images.astype(np.float32, copy=False),
             labels=labels,
+            truth_pion_counts=truth_pion_counts,
             entries=entries.astype(np.int64, copy=False),
             source_indices=np.full(len(images), source_index, dtype=np.int32),
         )
@@ -171,22 +202,26 @@ def main() -> None:
         total_selected += len(images)
         class_counts += np.bincount(labels, minlength=2)
 
-        for image, detector_image, label, entry in zip(
-            images, detector_images, labels, entries
+        for image, detector_image, label, pion_counts, entry in zip(
+            images, detector_images, labels, truth_pion_counts, entries
         ):
             if preview_written >= args.preview_count:
                 break
             if preview_class_counts[int(label)] >= preview_class_limits[int(label)]:
                 continue
+            truth_name = "pion" if int(label) == 1 else "no_pion"
             preview_path = preview_dir / (
-                f"event_{preview_written:04d}_source_{source_index}_entry_{int(entry)}.png"
+                f"{truth_name}_event_{preview_written:04d}_source_{source_index}_"
+                f"entry_{int(entry)}.png"
             )
             save_preview(
                 image,
                 detector_image,
                 int(label),
+                pion_counts,
                 Path(chunk["path"]).name,
                 int(entry),
+                response.mode,
                 preview_path,
             )
             preview_written += 1
@@ -210,6 +245,13 @@ def main() -> None:
         "geometry_file": args.geometry.name,
         "pmt_mask": args.pmt_mask,
         "excluded_pmt_ids": geometry.excluded_ids,
+        "pmt_response": response.mode,
+        "pmt_response_scope": "hitPE_and_hitPE_tankcluster",
+        "pmt_response_calibration_file": (
+            response.calibration_path.name if response.calibration_path else None
+        ),
+        "pmt_response_calibration_sha256": response.calibration_sha256,
+        "pmt_response_mapped_pmt_count": len(response.maps),
         "hitpe_branch": args.hitpe_branch,
         "hitid_branch": args.hitid_branch,
         "tankcluster_branch": tank_branch,
@@ -219,14 +261,36 @@ def main() -> None:
         "stored_width": args.image_width + 2,
         "detector_height": args.detector_height,
         "detector_width": args.detector_width,
-        "channels": ["log1p_hitPE", "log1p_hitPE_tankcluster"],
-        "arrays": ["angular_images", "detector_images", "labels"],
+        "channels": [
+            (
+                "log1p_tuned_hitPE"
+                if response.mode == "tuned"
+                else "log1p_hitPE"
+            ),
+            (
+                "log1p_tuned_hitPE_tankcluster"
+                if response.mode == "tuned"
+                else "log1p_hitPE_tankcluster"
+            ),
+        ],
+        "arrays": [
+            "angular_images",
+            "detector_images",
+            "labels",
+            "truth_pion_counts",
+            "entries",
+            "source_indices",
+        ],
         "projections": [
             "vertex_centered_equirectangular_with_azimuth_wrap",
             "annotation_free_unfolded_barrel_top_bottom",
         ],
         "label": "charged_pion_present" if args.charged_only else "any_pion_present",
-        "bdt_preselection": not args.no_bdt_cuts,
+        "event_selection": "fit_individual_pmt",
+        "event_selection_source": "Fit_indivdiualPMT_Gaussian_Convolution.cpp",
+        "event_selection_expression": FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION,
+        "event_selection_applied": not args.no_event_cuts,
+        "bdt_preselection": not args.no_event_cuts,
         "events_read": total_read,
         "events_written": total_selected,
         "misaligned_events_rejected": total_misaligned,

@@ -12,11 +12,14 @@ import uproot
 
 from annie_features import (
     BDT_CUT_BRANCHES,
+    FIT_INDIVIDUAL_PMT_CUT_BRANCHES,
     TRUTH_BRANCHES,
     build_bdt_selection,
+    build_fit_individual_pmt_selection,
     build_pion_labels,
     resolve_tankcluster_branch,
 )
+from annie_pmt_response import PMTResponse
 
 
 DEFAULT_GEOMETRY = Path(__file__).with_name("PMT_position_id_info.cvs")
@@ -164,6 +167,7 @@ def _accumulate_channel(
     vertices: np.ndarray,
     geometry: PMTGeometry,
     maximum_pe: Optional[float],
+    response: Optional[PMTResponse] = None,
 ) -> np.ndarray:
     pe_counts = _numpy(ak.num(pe_vectors, axis=1), np.int64)
     id_counts = _numpy(ak.num(id_vectors, axis=1), np.int64)
@@ -173,8 +177,9 @@ def _accumulate_channel(
 
     selected_pe = pe_vectors[aligned]
     selected_ids = id_vectors[aligned]
-    flat_pe = _numpy(ak.flatten(selected_pe))
+    raw_pe = _numpy(ak.flatten(selected_pe))
     flat_ids = _numpy(ak.flatten(selected_ids), np.int64)
+    flat_pe = response.apply(raw_pe, flat_ids) if response is not None else raw_pe
     event_indices = np.repeat(np.flatnonzero(aligned), pe_counts[aligned])
 
     valid_id = (flat_ids >= 0) & (flat_ids < len(geometry.positions))
@@ -184,13 +189,15 @@ def _accumulate_channel(
     distance = np.linalg.norm(relative, axis=1)
     valid = (
         valid_id
+        & np.isfinite(raw_pe)
+        & (raw_pe >= 0.0)
         & np.isfinite(flat_pe)
-        & (flat_pe > 0.0)
+        & (flat_pe >= 0.0)
         & np.isfinite(relative).all(axis=1)
         & (distance > 0.0)
     )
     if maximum_pe is not None:
-        valid &= flat_pe <= maximum_pe
+        valid &= (raw_pe < maximum_pe) & (flat_pe < maximum_pe)
     if not np.any(valid):
         return aligned
 
@@ -221,6 +228,7 @@ def build_ring_images(
     tankcluster_id_branch: str,
     height: int,
     width: int,
+    response: Optional[PMTResponse] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     vertices = np.column_stack([_numpy(arrays[name]) for name in VERTEX_BRANCHES])
     images = np.zeros((len(arrays), height, width, 2), dtype=np.float32)
@@ -232,6 +240,7 @@ def build_ring_images(
         vertices,
         geometry,
         None,
+        response,
     )
     tank_aligned = _accumulate_channel(
         images,
@@ -241,6 +250,7 @@ def build_ring_images(
         vertices,
         geometry,
         350.0,
+        response,
     )
     valid = full_aligned & tank_aligned & np.isfinite(vertices).all(axis=1)
     images = np.log1p(images)
@@ -259,6 +269,7 @@ def _accumulate_unfolded_channel(
     y_bins: np.ndarray,
     x_bins: np.ndarray,
     maximum_pe: Optional[float],
+    response: Optional[PMTResponse] = None,
 ) -> np.ndarray:
     pe_counts = _numpy(ak.num(pe_vectors, axis=1), np.int64)
     id_counts = _numpy(ak.num(id_vectors, axis=1), np.int64)
@@ -266,8 +277,9 @@ def _accumulate_unfolded_channel(
     if not np.any(aligned):
         return aligned
 
-    flat_pe = _numpy(ak.flatten(pe_vectors[aligned]))
+    raw_pe = _numpy(ak.flatten(pe_vectors[aligned]))
     flat_ids = _numpy(ak.flatten(id_vectors[aligned]), np.int64)
+    flat_pe = response.apply(raw_pe, flat_ids) if response is not None else raw_pe
     event_indices = np.repeat(np.flatnonzero(aligned), pe_counts[aligned])
     valid_id = (flat_ids >= 0) & (flat_ids < len(geometry.positions))
     hit_y = np.full(len(flat_ids), -1, dtype=np.int64)
@@ -276,13 +288,15 @@ def _accumulate_unfolded_channel(
     hit_x[valid_id] = x_bins[flat_ids[valid_id]]
     valid = (
         valid_id
+        & np.isfinite(raw_pe)
+        & (raw_pe >= 0.0)
         & np.isfinite(flat_pe)
-        & (flat_pe > 0.0)
+        & (flat_pe >= 0.0)
         & (hit_y >= 0)
         & (hit_x >= 0)
     )
     if maximum_pe is not None:
-        valid &= flat_pe <= maximum_pe
+        valid &= (raw_pe < maximum_pe) & (flat_pe < maximum_pe)
     if np.any(valid):
         np.add.at(
             images,
@@ -306,6 +320,7 @@ def build_unfolded_detector_images(
     tankcluster_id_branch: str,
     height: int = DEFAULT_DETECTOR_HEIGHT,
     width: int = DEFAULT_DETECTOR_WIDTH,
+    response: Optional[PMTResponse] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build annotation-free PE rasters matching the C++ unfolded detector layout."""
     images = np.zeros((len(arrays), height, width, 2), dtype=np.float32)
@@ -319,6 +334,7 @@ def build_unfolded_detector_images(
         y_bins,
         x_bins,
         None,
+        response,
     )
     tank_aligned = _accumulate_unfolded_channel(
         images,
@@ -329,6 +345,7 @@ def build_unfolded_detector_images(
         y_bins,
         x_bins,
         350.0,
+        response,
     )
     return np.log1p(images), full_aligned & tank_aligned
 
@@ -345,11 +362,18 @@ def iterate_ring_images(
     width: int,
     detector_height: int,
     detector_width: int,
-    apply_bdt_cuts: bool,
+    response: PMTResponse,
+    event_selection,
     include_truth: bool,
     charged_only: bool,
     chunk_size: str,
 ) -> Iterator[Dict[str, object]]:
+    if isinstance(event_selection, bool):
+        selection_mode = "fit_individual_pmt" if event_selection else "none"
+    else:
+        selection_mode = str(event_selection)
+    if selection_mode not in {"none", "fit_individual_pmt", "legacy_bdt"}:
+        raise ValueError(f"Unknown event selection mode {selection_mode!r}")
     for path in paths:
         with uproot.open(path) as root_file:
             if tree_name not in root_file:
@@ -364,7 +388,9 @@ def iterate_ring_images(
                 tankcluster_id_branch,
                 *VERTEX_BRANCHES,
             ]
-            if apply_bdt_cuts:
+            if selection_mode == "fit_individual_pmt":
+                requested.extend(FIT_INDIVIDUAL_PMT_CUT_BRANCHES)
+            elif selection_mode == "legacy_bdt":
                 requested.extend(BDT_CUT_BRANCHES)
             if include_truth:
                 requested.extend(TRUTH_BRANCHES)
@@ -385,6 +411,7 @@ def iterate_ring_images(
                     tankcluster_id_branch,
                     height,
                     width,
+                    response,
                 )
                 detector_images, detector_aligned = build_unfolded_detector_images(
                     arrays,
@@ -395,10 +422,13 @@ def iterate_ring_images(
                     tankcluster_id_branch,
                     detector_height,
                     detector_width,
+                    response,
                 )
                 aligned &= detector_aligned
-                selected = aligned
-                if apply_bdt_cuts:
+                selected = aligned.copy()
+                if selection_mode == "fit_individual_pmt":
+                    selected &= build_fit_individual_pmt_selection(arrays)
+                elif selection_mode == "legacy_bdt":
                     selected &= build_bdt_selection(arrays)
                 n_entries = len(arrays)
                 result: Dict[str, object] = {
@@ -415,5 +445,8 @@ def iterate_ring_images(
                 }
                 if include_truth:
                     result["labels"] = build_pion_labels(arrays, charged_only)[selected]
+                    result["truth_pion_counts"] = np.column_stack(
+                        [_numpy(arrays[name], np.int64) for name in TRUTH_BRANCHES]
+                    )[selected]
                 yield result
                 entry_offset += n_entries
