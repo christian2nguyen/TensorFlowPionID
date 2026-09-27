@@ -11,8 +11,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 import tensorflow as tf
+import awkward as ak
+import uproot
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
     auc,
@@ -44,6 +47,23 @@ from annie_ring_images import (
 TRAIN_FRACTION = 0.80
 VALIDATION_FRACTION = 0.10
 TEST_FRACTION = 0.10
+
+OPENING_ANGLE_DEGREE_BRANCHES = (
+    "trueMuonPionOpeningAngleDeg",
+    "trueMuonPionOpeningAngle_deg",
+    "mcMuonPionOpeningAngleDeg",
+    "mc_muon_pion_opening_angle_deg",
+)
+OPENING_ANGLE_RADIAN_BRANCHES = (
+    "trueMuonPionOpeningAngle",
+    "mcMuonPionOpeningAngle",
+    "mc_muon_pion_opening_angle",
+)
+TRUTH_MUON_VECTOR_BASES = ("mc_p3_mu",)
+TRUTH_PION_VECTOR_BASES = ("mc_p3_lead_pi", "mc_p3_lead_pion")
+MUON_MASS_GEV = 0.1056583755
+CHARGED_PION_MASS_GEV = 0.13957039
+NEUTRAL_PION_MASS_GEV = 0.1349768
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +113,14 @@ def parse_args() -> argparse.Namespace:
         help="response: Gain/Delta/Sigma only; final: also replay residual hits",
     )
     parser.add_argument("--charged-only", action="store_true")
+    parser.add_argument(
+        "--muon-pion-opening-angle-deg-branch",
+        help=(
+            "optional scalar truth branch containing the leading-pion/muon "
+            "opening angle in degrees; otherwise auto-detect a scalar branch "
+            "or derive it from mc_p3_mu and mc_p3_lead_pi(on)"
+        ),
+    )
     parser.add_argument(
         "--no-event-cuts",
         "--no-bdt-cuts",
@@ -208,6 +236,220 @@ def load_data(
         geometry,
         response,
     )
+
+
+def _resolve_vector3_spec(available, base_names: Tuple[str, ...]) -> Tuple[str, ...]:
+    component_suffixes = (
+        (".fX", ".fY", ".fZ"),
+        ("_fX", "_fY", "_fZ"),
+        (".x", ".y", ".z"),
+        ("_x", "_y", "_z"),
+    )
+    for base_name in base_names:
+        for suffixes in component_suffixes:
+            names = tuple(f"{base_name}{suffix}" for suffix in suffixes)
+            if all(name in available for name in names):
+                return names
+    for base_name in base_names:
+        if base_name in available:
+            return (base_name,)
+    return ()
+
+
+def _read_vector3(tree, spec: Tuple[str, ...]) -> np.ndarray:
+    if len(spec) == 3:
+        return np.column_stack(
+            [np.asarray(tree[name].array(library="np"), dtype=np.float64) for name in spec]
+        )
+    if len(spec) != 1:
+        raise ValueError("A truth-vector branch was not resolved")
+
+    values = tree[spec[0]].array(library="ak")
+    fields = set(ak.fields(values))
+    for names in (("fX", "fY", "fZ"), ("x", "y", "z"), ("X", "Y", "Z")):
+        if all(name in fields for name in names):
+            return np.column_stack(
+                [np.asarray(ak.to_numpy(values[name]), dtype=np.float64) for name in names]
+            )
+    converted = np.asarray(ak.to_numpy(values))
+    if converted.dtype.names:
+        for names in (("fX", "fY", "fZ"), ("x", "y", "z"), ("X", "Y", "Z")):
+            if all(name in converted.dtype.names for name in names):
+                return np.column_stack([converted[name] for name in names]).astype(
+                    np.float64, copy=False
+                )
+    if converted.ndim == 2 and converted.shape[1] >= 3:
+        return converted[:, :3].astype(np.float64, copy=False)
+    raise ValueError(
+        f"Could not extract x/y/z components from truth-vector branch {spec[0]!r}"
+    )
+
+
+def _truth_kinematics_for_tree(
+    tree, scalar_degree_branch: str = ""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Read truth momenta and obtain the leading-pion/muon opening angle."""
+    available = set(tree.keys(recursive=True))
+    entry_count = int(tree.num_entries)
+    muon_vectors = None
+    pion_vectors = None
+    muon_momentum = np.full(entry_count, np.nan, dtype=np.float64)
+    pion_momentum = np.full(entry_count, np.nan, dtype=np.float64)
+
+    muon_spec = _resolve_vector3_spec(available, TRUTH_MUON_VECTOR_BASES)
+    pion_spec = _resolve_vector3_spec(available, TRUTH_PION_VECTOR_BASES)
+    vector_descriptions = []
+    if muon_spec:
+        try:
+            muon_vectors = _read_vector3(tree, muon_spec)
+            if len(muon_vectors) != entry_count:
+                raise ValueError("Muon truth-vector length differs from tree length")
+            muon_momentum = np.linalg.norm(muon_vectors, axis=1)
+            muon_momentum[~np.isfinite(muon_vectors).all(axis=1)] = np.nan
+            vector_descriptions.append(f"muon momentum from {muon_spec[0]}")
+        except Exception as error:
+            vector_descriptions.append(f"muon momentum unavailable ({error})")
+            muon_vectors = None
+    else:
+        vector_descriptions.append("muon momentum unavailable")
+    if pion_spec:
+        try:
+            pion_vectors = _read_vector3(tree, pion_spec)
+            if len(pion_vectors) != entry_count:
+                raise ValueError(
+                    "Leading-pion truth-vector length differs from tree length"
+                )
+            pion_momentum = np.linalg.norm(pion_vectors, axis=1)
+            pion_momentum[~np.isfinite(pion_vectors).all(axis=1)] = np.nan
+            vector_descriptions.append(f"leading-pion momentum from {pion_spec[0]}")
+        except Exception as error:
+            vector_descriptions.append(f"leading-pion momentum unavailable ({error})")
+            pion_vectors = None
+    else:
+        vector_descriptions.append("leading-pion momentum unavailable")
+
+    if scalar_degree_branch:
+        if scalar_degree_branch not in available:
+            raise ValueError(
+                f"Requested opening-angle branch {scalar_degree_branch!r} was not found"
+            )
+        angles = np.asarray(
+            tree[scalar_degree_branch].array(library="np"), dtype=np.float64
+        )
+        description = f"degree branch {scalar_degree_branch}"
+    else:
+        degree_branch = next(
+            (name for name in OPENING_ANGLE_DEGREE_BRANCHES if name in available),
+            "",
+        )
+        radian_branch = next(
+            (name for name in OPENING_ANGLE_RADIAN_BRANCHES if name in available),
+            "",
+        )
+        if degree_branch:
+            angles = np.asarray(
+                tree[degree_branch].array(library="np"), dtype=np.float64
+            )
+            description = f"degree branch {degree_branch}"
+        elif radian_branch:
+            radians = np.asarray(
+                tree[radian_branch].array(library="np"), dtype=np.float64
+            )
+            angles = np.degrees(radians)
+            description = f"radian branch {radian_branch} converted to degrees"
+        else:
+            if muon_vectors is None or pion_vectors is None:
+                angles = np.full(entry_count, np.nan, dtype=np.float64)
+                description = "opening angle unavailable"
+            else:
+                denominator = muon_momentum * pion_momentum
+                angles = np.full(entry_count, np.nan, dtype=np.float64)
+                valid = (
+                    np.isfinite(muon_vectors).all(axis=1)
+                    & np.isfinite(pion_vectors).all(axis=1)
+                    & (denominator > 0.0)
+                )
+                cosine = np.zeros(entry_count, dtype=np.float64)
+                cosine[valid] = (
+                    np.einsum("ij,ij->i", muon_vectors[valid], pion_vectors[valid])
+                    / denominator[valid]
+                )
+                angles[valid] = np.degrees(
+                    np.arccos(np.clip(cosine[valid], -1.0, 1.0))
+                )
+                description = (
+                    f"opening angle derived from {muon_spec[0]} and "
+                    f"{pion_spec[0]} truth vectors"
+                )
+
+    angles = np.asarray(angles, dtype=np.float64).reshape(-1)
+    valid_angle = np.isfinite(angles) & (angles >= 0.0) & (angles <= 180.0)
+    muon_momentum = np.where(muon_momentum >= 0.0, muon_momentum, np.nan)
+    pion_momentum = np.where(pion_momentum >= 0.0, pion_momentum, np.nan)
+    full_description = "; ".join([description, *vector_descriptions])
+    return (
+        np.where(valid_angle, angles, np.nan),
+        muon_momentum,
+        pion_momentum,
+        full_description,
+    )
+
+
+def load_truth_muon_pion_kinematics(
+    source_paths: np.ndarray,
+    entries: np.ndarray,
+    tree_name: str,
+    scalar_degree_branch: str = "",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Load truth angle and momenta for selected events in multiple ROOT files."""
+    angles = np.full(len(entries), np.nan, dtype=np.float64)
+    muon_momenta = np.full(len(entries), np.nan, dtype=np.float64)
+    pion_momenta = np.full(len(entries), np.nan, dtype=np.float64)
+    descriptions = set()
+    source_strings = np.asarray(source_paths, dtype=str)
+    for source in dict.fromkeys(source_strings.tolist()):
+        mask = source_strings == source
+        try:
+            with uproot.open(source) as root_file:
+                tree = root_file[tree_name]
+                (
+                    file_angles,
+                    file_muon_momenta,
+                    file_pion_momenta,
+                    description,
+                ) = _truth_kinematics_for_tree(tree, scalar_degree_branch)
+            local_entries = entries[mask].astype(np.int64, copy=False)
+            valid_entries = (local_entries >= 0) & (local_entries < len(file_angles))
+            target_indices = np.flatnonzero(mask)
+            selected_targets = target_indices[valid_entries]
+            selected_entries = local_entries[valid_entries]
+            angles[selected_targets] = file_angles[selected_entries]
+            muon_momenta[selected_targets] = file_muon_momenta[selected_entries]
+            pion_momenta[selected_targets] = file_pion_momenta[selected_entries]
+            descriptions.add(description)
+        except Exception as error:
+            if scalar_degree_branch:
+                raise
+            print(
+                f"Warning: could not load truth muon-pion kinematics from "
+                f"{Path(source).name}: {error}"
+            )
+            descriptions.add("unavailable")
+    return (
+        angles,
+        muon_momenta,
+        pion_momenta,
+        "; ".join(sorted(descriptions)) or "unavailable",
+    )
+
+
+def _kinetic_energy(momentum: np.ndarray, mass: np.ndarray) -> np.ndarray:
+    """Return relativistic kinetic energy for GeV/c momentum and GeV/c^2 mass."""
+    momentum = np.asarray(momentum, dtype=np.float64)
+    mass = np.asarray(mass, dtype=np.float64)
+    kinetic_energy = np.sqrt(np.square(momentum) + np.square(mass)) - mass
+    valid = np.isfinite(momentum) & np.isfinite(mass) & (momentum >= 0.0)
+    return np.where(valid, kinetic_energy, np.nan)
 
 
 def _image_tower(inputs, normalizer, prefix: str):
@@ -723,6 +965,10 @@ def plot_misclassified_gallery(
     test_scores: np.ndarray,
     source_paths_test: np.ndarray,
     entries_test: np.ndarray,
+    truth_pion_counts_test: np.ndarray,
+    truth_muon_pion_angles_test: np.ndarray,
+    truth_muon_kinetic_energy_test: np.ndarray,
+    truth_pion_kinetic_energy_test: np.ndarray,
     output: Path,
     threshold: float,
     per_category: int = 3,
@@ -762,9 +1008,37 @@ def plot_misclassified_gallery(
             angular = images_test[event_index][:, 1:-1, 0]
             detector = detector_images_test[event_index][:, :, 0]
             source_name = Path(str(source_paths_test[event_index])).name
+            true_label = "pion" if y_test[event_index] == 1 else "non-pion"
+            predicted_label = (
+                "pion" if test_scores[event_index] >= threshold else "non-pion"
+            )
+            pi_plus, pi_minus, pi_zero = (
+                int(value) for value in truth_pion_counts_test[event_index]
+            )
+            opening_angle = truth_muon_pion_angles_test[event_index]
+            angle_text = (
+                f"θ(π,μ)={opening_angle:.1f}°"
+                if np.isfinite(opening_angle)
+                else "θ(π,μ)=n/a"
+            )
+            muon_kinetic_energy = truth_muon_kinetic_energy_test[event_index]
+            pion_kinetic_energy = truth_pion_kinetic_energy_test[event_index]
+            muon_energy_text = (
+                f"Tμ={muon_kinetic_energy:.3f} GeV"
+                if np.isfinite(muon_kinetic_energy)
+                else "Tμ=n/a"
+            )
+            pion_energy_text = (
+                f"Tπ={pion_kinetic_energy:.3f} GeV"
+                if np.isfinite(pion_kinetic_energy)
+                else "Tπ=n/a"
+            )
             caption = (
-                f"{title}\n{source_name} entry {int(entries_test[event_index])} — "
-                f"score={test_scores[event_index]:.3f}"
+                f"{title}\n{source_name} — entry {int(entries_test[event_index])}\n"
+                f"truth={true_label}, prediction={predicted_label}, "
+                f"score={test_scores[event_index]:.3f}\n"
+                f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}; {angle_text}\n"
+                f"truth {muon_energy_text}, {pion_energy_text}"
             )
             axes[row_index, 0].imshow(
                 angular, origin="lower", aspect="auto", cmap="magma"
@@ -782,6 +1056,140 @@ def plot_misclassified_gallery(
     return path.name
 
 
+def plot_misclassified_event_pdf(
+    images_test: np.ndarray,
+    detector_images_test: np.ndarray,
+    y_test: np.ndarray,
+    test_scores: np.ndarray,
+    source_paths_test: np.ndarray,
+    entries_test: np.ndarray,
+    truth_pion_counts_test: np.ndarray,
+    truth_muon_pion_angles_test: np.ndarray,
+    truth_muon_kinetic_energy_test: np.ndarray,
+    truth_pion_kinetic_energy_test: np.ndarray,
+    output: Path,
+    threshold: float,
+    max_examples: int = 20,
+) -> str:
+    """Write up to 20 annotated misclassified events to one PDF."""
+    false_positive_indices = np.flatnonzero(
+        (y_test == 0) & (test_scores >= threshold)
+    )
+    false_negative_indices = np.flatnonzero(
+        (y_test == 1) & (test_scores < threshold)
+    )
+    false_positive_indices = false_positive_indices[
+        np.argsort(test_scores[false_positive_indices])[::-1]
+    ]
+    false_negative_indices = false_negative_indices[
+        np.argsort(test_scores[false_negative_indices])
+    ]
+
+    per_class_target = max_examples // 2
+    selected: List[Tuple[str, int]] = [
+        ("false_positive", int(index))
+        for index in false_positive_indices[:per_class_target]
+    ]
+    selected.extend(
+        ("false_negative", int(index))
+        for index in false_negative_indices[:per_class_target]
+    )
+    remaining = [
+        ("false_positive", int(index))
+        for index in false_positive_indices[per_class_target:]
+    ]
+    remaining.extend(
+        ("false_negative", int(index))
+        for index in false_negative_indices[per_class_target:]
+    )
+    remaining.sort(
+        key=lambda item: abs(float(test_scores[item[1]]) - threshold),
+        reverse=True,
+    )
+    selected.extend(remaining[: max_examples - len(selected)])
+
+    pdf_path = output.with_suffix(".misclassified_events.pdf")
+    with PdfPages(
+        pdf_path,
+        metadata={
+            "Title": "ANNIE pion-ID misclassified events",
+            "Subject": "Annotated false-positive and false-negative PMT images",
+            "Author": "train_annie_ring.py",
+        },
+    ) as pdf:
+        if not selected:
+            fig, axis = plt.subplots(figsize=(11, 5))
+            axis.axis("off")
+            axis.text(
+                0.5,
+                0.5,
+                f"No events were misclassified at pion-score threshold {threshold:.3f}.",
+                ha="center",
+                va="center",
+                fontsize=14,
+            )
+            fig.suptitle("ANNIE pion-ID misclassification review")
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        for category, event_index in selected:
+            source_name = Path(str(source_paths_test[event_index])).name
+            true_label = "pion" if y_test[event_index] == 1 else "non-pion"
+            predicted_label = (
+                "pion" if test_scores[event_index] >= threshold else "non-pion"
+            )
+            pi_plus, pi_minus, pi_zero = (
+                int(value) for value in truth_pion_counts_test[event_index]
+            )
+            opening_angle = truth_muon_pion_angles_test[event_index]
+            angle_text = (
+                f"θ(π,μ)={opening_angle:.1f}°"
+                if np.isfinite(opening_angle)
+                else "θ(π,μ)=n/a"
+            )
+            muon_kinetic_energy = truth_muon_kinetic_energy_test[event_index]
+            pion_kinetic_energy = truth_pion_kinetic_energy_test[event_index]
+            muon_energy_text = (
+                f"Tμ={muon_kinetic_energy:.3f} GeV"
+                if np.isfinite(muon_kinetic_energy)
+                else "Tμ=n/a"
+            )
+            pion_energy_text = (
+                f"Tπ={pion_kinetic_energy:.3f} GeV"
+                if np.isfinite(pion_kinetic_energy)
+                else "Tπ=n/a"
+            )
+            category_title = category.replace("_", " ").title()
+            annotation = (
+                f"{category_title}: truth={true_label}, prediction={predicted_label}, "
+                f"score={test_scores[event_index]:.3f}\n"
+                f"{source_name} - entry {int(entries_test[event_index])}\n"
+                f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}; {angle_text}; "
+                f"truth {muon_energy_text}, {pion_energy_text}"
+            )
+
+            fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+            axes[0].imshow(
+                images_test[event_index][:, 1:-1, 0],
+                origin="lower",
+                aspect="auto",
+                cmap="magma",
+            )
+            axes[0].set_title("Angular full hitPE")
+            axes[1].imshow(
+                detector_images_test[event_index][:, :, 0],
+                origin="lower",
+                aspect="equal",
+                cmap="magma",
+            )
+            axes[1].set_title("Unfolded full hitPE")
+            fig.suptitle(annotation, fontsize=10)
+            fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.88))
+            pdf.savefig(fig)
+            plt.close(fig)
+    return pdf_path.name
+
+
 def plot_pion_example_pages(
     model: tf.keras.Model,
     images_test: np.ndarray,
@@ -791,16 +1199,30 @@ def plot_pion_example_pages(
     source_paths_test: np.ndarray,
     entries_test: np.ndarray,
     truth_pion_counts_test: np.ndarray,
+    truth_muon_pion_angles_test: np.ndarray,
+    truth_muon_kinetic_energy_test: np.ndarray,
+    truth_pion_kinetic_energy_test: np.ndarray,
     output: Path,
     threshold: float,
     examples_per_page: int = 3,
 ) -> List[str]:
-    """Draw high-, boundary-, and low-scoring held-out truth-pion pages."""
+    """Draw charged-, high-, boundary-, and low-score truth-pion pages."""
     pion_indices = np.flatnonzero(y_test == 1)
     if len(pion_indices) == 0:
         return []
 
+    charged_pion_indices = pion_indices[
+        (truth_pion_counts_test[pion_indices, 0]
+         + truth_pion_counts_test[pion_indices, 1]) > 0
+    ]
     ranking_options = [
+        (
+            "charged_pions",
+            "Held-out truth charged-pion events",
+            charged_pion_indices[
+                np.argsort(test_scores[charged_pion_indices])[::-1]
+            ],
+        ),
         (
             "high_score",
             "Highest-scoring held-out truth-pion events",
@@ -915,10 +1337,29 @@ def plot_pion_example_pages(
                 int(value) for value in truth_pion_counts_test[event_index]
             )
             source_name = Path(str(source_paths_test[event_index])).name
+            opening_angle = truth_muon_pion_angles_test[event_index]
+            angle_text = (
+                f"truth leading π–μ angle={opening_angle:.1f}°"
+                if np.isfinite(opening_angle)
+                else "truth leading π–μ angle=n/a"
+            )
+            muon_kinetic_energy = truth_muon_kinetic_energy_test[event_index]
+            pion_kinetic_energy = truth_pion_kinetic_energy_test[event_index]
+            muon_energy_text = (
+                f"Tμ={muon_kinetic_energy:.3f} GeV"
+                if np.isfinite(muon_kinetic_energy)
+                else "Tμ=n/a"
+            )
+            pion_energy_text = (
+                f"Tπ={pion_kinetic_energy:.3f} GeV"
+                if np.isfinite(pion_kinetic_energy)
+                else "Tπ=n/a"
+            )
             axes[row_index, 0].set_ylabel(
                 f"{source_name}\nentry {int(entries_test[event_index])}\n"
                 f"score={test_scores[event_index]:.3f}\n"
-                f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}",
+                f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}\n{angle_text}\n"
+                f"truth {muon_energy_text}, {pion_energy_text}",
                 fontsize=8,
             )
         fig.suptitle(
@@ -1054,6 +1495,8 @@ def evaluate_and_plot(
     history_path: Path,
     output: Path,
     threshold: float,
+    tree_name: str,
+    opening_angle_degree_branch: str = "",
 ) -> Dict[str, object]:
     test_scores = model.predict(
         {
@@ -1062,6 +1505,30 @@ def evaluate_and_plot(
         },
         verbose=0,
     ).reshape(-1)
+    (
+        truth_muon_pion_angles,
+        truth_muon_momenta,
+        truth_pion_momenta,
+        truth_kinematics_source,
+    ) = load_truth_muon_pion_kinematics(
+        source_paths_test,
+        entries_test,
+        tree_name,
+        opening_angle_degree_branch,
+    )
+    truth_muon_kinetic_energy = _kinetic_energy(
+        truth_muon_momenta, MUON_MASS_GEV
+    )
+    charged_pion_present = (
+        truth_pion_counts_test[:, 0] + truth_pion_counts_test[:, 1]
+    ) > 0
+    neutral_pion_present = truth_pion_counts_test[:, 2] > 0
+    pion_mass = np.where(
+        charged_pion_present,
+        CHARGED_PION_MASS_GEV,
+        np.where(neutral_pion_present, NEUTRAL_PION_MASS_GEV, np.nan),
+    )
+    truth_pion_kinetic_energy = _kinetic_energy(truth_pion_momenta, pion_mass)
 
     predictions_path = output.with_suffix(".test_predictions.csv")
     with predictions_path.open("w", newline="", encoding="utf-8") as handle:
@@ -1074,6 +1541,9 @@ def evaluate_and_plot(
                 "truePiPlusCher",
                 "truePiMinusCher",
                 "truePi0",
+                "truth_leading_pion_muon_opening_angle_deg",
+                "truth_muon_kinetic_energy_GeV",
+                "truth_leading_pion_kinetic_energy_GeV",
                 "pion_score",
             ]
         )
@@ -1085,6 +1555,9 @@ def evaluate_and_plot(
                 truth_pion_counts_test[:, 0].astype(int).tolist(),
                 truth_pion_counts_test[:, 1].astype(int).tolist(),
                 truth_pion_counts_test[:, 2].astype(int).tolist(),
+                truth_muon_pion_angles.astype(float).tolist(),
+                truth_muon_kinetic_energy.astype(float).tolist(),
+                truth_pion_kinetic_energy.astype(float).tolist(),
                 test_scores.astype(float).tolist(),
             )
         )
@@ -1112,11 +1585,16 @@ def evaluate_and_plot(
         source_paths_test,
         entries_test,
         truth_pion_counts_test,
+        truth_muon_pion_angles,
+        truth_muon_kinetic_energy,
+        truth_pion_kinetic_energy,
         output,
         threshold,
     )
     return {
         "test_predictions": predictions_path.name,
+        "truth_muon_pion_opening_angle_source": truth_kinematics_source,
+        "truth_muon_pion_kinematics_source": truth_kinematics_source,
         "roc_curve": roc_name,
         "roc_auc_sklearn": roc_auc_value,
         "precision_recall_curve": pr_name,
@@ -1183,6 +1661,24 @@ def evaluate_and_plot(
             test_scores,
             source_paths_test,
             entries_test,
+            truth_pion_counts_test,
+            truth_muon_pion_angles,
+            truth_muon_kinetic_energy,
+            truth_pion_kinetic_energy,
+            output,
+            threshold,
+        ),
+        "misclassified_events_pdf": plot_misclassified_event_pdf(
+            images_test,
+            detector_images_test,
+            y_test,
+            test_scores,
+            source_paths_test,
+            entries_test,
+            truth_pion_counts_test,
+            truth_muon_pion_angles,
+            truth_muon_kinetic_energy,
+            truth_pion_kinetic_energy,
             output,
             threshold,
         ),
@@ -1311,6 +1807,8 @@ def main() -> None:
         history_path,
         args.output,
         args.threshold,
+        args.tree,
+        args.muon_pion_opening_angle_deg_branch or "",
     )
     print(
         "Test ROC AUC cross-check: "
@@ -1367,6 +1865,19 @@ def main() -> None:
         ],
         "label": "charged_pion_present" if args.charged_only else "any_pion_present",
         "truth_branches": ["truePiPlusCher", "truePiMinusCher", "truePi0"],
+        "truth_muon_pion_opening_angle_annotation_only": True,
+        "truth_muon_pion_kinetic_energy_annotation_only": True,
+        "truth_momentum_units": "GeV/c",
+        "truth_kinetic_energy_units": "GeV",
+        "truth_kinetic_energy_formula": "sqrt(p^2 + m^2) - m",
+        "truth_particle_masses_GeV": {
+            "muon": MUON_MASS_GEV,
+            "charged_pion": CHARGED_PION_MASS_GEV,
+            "neutral_pion": NEUTRAL_PION_MASS_GEV,
+        },
+        "requested_muon_pion_opening_angle_degree_branch": (
+            args.muon_pion_opening_angle_deg_branch
+        ),
         "event_selection": "fit_individual_pmt",
         "event_selection_source": "Fit_indivdiualPMT_Gaussian_Convolution.cpp",
         "event_selection_expression": FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION,

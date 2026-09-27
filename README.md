@@ -267,10 +267,12 @@ record specificity, balanced accuracy, ordinary accuracy, F1, and the Matthews
 correlation coefficient at each evaluated operating point. A Brier score
 provides a threshold-independent check of probability calibration.
 
-Three held-out truth-pion image pages are produced for visual validation: the
-highest-scoring pions, pions nearest the configured decision threshold, and the
-lowest-scoring pions. Each page shows up to three distinct events with all four
-PMT image views and pion-truth annotations.
+Four held-out truth-pion image pages are produced for visual validation: a
+dedicated charged-pion page, the highest-scoring pions, pions nearest the
+configured decision threshold, and the lowest-scoring pions. Each page shows up
+to three events with all four PMT image views and pion-truth annotations.
+The annotations include the truth muon and leading-pion kinetic energies in GeV
+when their truth momentum vectors are available.
 
 By default, Model A uses the reconstructed-event selection from
 `Fit_indivdiualPMT_Gaussian_Convolution.cpp`, with the charge-balance requirement
@@ -293,16 +295,39 @@ Training also writes test-set diagnostic products beside the model: ROC and
 precision-recall curves, score distributions, efficiency/background rejection
 versus threshold, a confusion matrix, a probability-calibration curve, training
 history plots, the most confident misclassified events, Grad-CAM examples for
-both image towers, and three pion-example pages. The pion-example pages show the
+both image towers, and four pion-example pages. The pion-example pages show the
 full-event and tank-cluster PE channels in both angular and unfolded views for
-high-scoring, threshold-boundary, and low-scoring held-out pion events; each row
-includes the source file, tree entry, model score, and the truth counts for pi+,
-pi-, and pi0. Every row also includes angular and unfolded Grad-CAM heatmaps;
+charged-pion, high-scoring, threshold-boundary, and low-scoring held-out pion
+events; each row includes the source file, tree entry, model score, and the
+truth counts for pi+, pi-, and pi0. Every row also includes angular and unfolded
+Grad-CAM heatmaps;
 these tower-level maps use both PE channels and are overlaid on full-event
-`hitPE` for detector-coordinate context.
-The test CSV contains the same truth counts together with each event's source,
-entry, binary truth label, and pion score. Their filenames and summary metrics
-are stored under `evaluation` in the model JSON.
+`hitPE` for detector-coordinate context. The annotation also reports the truth
+opening angle in degrees between the muon and leading pion. This is calculated
+from `mc_p3_mu` and `mc_p3_lead_pi` (or `mc_p3_lead_pion`) when available and is
+never supplied to the CNN. The same truth vectors provide the momentum
+magnitudes used to calculate relativistic kinetic energy as
+`T = sqrt(p^2 + m^2) - m`. The code uses the muon rest mass and selects the
+charged- or neutral-pion rest mass from the event's pion truth counts. Momentum
+is interpreted in GeV/c, matching the source analysis, and kinetic energy is
+reported in GeV. If the ROOT file instead contains a scalar angle in
+degrees, select it explicitly with
+`--muon-pion-opening-angle-deg-branch BRANCH_NAME`. The test CSV contains the
+same truth counts, opening angle, muon kinetic energy, and leading-pion kinetic
+energy together with each event's source, entry, binary truth label, and pion
+score. Their filenames and summary metrics are stored under `evaluation` in the
+model JSON.
+
+The misclassified-event output keeps the combined gallery and writes the
+selected events to one multipage PDF named
+`annie_ring_pion.misclassified_events.pdf` for the default model output. It
+does not write separate PNG files for each event. Each event occupies one PDF
+page. The selection initially takes up to 10 of the most confident false
+positives and 10 of the most confident false negatives, then fills unused slots
+from the other category.
+Every example includes its source file, tree entry, true and predicted classes,
+pion score, truth pion counts, truth muon-pion opening angle, and truth muon and
+leading-pion kinetic energies. Unavailable truth values are shown as `n/a`.
 
 The unfolded tensor deliberately does not copy presentation-only objects from
 the C++ event display. It excludes PMT number labels, titles, axes, legends,
@@ -310,8 +335,9 @@ event/run text, charge-histogram insets, detector outlines, region labels, and
 truth information. Only the PMT position and accumulated PE are retained. This
 prevents the network from learning annotations or other information that will
 not be available when scoring data. Pion truth counts are used only for labels,
-metadata, and diagnostic figure annotations; they are never image channels or
-model inputs.
+metadata, and diagnostic figure annotations; truth opening angles and kinetic
+energies are also diagnostic-only. None of these truth quantities are image
+channels or model inputs.
 
 The angular map uses 16 × 32 bins by default and duplicates the periodic
 azimuth edge before convolution. PE is accumulated per angular bin and
