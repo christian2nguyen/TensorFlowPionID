@@ -44,9 +44,9 @@ from annie_ring_images import (
     iterate_ring_images,
 )
 
-TRAIN_FRACTION = 0.80
-VALIDATION_FRACTION = 0.10
-TEST_FRACTION = 0.10
+TRAIN_FRACTION = 0.70
+VALIDATION_FRACTION = 0.15
+TEST_FRACTION = 0.15
 
 OPENING_ANGLE_DEGREE_BRANCHES = (
     "trueMuonPionOpeningAngleDeg",

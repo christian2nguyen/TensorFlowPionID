@@ -250,7 +250,7 @@ exactly two channels (`hitPE` and `hitPE_tankcluster`) and no charge or timing
 inputs. Training also writes `annie_ring_pion.history.csv`, containing the
 per-epoch training and validation metrics used to identify the best stopping
 point. Events are split reproducibly and stratified by pion truth label into
-80% training, 10% validation, and 10% testing. Evaluation includes count and
+70% training, 15% validation, and 15% testing. Evaluation includes count and
 true-class-normalized confusion matrices
 at the requested `--threshold`. A separate confidence-band confusion matrix
 classifies `score < 0.20` as non-pion-like and `score > 0.80` as pion-like;
