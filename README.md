@@ -250,12 +250,15 @@ exactly two channels (`hitPE` and `hitPE_tankcluster`) and no charge or timing
 inputs. Training also writes `annie_ring_pion.history.csv`, containing the
 per-epoch training and validation metrics used to identify the best stopping
 point. Events are split reproducibly and stratified by pion truth label into
-70% training, 15% validation, and 15% testing. Evaluation includes count and
+80% training, 10% validation, and 10% testing. Evaluation includes count and
 true-class-normalized confusion matrices
 at the requested `--threshold`. A separate confidence-band confusion matrix
 classifies `score < 0.20` as non-pion-like and `score > 0.80` as pion-like;
 events in the middle band are excluded and their count is printed on the plot.
 This confidence-band matrix is written in count and true-class-normalized forms.
+A second count and normalized pair uses the looser confidence bands
+`score < 0.30` for non-pion-like and `score > 0.70` for pion-like, excluding
+the middle `0.30 <= score <= 0.70` region.
 It also writes an efficiency/purity threshold scan as both PNG and CSV. Here,
 pion efficiency is `TP/(TP+FN)`, pion purity is `TP/(TP+FP)`, and the third
 curve is their product. The plot highlights the `0.20` and `0.80` confidence
@@ -294,7 +297,9 @@ both image towers, and three pion-example pages. The pion-example pages show the
 full-event and tank-cluster PE channels in both angular and unfolded views for
 high-scoring, threshold-boundary, and low-scoring held-out pion events; each row
 includes the source file, tree entry, model score, and the truth counts for pi+,
-pi-, and pi0.
+pi-, and pi0. Every row also includes angular and unfolded Grad-CAM heatmaps;
+these tower-level maps use both PE channels and are overlaid on full-event
+`hitPE` for detector-coordinate context.
 The test CSV contains the same truth counts together with each event's source,
 entry, binary truth label, and pion score. Their filenames and summary metrics
 are stored under `evaluation` in the model JSON.

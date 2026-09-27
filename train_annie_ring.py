@@ -41,9 +41,9 @@ from annie_ring_images import (
     iterate_ring_images,
 )
 
-TRAIN_FRACTION = 0.70
-VALIDATION_FRACTION = 0.15
-TEST_FRACTION = 0.15
+TRAIN_FRACTION = 0.80
+VALIDATION_FRACTION = 0.10
+TEST_FRACTION = 0.10
 
 
 def parse_args() -> argparse.Namespace:
@@ -577,6 +577,7 @@ def plot_score_band_confusion_matrix(
     normalize: bool = False,
     low_score: float = 0.20,
     high_score: float = 0.80,
+    filename_tag: str = "",
 ) -> str:
     """Plot a matrix using only confident low- and high-score events."""
     selected = (test_scores < low_score) | (test_scores > high_score)
@@ -641,11 +642,9 @@ def plot_score_band_confusion_matrix(
     colorbar_label = "Fraction within selected truth class" if normalize else "Event count"
     fig.colorbar(image, ax=axis, label=colorbar_label)
     fig.tight_layout()
-    suffix = (
-        ".confusion_matrix_score_bands_normalized.png"
-        if normalize
-        else ".confusion_matrix_score_bands.png"
-    )
+    tag = f"_{filename_tag}" if filename_tag else ""
+    normalized_tag = "_normalized" if normalize else ""
+    suffix = f".confusion_matrix_score_bands{tag}{normalized_tag}.png"
     path = output.with_suffix(suffix)
     fig.savefig(path, dpi=160)
     plt.close(fig)
@@ -784,6 +783,7 @@ def plot_misclassified_gallery(
 
 
 def plot_pion_example_pages(
+    model: tf.keras.Model,
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
     y_test: np.ndarray,
@@ -819,7 +819,7 @@ def plot_pion_example_pages(
             pion_indices[np.argsort(test_scores[pion_indices])],
         ),
     ]
-    column_titles = [
+    raw_column_titles = [
         "Angular full hitPE",
         "Angular tank-cluster hitPE",
         "Unfolded full hitPE",
@@ -840,12 +840,31 @@ def plot_pion_example_pages(
         if not order:
             continue
 
+        angular_batch = images_test[order]
+        detector_batch = detector_images_test[order]
+        model_inputs = {
+            "pmt_angular_image": angular_batch,
+            "pmt_unfolded_image": detector_batch,
+        }
+        angular_heatmaps = _grad_cam_heatmaps(
+            model,
+            "angular_conv3",
+            model_inputs,
+            (angular_batch.shape[1], angular_batch.shape[2]),
+        )
+        detector_heatmaps = _grad_cam_heatmaps(
+            model,
+            "detector_conv3",
+            model_inputs,
+            (detector_batch.shape[1], detector_batch.shape[2]),
+        )
+
         fig, axes = plt.subplots(
-            len(order), 4, figsize=(16, 3.8 * len(order)), squeeze=False
+            len(order), 6, figsize=(23, 3.8 * len(order)), squeeze=False
         )
         for row_index, event_index in enumerate(order):
-            angular = images_test[event_index][:, 1:-1, :]
-            detector = detector_images_test[event_index]
+            angular = angular_batch[row_index][:, 1:-1, :]
+            detector = detector_batch[row_index]
             panels = [
                 (angular[:, :, 0], "auto"),
                 (angular[:, :, 1], "auto"),
@@ -853,12 +872,45 @@ def plot_pion_example_pages(
                 (detector[:, :, 1], "equal"),
             ]
             for column, ((panel, aspect), title) in enumerate(
-                zip(panels, column_titles)
+                zip(panels, raw_column_titles)
             ):
                 axes[row_index, column].imshow(
                     panel, origin="lower", aspect=aspect, cmap="magma"
                 )
                 axes[row_index, column].set_title(title, fontsize=9)
+
+            angular_heat = angular_heatmaps[row_index][:, 1:-1]
+            axes[row_index, 4].imshow(
+                angular[:, :, 0], origin="lower", aspect="auto", cmap="gray"
+            )
+            axes[row_index, 4].imshow(
+                angular_heat,
+                origin="lower",
+                aspect="auto",
+                cmap="jet",
+                alpha=0.55,
+                vmin=0.0,
+                vmax=1.0,
+            )
+            axes[row_index, 4].set_title(
+                "Angular Grad-CAM\n(red = strongest influence)", fontsize=9
+            )
+
+            axes[row_index, 5].imshow(
+                detector[:, :, 0], origin="lower", aspect="equal", cmap="gray"
+            )
+            axes[row_index, 5].imshow(
+                detector_heatmaps[row_index],
+                origin="lower",
+                aspect="equal",
+                cmap="jet",
+                alpha=0.55,
+                vmin=0.0,
+                vmax=1.0,
+            )
+            axes[row_index, 5].set_title(
+                "Unfolded Grad-CAM\n(red = strongest influence)", fontsize=9
+            )
             pi_plus, pi_minus, pi_zero = (
                 int(value) for value in truth_pion_counts_test[event_index]
             )
@@ -1052,6 +1104,7 @@ def evaluate_and_plot(
         y_test, test_scores, output, threshold
     )
     pion_example_pages = plot_pion_example_pages(
+        model,
         images_test,
         detector_images_test,
         y_test,
@@ -1098,6 +1151,27 @@ def evaluate_and_plot(
         "confusion_matrix_score_bands_normalized": (
             plot_score_band_confusion_matrix(
                 y_test, test_scores, output, normalize=True
+            )
+        ),
+        "confusion_matrix_score_bands_0p30_0p70": (
+            plot_score_band_confusion_matrix(
+                y_test,
+                test_scores,
+                output,
+                low_score=0.30,
+                high_score=0.70,
+                filename_tag="0p30_0p70",
+            )
+        ),
+        "confusion_matrix_score_bands_0p30_0p70_normalized": (
+            plot_score_band_confusion_matrix(
+                y_test,
+                test_scores,
+                output,
+                normalize=True,
+                low_score=0.30,
+                high_score=0.70,
+                filename_tag="0p30_0p70",
             )
         ),
         "calibration_curve": plot_calibration_curve(y_test, test_scores, output),
