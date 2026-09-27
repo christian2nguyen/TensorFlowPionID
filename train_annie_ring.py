@@ -17,6 +17,7 @@ from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
     auc,
     average_precision_score,
+    brier_score_loss,
     confusion_matrix,
     precision_recall_curve,
     roc_curve,
@@ -39,6 +40,10 @@ from annie_ring_images import (
     PMTGeometry,
     iterate_ring_images,
 )
+
+TRAIN_FRACTION = 0.70
+VALIDATION_FRACTION = 0.15
+TEST_FRACTION = 0.15
 
 
 def parse_args() -> argparse.Namespace:
@@ -365,17 +370,45 @@ def pion_operating_point(
     true_negative = int(np.count_nonzero(~predictions & ~truth_pion))
     efficiency_denominator = true_positive + false_negative
     purity_denominator = true_positive + false_positive
+    specificity_denominator = true_negative + false_positive
+    total = true_positive + false_positive + false_negative + true_negative
     efficiency = (
         true_positive / efficiency_denominator
         if efficiency_denominator
         else 0.0
     )
     purity = true_positive / purity_denominator if purity_denominator else 0.0
+    specificity = (
+        true_negative / specificity_denominator
+        if specificity_denominator
+        else 0.0
+    )
+    f1_denominator = 2 * true_positive + false_positive + false_negative
+    f1_score = 2 * true_positive / f1_denominator if f1_denominator else 0.0
+    mcc_denominator = np.sqrt(
+        (true_positive + false_positive)
+        * (true_positive + false_negative)
+        * (true_negative + false_positive)
+        * (true_negative + false_negative)
+    )
+    matthews_correlation = (
+        (true_positive * true_negative - false_positive * false_negative)
+        / mcc_denominator
+        if mcc_denominator
+        else 0.0
+    )
     return {
         "threshold": float(threshold),
         "efficiency": float(efficiency),
         "purity": float(purity),
         "efficiency_x_purity": float(efficiency * purity),
+        "specificity": float(specificity),
+        "balanced_accuracy": float((efficiency + specificity) / 2.0),
+        "accuracy": float(
+            (true_positive + true_negative) / total if total else 0.0
+        ),
+        "f1_score": float(f1_score),
+        "matthews_correlation_coefficient": float(matthews_correlation),
         "true_positive": true_positive,
         "false_positive": false_positive,
         "false_negative": false_negative,
@@ -394,7 +427,7 @@ def plot_efficiency_purity_vs_threshold(
         np.concatenate(
             [
                 np.linspace(0.0, 1.0, 201),
-                np.array([evaluation_threshold, 0.20], dtype=np.float64),
+                np.array([evaluation_threshold, 0.20, 0.80], dtype=np.float64),
             ]
         )
     )
@@ -423,8 +456,24 @@ def plot_efficiency_purity_vs_threshold(
     axis.plot(scan_thresholds, efficiencies, label="Pion efficiency")
     axis.plot(scan_thresholds, purities, label="Pion purity")
     axis.plot(scan_thresholds, products, label="Efficiency x purity")
-    axis.axvline(0.20, color="black", linestyle="--", alpha=0.7, label="score = 0.20")
-    if not np.isclose(evaluation_threshold, 0.20):
+    axis.axvline(
+        0.20,
+        color="gray",
+        linestyle="--",
+        alpha=0.7,
+        label="non-pion boundary = 0.20",
+    )
+    axis.axvline(
+        0.80,
+        color="black",
+        linestyle="--",
+        alpha=0.7,
+        label="pion boundary = 0.80",
+    )
+    if not (
+        np.isclose(evaluation_threshold, 0.20)
+        or np.isclose(evaluation_threshold, 0.80)
+    ):
         axis.axvline(
             evaluation_threshold,
             color="gray",
@@ -447,7 +496,7 @@ def plot_efficiency_purity_vs_threshold(
         plot_path.name,
         csv_path.name,
         pion_operating_point(y_test, test_scores, evaluation_threshold),
-        pion_operating_point(y_test, test_scores, 0.20),
+        pion_operating_point(y_test, test_scores, 0.80),
     )
 
 
@@ -461,6 +510,10 @@ def plot_confusion_matrix(
     filename_suffix: str = ".confusion_matrix.png",
 ) -> str:
     predictions = (test_scores >= threshold).astype(int)
+    rule_text = (
+        f"non-pion-like if score < {threshold:.2f}; "
+        f"pion-like if score >= {threshold:.2f}"
+    )
     counts = confusion_matrix(y_test, predictions, labels=[0, 1])
     if normalize:
         denominators = counts.sum(axis=1, keepdims=True)
@@ -490,7 +543,7 @@ def plot_confusion_matrix(
         if normalize
         else "Confusion matrix"
     )
-    axis.set_title(f"{title}\n(pion if score >= {threshold:.2f})")
+    axis.set_title(f"{title}\n({rule_text})", fontsize=10)
     for row in range(2):
         for column in range(2):
             value = matrix[row, column]
@@ -511,6 +564,89 @@ def plot_confusion_matrix(
     fig.colorbar(image, ax=axis, label=colorbar_label)
     fig.tight_layout()
     path = output.with_suffix(filename_suffix)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    return path.name
+
+
+def plot_score_band_confusion_matrix(
+    y_test: np.ndarray,
+    test_scores: np.ndarray,
+    output: Path,
+    *,
+    normalize: bool = False,
+    low_score: float = 0.20,
+    high_score: float = 0.80,
+) -> str:
+    """Plot a matrix using only confident low- and high-score events."""
+    selected = (test_scores < low_score) | (test_scores > high_score)
+    selected_truth = y_test[selected]
+    selected_predictions = (test_scores[selected] > high_score).astype(int)
+    counts = confusion_matrix(
+        selected_truth, selected_predictions, labels=[0, 1]
+    )
+    if normalize:
+        denominators = counts.sum(axis=1, keepdims=True)
+        matrix = np.divide(
+            counts,
+            denominators,
+            out=np.zeros_like(counts, dtype=np.float64),
+            where=denominators != 0,
+        )
+    else:
+        matrix = counts
+
+    fig, axis = plt.subplots(figsize=(6, 5))
+    image = axis.imshow(
+        matrix,
+        cmap="Blues",
+        vmin=0.0,
+        vmax=1.0 if normalize else None,
+    )
+    axis.set_xticks([0, 1])
+    axis.set_xticklabels(
+        [f"non-pion-like\nscore < {low_score:.2f}", f"pion-like\nscore > {high_score:.2f}"]
+    )
+    axis.set_yticks([0, 1])
+    axis.set_yticklabels(["no pion", "pion"])
+    axis.set_xlabel("Predicted score category")
+    axis.set_ylabel("Truth")
+    title = (
+        "True-class-normalized confidence-band matrix"
+        if normalize
+        else "Confidence-band confusion matrix"
+    )
+    excluded_count = int(np.count_nonzero(~selected))
+    axis.set_title(
+        f"{title}\n{low_score:.2f} <= score <= {high_score:.2f} excluded "
+        f"({excluded_count}/{len(test_scores)} test events)",
+        fontsize=10,
+    )
+    for row in range(2):
+        for column in range(2):
+            value = matrix[row, column]
+            label = f"{value:.1%}" if normalize else str(int(value))
+            axis.text(
+                column,
+                row,
+                label,
+                ha="center",
+                va="center",
+                color=(
+                    "white"
+                    if value > (0.5 if normalize else matrix.max() / 2)
+                    else "black"
+                ),
+            )
+    colorbar_label = "Fraction within selected truth class" if normalize else "Event count"
+    fig.colorbar(image, ax=axis, label=colorbar_label)
+    fig.tight_layout()
+    suffix = (
+        ".confusion_matrix_score_bands_normalized.png"
+        if normalize
+        else ".confusion_matrix_score_bands.png"
+    )
+    path = output.with_suffix(suffix)
     fig.savefig(path, dpi=160)
     plt.close(fig)
     return path.name
@@ -647,7 +783,7 @@ def plot_misclassified_gallery(
     return path.name
 
 
-def plot_pion_examples(
+def plot_pion_example_pages(
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
     y_test: np.ndarray,
@@ -656,58 +792,93 @@ def plot_pion_examples(
     entries_test: np.ndarray,
     truth_pion_counts_test: np.ndarray,
     output: Path,
-    example_count: int = 3,
-) -> str:
-    """Draw high-scoring truth-pion events with their pion composition."""
+    threshold: float,
+    examples_per_page: int = 3,
+) -> List[str]:
+    """Draw high-, boundary-, and low-scoring held-out truth-pion pages."""
     pion_indices = np.flatnonzero(y_test == 1)
     if len(pion_indices) == 0:
-        return ""
-    order = pion_indices[np.argsort(test_scores[pion_indices])[::-1]][:example_count]
-    fig, axes = plt.subplots(
-        len(order), 4, figsize=(16, 3.8 * len(order)), squeeze=False
-    )
+        return []
+
+    ranking_options = [
+        (
+            "high_score",
+            "Highest-scoring held-out truth-pion events",
+            pion_indices[np.argsort(test_scores[pion_indices])[::-1]],
+        ),
+        (
+            "boundary_score",
+            f"Truth-pion events closest to score threshold {threshold:.2f}",
+            pion_indices[
+                np.argsort(np.abs(test_scores[pion_indices] - threshold))
+            ],
+        ),
+        (
+            "low_score",
+            "Lowest-scoring held-out truth-pion events",
+            pion_indices[np.argsort(test_scores[pion_indices])],
+        ),
+    ]
     column_titles = [
         "Angular full hitPE",
         "Angular tank-cluster hitPE",
         "Unfolded full hitPE",
         "Unfolded tank-cluster hitPE",
     ]
-    for row_index, event_index in enumerate(order):
-        angular = images_test[event_index][:, 1:-1, :]
-        detector = detector_images_test[event_index]
-        panels = [
-            (angular[:, :, 0], "auto"),
-            (angular[:, :, 1], "auto"),
-            (detector[:, :, 0], "equal"),
-            (detector[:, :, 1], "equal"),
-        ]
-        for column, ((panel, aspect), title) in enumerate(
-            zip(panels, column_titles)
-        ):
-            axes[row_index, column].imshow(
-                panel, origin="lower", aspect=aspect, cmap="magma"
+    used_indices = set()
+    output_names = []
+    for page_tag, page_title, candidates in ranking_options:
+        order = []
+        for event_index in candidates:
+            integer_index = int(event_index)
+            if integer_index in used_indices:
+                continue
+            order.append(integer_index)
+            used_indices.add(integer_index)
+            if len(order) == examples_per_page:
+                break
+        if not order:
+            continue
+
+        fig, axes = plt.subplots(
+            len(order), 4, figsize=(16, 3.8 * len(order)), squeeze=False
+        )
+        for row_index, event_index in enumerate(order):
+            angular = images_test[event_index][:, 1:-1, :]
+            detector = detector_images_test[event_index]
+            panels = [
+                (angular[:, :, 0], "auto"),
+                (angular[:, :, 1], "auto"),
+                (detector[:, :, 0], "equal"),
+                (detector[:, :, 1], "equal"),
+            ]
+            for column, ((panel, aspect), title) in enumerate(
+                zip(panels, column_titles)
+            ):
+                axes[row_index, column].imshow(
+                    panel, origin="lower", aspect=aspect, cmap="magma"
+                )
+                axes[row_index, column].set_title(title, fontsize=9)
+            pi_plus, pi_minus, pi_zero = (
+                int(value) for value in truth_pion_counts_test[event_index]
             )
-            axes[row_index, column].set_title(title, fontsize=9)
-        pi_plus, pi_minus, pi_zero = (
-            int(value) for value in truth_pion_counts_test[event_index]
+            source_name = Path(str(source_paths_test[event_index])).name
+            axes[row_index, 0].set_ylabel(
+                f"{source_name}\nentry {int(entries_test[event_index])}\n"
+                f"score={test_scores[event_index]:.3f}\n"
+                f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}",
+                fontsize=8,
+            )
+        fig.suptitle(
+            f"{page_title} (truth information is annotation only)",
+            fontsize=12,
         )
-        source_name = Path(str(source_paths_test[event_index])).name
-        axes[row_index, 0].set_ylabel(
-            f"{source_name}\nentry {int(entries_test[event_index])}\n"
-            f"score={test_scores[event_index]:.3f}\n"
-            f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}",
-            fontsize=8,
-        )
-    fig.suptitle(
-        "Highest-scoring held-out truth-pion events "
-        "(truth information is annotation only)",
-        fontsize=12,
-    )
-    fig.tight_layout()
-    path = output.with_suffix(".pion_examples.png")
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    return path.name
+        fig.tight_layout()
+        path = output.with_suffix(f".pion_examples_{page_tag}.png")
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        output_names.append(path.name)
+    return output_names
 
 
 def _grad_cam_heatmaps(
@@ -876,9 +1047,20 @@ def evaluate_and_plot(
         efficiency_purity_plot,
         efficiency_purity_csv,
         configured_operating_point,
-        threshold_0p20_operating_point,
+        threshold_0p80_operating_point,
     ) = plot_efficiency_purity_vs_threshold(
         y_test, test_scores, output, threshold
+    )
+    pion_example_pages = plot_pion_example_pages(
+        images_test,
+        detector_images_test,
+        y_test,
+        test_scores,
+        source_paths_test,
+        entries_test,
+        truth_pion_counts_test,
+        output,
+        threshold,
     )
     return {
         "test_predictions": predictions_path.name,
@@ -886,6 +1068,7 @@ def evaluate_and_plot(
         "roc_auc_sklearn": roc_auc_value,
         "precision_recall_curve": pr_name,
         "average_precision": average_precision,
+        "brier_score": float(brier_score_loss(y_test, test_scores)),
         "score_distribution": plot_score_distribution(
             y_test, test_scores, output
         ),
@@ -897,7 +1080,7 @@ def evaluate_and_plot(
         "efficiency_purity_vs_threshold": efficiency_purity_plot,
         "efficiency_purity_vs_threshold_csv": efficiency_purity_csv,
         "pion_metrics_at_configured_threshold": configured_operating_point,
-        "pion_metrics_at_threshold_0p20": threshold_0p20_operating_point,
+        "pion_metrics_at_threshold_0p80": threshold_0p80_operating_point,
         "confusion_matrix": plot_confusion_matrix(
             y_test, test_scores, threshold, output
         ),
@@ -909,20 +1092,13 @@ def evaluate_and_plot(
             normalize=True,
             filename_suffix=".confusion_matrix_normalized.png",
         ),
-        "confusion_matrix_threshold_0p20": plot_confusion_matrix(
-            y_test,
-            test_scores,
-            0.20,
-            output,
-            filename_suffix=".confusion_matrix_threshold_0p20.png",
+        "confusion_matrix_score_bands": plot_score_band_confusion_matrix(
+            y_test, test_scores, output
         ),
-        "confusion_matrix_threshold_0p20_normalized": plot_confusion_matrix(
-            y_test,
-            test_scores,
-            0.20,
-            output,
-            normalize=True,
-            filename_suffix=".confusion_matrix_threshold_0p20_normalized.png",
+        "confusion_matrix_score_bands_normalized": (
+            plot_score_band_confusion_matrix(
+                y_test, test_scores, output, normalize=True
+            )
         ),
         "calibration_curve": plot_calibration_curve(y_test, test_scores, output),
         "training_curves": plot_training_curves(history_path, output),
@@ -936,16 +1112,7 @@ def evaluate_and_plot(
             output,
             threshold,
         ),
-        "pion_examples": plot_pion_examples(
-            images_test,
-            detector_images_test,
-            y_test,
-            test_scores,
-            source_paths_test,
-            entries_test,
-            truth_pion_counts_test,
-            output,
-        ),
+        "pion_example_pages": pion_example_pages,
         "gradcam_examples": plot_gradcam_examples(
             model,
             images_test,
@@ -985,11 +1152,14 @@ def main() -> None:
         raise ValueError(f"Both classes are required; class counts are {counts.tolist()}")
     indices = np.arange(len(labels))
     train_indices, temp_indices = train_test_split(
-        indices, test_size=0.30, random_state=args.seed, stratify=labels
+        indices,
+        test_size=VALIDATION_FRACTION + TEST_FRACTION,
+        random_state=args.seed,
+        stratify=labels,
     )
     val_indices, test_indices = train_test_split(
         temp_indices,
-        test_size=0.50,
+        test_size=TEST_FRACTION / (VALIDATION_FRACTION + TEST_FRACTION),
         random_state=args.seed,
         stratify=labels[temp_indices],
     )
@@ -1129,6 +1299,16 @@ def main() -> None:
         "event_selection_applied": not args.no_event_cuts,
         "bdt_preselection": not args.no_event_cuts,
         "threshold": args.threshold,
+        "data_split": {
+            "training_fraction": TRAIN_FRACTION,
+            "validation_fraction": VALIDATION_FRACTION,
+            "testing_fraction": TEST_FRACTION,
+            "training_events": int(len(train_indices)),
+            "validation_events": int(len(val_indices)),
+            "testing_events": int(len(test_indices)),
+            "stratified_by_truth_label": True,
+            "random_seed": args.seed,
+        },
         "class_counts": {"no_pion": int(counts[0]), "pion": int(counts[1])},
         "misaligned_events_rejected": n_misaligned,
         "test_metrics": {name: float(value) for name, value in metrics.items()},
@@ -1146,17 +1326,28 @@ def main() -> None:
     for name, value in evaluation_files.items():
         if isinstance(value, str) and value:
             print(f"  {name}: {value}")
+        elif isinstance(value, list):
+            for item in value:
+                print(f"  {name}: {item}")
+    print(
+        f"Probability calibration: Brier score="
+        f"{evaluation_files['brier_score']:.5f} (lower is better)"
+    )
     print("Pion operating points (score >= threshold):")
     for name in (
         "pion_metrics_at_configured_threshold",
-        "pion_metrics_at_threshold_0p20",
+        "pion_metrics_at_threshold_0p80",
     ):
         point = evaluation_files[name]
         print(
             f"  threshold={point['threshold']:.2f}: "
             f"efficiency={point['efficiency']:.5f}, "
             f"purity={point['purity']:.5f}, "
-            f"efficiency*purity={point['efficiency_x_purity']:.5f}"
+            f"efficiency*purity={point['efficiency_x_purity']:.5f}, "
+            f"specificity={point['specificity']:.5f}, "
+            f"balanced_accuracy={point['balanced_accuracy']:.5f}, "
+            f"F1={point['f1_score']:.5f}, "
+            f"MCC={point['matthews_correlation_coefficient']:.5f}"
         )
 
 

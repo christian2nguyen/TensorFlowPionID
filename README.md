@@ -249,13 +249,25 @@ This command is **Model A**, the PE-only, dual-view baseline. Each view uses
 exactly two channels (`hitPE` and `hitPE_tankcluster`) and no charge or timing
 inputs. Training also writes `annie_ring_pion.history.csv`, containing the
 per-epoch training and validation metrics used to identify the best stopping
-point. Evaluation includes count and true-class-normalized confusion matrices
-at the requested `--threshold`, plus corresponding matrices at a fixed pion
-score threshold of `0.20` (`score < 0.20` is classified as no pion).
+point. Events are split reproducibly and stratified by pion truth label into
+70% training, 15% validation, and 15% testing. Evaluation includes count and
+true-class-normalized confusion matrices
+at the requested `--threshold`. A separate confidence-band confusion matrix
+classifies `score < 0.20` as non-pion-like and `score > 0.80` as pion-like;
+events in the middle band are excluded and their count is printed on the plot.
+This confidence-band matrix is written in count and true-class-normalized forms.
 It also writes an efficiency/purity threshold scan as both PNG and CSV. Here,
 pion efficiency is `TP/(TP+FN)`, pion purity is `TP/(TP+FP)`, and the third
-curve is their product. The plot highlights score `0.20` and the configured
-`--threshold`.
+curve is their product. The plot highlights the `0.20` and `0.80` confidence
+boundaries and the configured `--threshold`. The CSV and JSON metadata also
+record specificity, balanced accuracy, ordinary accuracy, F1, and the Matthews
+correlation coefficient at each evaluated operating point. A Brier score
+provides a threshold-independent check of probability calibration.
+
+Three held-out truth-pion image pages are produced for visual validation: the
+highest-scoring pions, pions nearest the configured decision threshold, and the
+lowest-scoring pions. Each page shows up to three distinct events with all four
+PMT image views and pion-truth annotations.
 
 By default, Model A uses the reconstructed-event selection from
 `Fit_indivdiualPMT_Gaussian_Convolution.cpp`, with the charge-balance requirement
@@ -278,10 +290,11 @@ Training also writes test-set diagnostic products beside the model: ROC and
 precision-recall curves, score distributions, efficiency/background rejection
 versus threshold, a confusion matrix, a probability-calibration curve, training
 history plots, the most confident misclassified events, Grad-CAM examples for
-both image towers, and `annie_ring_pion.pion_examples.png`. The pion-example
-figure shows the full-event and tank-cluster PE channels in both angular and
-unfolded views for high-scoring held-out pion events; each row includes the
-source file, tree entry, model score, and the truth counts for pi+, pi-, and pi0.
+both image towers, and three pion-example pages. The pion-example pages show the
+full-event and tank-cluster PE channels in both angular and unfolded views for
+high-scoring, threshold-boundary, and low-scoring held-out pion events; each row
+includes the source file, tree entry, model score, and the truth counts for pi+,
+pi-, and pi0.
 The test CSV contains the same truth counts together with each event's source,
 entry, binary truth label, and pion score. Their filenames and summary metrics
 are stored under `evaluation` in the model JSON.
