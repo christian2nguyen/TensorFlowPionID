@@ -32,7 +32,10 @@ from annie_pmt_response import (
     PMT_TUNE_VARIANT_CHOICES,
     PMTResponse,
 )
-from annie_features import FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION
+from annie_features import (
+    FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION,
+    RING_EVENT_FEATURE_BRANCHES,
+)
 from annie_ring_images import (
     DEFAULT_GEOMETRY,
     DEFAULT_DETECTOR_HEIGHT,
@@ -167,6 +170,7 @@ def load_data(
     np.ndarray,
     np.ndarray,
     np.ndarray,
+    np.ndarray,
     str,
     int,
     PMTGeometry,
@@ -181,6 +185,7 @@ def load_data(
     print(response.describe())
     image_chunks: List[np.ndarray] = []
     detector_chunks: List[np.ndarray] = []
+    event_feature_chunks: List[np.ndarray] = []
     label_chunks: List[np.ndarray] = []
     truth_pion_chunks: List[np.ndarray] = []
     source_path_chunks: List[np.ndarray] = []
@@ -206,9 +211,11 @@ def load_data(
         True,
         args.charged_only,
         args.chunk_size,
+        event_feature_branches=RING_EVENT_FEATURE_BRANCHES,
     ):
         image_chunks.append(chunk["images"])
         detector_chunks.append(chunk["detector_images"])
+        event_feature_chunks.append(chunk["event_features"])
         label_chunks.append(chunk["labels"])
         truth_pion_chunks.append(chunk["truth_pion_counts"])
         entries = chunk["entries"]
@@ -227,6 +234,7 @@ def load_data(
     return (
         np.concatenate(image_chunks),
         np.concatenate(detector_chunks),
+        np.concatenate(event_feature_chunks),
         np.concatenate(label_chunks),
         np.concatenate(source_path_chunks),
         np.concatenate(entry_chunks),
@@ -473,6 +481,7 @@ def build_model(
     detector_shape: Tuple[int, ...],
     angular_train: np.ndarray,
     detector_train: np.ndarray,
+    event_features_train: np.ndarray,
 ) -> tf.keras.Model:
     angular_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="angular_channel_normalization"
@@ -480,19 +489,32 @@ def build_model(
     detector_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="detector_channel_normalization"
     )
+    event_feature_normalizer = tf.keras.layers.Normalization(
+        axis=-1, name="event_feature_normalization"
+    )
     angular_normalizer.adapt(angular_train)
     detector_normalizer.adapt(detector_train)
+    event_feature_normalizer.adapt(event_features_train)
     angular_inputs = tf.keras.Input(shape=angular_shape, name="pmt_angular_image")
     detector_inputs = tf.keras.Input(shape=detector_shape, name="pmt_unfolded_image")
+    event_feature_inputs = tf.keras.Input(
+        shape=(event_features_train.shape[1],), name="event_features"
+    )
     angular_features = _image_tower(angular_inputs, angular_normalizer, "angular")
     detector_features = _image_tower(detector_inputs, detector_normalizer, "detector")
-    x = tf.keras.layers.Concatenate(name="combined_views")(
-        [angular_features, detector_features]
+    event_features = event_feature_normalizer(event_feature_inputs)
+    event_features = tf.keras.layers.Dense(
+        8, activation="relu", name="event_feature_embedding"
+    )(event_features)
+    x = tf.keras.layers.Concatenate(name="combined_views_and_event_features")(
+        [angular_features, detector_features, event_features]
     )
     x = tf.keras.layers.Dense(32, activation="relu")(x)
     x = tf.keras.layers.Dropout(0.30)(x)
     outputs = tf.keras.layers.Dense(1, activation="sigmoid", name="pion_score")(x)
-    model = tf.keras.Model([angular_inputs, detector_inputs], outputs)
+    model = tf.keras.Model(
+        [angular_inputs, detector_inputs, event_feature_inputs], outputs
+    )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
         loss="binary_crossentropy",
@@ -961,6 +983,7 @@ def plot_training_curves(history_path: Path, output: Path) -> str:
 def plot_misclassified_gallery(
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
+    event_features_test: np.ndarray,
     y_test: np.ndarray,
     test_scores: np.ndarray,
     source_paths_test: np.ndarray,
@@ -1033,11 +1056,14 @@ def plot_misclassified_gallery(
                 if np.isfinite(pion_kinetic_energy)
                 else "Tπ=n/a"
             )
+            num_mrd_tracks, cluster_charge_balance = event_features_test[event_index]
             caption = (
                 f"{title}\n{source_name} — entry {int(entries_test[event_index])}\n"
                 f"truth={true_label}, prediction={predicted_label}, "
                 f"score={test_scores[event_index]:.3f}\n"
                 f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}; {angle_text}\n"
+                f"numMRDTracks={num_mrd_tracks:.0f}, "
+                f"clusterChargeBalance={cluster_charge_balance:.3f}\n"
                 f"truth {muon_energy_text}, {pion_energy_text}"
             )
             axes[row_index, 0].imshow(
@@ -1059,6 +1085,7 @@ def plot_misclassified_gallery(
 def plot_misclassified_event_pdf(
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
+    event_features_test: np.ndarray,
     y_test: np.ndarray,
     test_scores: np.ndarray,
     source_paths_test: np.ndarray,
@@ -1159,12 +1186,15 @@ def plot_misclassified_event_pdf(
                 if np.isfinite(pion_kinetic_energy)
                 else "Tπ=n/a"
             )
+            num_mrd_tracks, cluster_charge_balance = event_features_test[event_index]
             category_title = category.replace("_", " ").title()
             annotation = (
                 f"{category_title}: truth={true_label}, prediction={predicted_label}, "
                 f"score={test_scores[event_index]:.3f}\n"
                 f"{source_name} - entry {int(entries_test[event_index])}\n"
                 f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}; {angle_text}; "
+                f"numMRDTracks={num_mrd_tracks:.0f}; "
+                f"clusterChargeBalance={cluster_charge_balance:.3f}\n"
                 f"truth {muon_energy_text}, {pion_energy_text}"
             )
 
@@ -1194,6 +1224,7 @@ def plot_pion_example_pages(
     model: tf.keras.Model,
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
+    event_features_test: np.ndarray,
     y_test: np.ndarray,
     test_scores: np.ndarray,
     source_paths_test: np.ndarray,
@@ -1267,6 +1298,7 @@ def plot_pion_example_pages(
         model_inputs = {
             "pmt_angular_image": angular_batch,
             "pmt_unfolded_image": detector_batch,
+            "event_features": event_features_test[order],
         }
         angular_heatmaps = _grad_cam_heatmaps(
             model,
@@ -1355,10 +1387,13 @@ def plot_pion_example_pages(
                 if np.isfinite(pion_kinetic_energy)
                 else "Tπ=n/a"
             )
+            num_mrd_tracks, cluster_charge_balance = event_features_test[event_index]
             axes[row_index, 0].set_ylabel(
                 f"{source_name}\nentry {int(entries_test[event_index])}\n"
                 f"score={test_scores[event_index]:.3f}\n"
                 f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}\n{angle_text}\n"
+                f"numMRDTracks={num_mrd_tracks:.0f}, "
+                f"charge balance={cluster_charge_balance:.3f}\n"
                 f"truth {muon_energy_text}, {pion_energy_text}",
                 fontsize=8,
             )
@@ -1404,6 +1439,7 @@ def plot_gradcam_examples(
     model: tf.keras.Model,
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
+    event_features_test: np.ndarray,
     y_test: np.ndarray,
     test_scores: np.ndarray,
     output: Path,
@@ -1433,6 +1469,7 @@ def plot_gradcam_examples(
     model_inputs = {
         "pmt_angular_image": angular_batch,
         "pmt_unfolded_image": detector_batch,
+        "event_features": event_features_test[selected_indices],
     }
     angular_heatmaps = _grad_cam_heatmaps(
         model,
@@ -1488,6 +1525,7 @@ def evaluate_and_plot(
     model: tf.keras.Model,
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
+    event_features_test: np.ndarray,
     y_test: np.ndarray,
     source_paths_test: np.ndarray,
     entries_test: np.ndarray,
@@ -1502,6 +1540,7 @@ def evaluate_and_plot(
         {
             "pmt_angular_image": images_test,
             "pmt_unfolded_image": detector_images_test,
+            "event_features": event_features_test,
         },
         verbose=0,
     ).reshape(-1)
@@ -1544,6 +1583,7 @@ def evaluate_and_plot(
                 "truth_leading_pion_muon_opening_angle_deg",
                 "truth_muon_kinetic_energy_GeV",
                 "truth_leading_pion_kinetic_energy_GeV",
+                *RING_EVENT_FEATURE_BRANCHES,
                 "pion_score",
             ]
         )
@@ -1558,6 +1598,8 @@ def evaluate_and_plot(
                 truth_muon_pion_angles.astype(float).tolist(),
                 truth_muon_kinetic_energy.astype(float).tolist(),
                 truth_pion_kinetic_energy.astype(float).tolist(),
+                event_features_test[:, 0].astype(float).tolist(),
+                event_features_test[:, 1].astype(float).tolist(),
                 test_scores.astype(float).tolist(),
             )
         )
@@ -1580,6 +1622,7 @@ def evaluate_and_plot(
         model,
         images_test,
         detector_images_test,
+        event_features_test,
         y_test,
         test_scores,
         source_paths_test,
@@ -1657,6 +1700,7 @@ def evaluate_and_plot(
         "misclassified_gallery": plot_misclassified_gallery(
             images_test,
             detector_images_test,
+            event_features_test,
             y_test,
             test_scores,
             source_paths_test,
@@ -1671,6 +1715,7 @@ def evaluate_and_plot(
         "misclassified_events_pdf": plot_misclassified_event_pdf(
             images_test,
             detector_images_test,
+            event_features_test,
             y_test,
             test_scores,
             source_paths_test,
@@ -1687,6 +1732,7 @@ def evaluate_and_plot(
             model,
             images_test,
             detector_images_test,
+            event_features_test,
             y_test,
             test_scores,
             output,
@@ -1708,6 +1754,7 @@ def main() -> None:
     (
         images,
         detector_images,
+        event_features,
         labels,
         source_paths,
         entries,
@@ -1749,17 +1796,20 @@ def main() -> None:
         tuple(detector_images.shape[1:]),
         images[train_indices],
         detector_images[train_indices],
+        event_features[train_indices],
     )
     model.fit(
         {
             "pmt_angular_image": images[train_indices],
             "pmt_unfolded_image": detector_images[train_indices],
+            "event_features": event_features[train_indices],
         },
         y_train,
         validation_data=(
             {
                 "pmt_angular_image": images[val_indices],
                 "pmt_unfolded_image": detector_images[val_indices],
+                "event_features": event_features[val_indices],
             },
             y_val,
         ),
@@ -1786,6 +1836,7 @@ def main() -> None:
         {
             "pmt_angular_image": images[test_indices],
             "pmt_unfolded_image": detector_images[test_indices],
+            "event_features": event_features[test_indices],
         },
         y_test,
         return_dict=True,
@@ -1800,6 +1851,7 @@ def main() -> None:
         model,
         images[test_indices],
         detector_images[test_indices],
+        event_features[test_indices],
         y_test,
         source_paths[test_indices],
         entries[test_indices],
@@ -1817,7 +1869,7 @@ def main() -> None:
     )
     metadata = {
         "model_type": "annie_pion_ring_cnn",
-        "model_variant": "A_PE_dual_view",
+        "model_variant": "B_PE_dual_view_plus_event_features",
         "tensorflow_version": tf.__version__,
         "training_sources": [str(path) for path in args.root_files],
         "tree": args.tree,
@@ -1863,6 +1915,11 @@ def main() -> None:
             "vertex_centered_equirectangular_with_azimuth_wrap",
             "annotation_free_unfolded_barrel_top_bottom",
         ],
+        "event_feature_input_name": "event_features",
+        "event_feature_branches": RING_EVENT_FEATURE_BRANCHES,
+        "event_feature_preprocessing": (
+            "finite_only_then_keras_normalization_adapted_on_training_split"
+        ),
         "label": "charged_pion_present" if args.charged_only else "any_pion_present",
         "truth_branches": ["truePiPlusCher", "truePiMinusCher", "truePi0"],
         "truth_muon_pion_opening_angle_annotation_only": True,

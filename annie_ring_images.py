@@ -427,6 +427,7 @@ def iterate_ring_images(
     include_truth: bool,
     charged_only: bool,
     chunk_size: str,
+    event_feature_branches: Optional[List[str]] = None,
 ) -> Iterator[Dict[str, object]]:
     if isinstance(event_selection, bool):
         selection_mode = "fit_individual_pmt" if event_selection else "none"
@@ -455,6 +456,8 @@ def iterate_ring_images(
                 requested.extend(BDT_CUT_BRANCHES)
             if include_truth:
                 requested.extend(TRUTH_BRANCHES)
+            if event_feature_branches:
+                requested.extend(event_feature_branches)
             missing = [name for name in requested if name not in available]
             if missing:
                 raise ValueError(f"{path} is missing branches: {', '.join(missing)}")
@@ -498,6 +501,12 @@ def iterate_ring_images(
                     selected &= build_fit_individual_pmt_selection(arrays)
                 elif selection_mode == "legacy_bdt":
                     selected &= build_bdt_selection(arrays)
+                event_features = None
+                if event_feature_branches:
+                    event_features = np.column_stack(
+                        [_numpy(arrays[name]) for name in event_feature_branches]
+                    ).astype(np.float32, copy=False)
+                    selected &= np.isfinite(event_features).all(axis=1)
                 result: Dict[str, object] = {
                     "path": path,
                     "entries": entry_numbers[selected],
@@ -508,6 +517,8 @@ def iterate_ring_images(
                     "n_selected": int(selected.sum()),
                     "n_misaligned": int((~aligned).sum()),
                 }
+                if event_features is not None:
+                    result["event_features"] = event_features[selected]
                 if include_truth:
                     result["labels"] = build_pion_labels(arrays, charged_only)[selected]
                     result["truth_pion_counts"] = np.column_stack(

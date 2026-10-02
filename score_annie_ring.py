@@ -94,6 +94,7 @@ def main() -> None:
             "legacy_bdt" if metadata.get("bdt_preselection", False) else "none"
         )
     with args.output.open("w", newline="", encoding="utf-8") as handle:
+        event_feature_branches = list(metadata.get("event_feature_branches", []))
         writer = csv.DictWriter(
             handle,
             fieldnames=[
@@ -102,6 +103,7 @@ def main() -> None:
                 "pmt_response",
                 "pmt_tune_variant",
                 "pmt_response_payload_format",
+                *event_feature_branches,
                 "pion_score",
                 "pion_prediction",
             ],
@@ -124,30 +126,40 @@ def main() -> None:
             False,
             False,
             args.chunk_size,
+            event_feature_branches=event_feature_branches,
         ):
             images = chunk["images"]
             if len(images) == 0:
                 continue
-            scores = model.predict(
-                {
-                    "pmt_angular_image": images,
-                    "pmt_unfolded_image": chunk["detector_images"],
-                },
-                verbose=0,
-            ).reshape(-1)
+            model_inputs = {
+                "pmt_angular_image": images,
+                "pmt_unfolded_image": chunk["detector_images"],
+            }
+            if event_feature_branches:
+                model_inputs["event_features"] = chunk["event_features"]
+            scores = model.predict(model_inputs, verbose=0).reshape(-1)
             threshold = float(metadata["threshold"])
-            for entry, score in zip(chunk["entries"], scores):
-                writer.writerow(
-                    {
-                        "source_file": str(chunk["path"]),
-                        "tree_entry": int(entry),
-                        "pmt_response": response.mode,
-                        "pmt_tune_variant": response.tune_variant,
-                        "pmt_response_payload_format": response.payload_format,
-                        "pion_score": float(score),
-                        "pion_prediction": int(score >= threshold),
-                    }
-                )
+            feature_rows = chunk.get("event_features")
+            for row_index, (entry, score) in enumerate(zip(chunk["entries"], scores)):
+                output_row = {
+                    "source_file": str(chunk["path"]),
+                    "tree_entry": int(entry),
+                    "pmt_response": response.mode,
+                    "pmt_tune_variant": response.tune_variant,
+                    "pmt_response_payload_format": response.payload_format,
+                    "pion_score": float(score),
+                    "pion_prediction": int(score >= threshold),
+                }
+                if feature_rows is not None:
+                    output_row.update(
+                        {
+                            name: float(feature_rows[row_index, feature_index])
+                            for feature_index, name in enumerate(
+                                event_feature_branches
+                            )
+                        }
+                    )
+                writer.writerow(output_row)
                 written += 1
     print(f"Wrote {written} selected event scores to {args.output}")
 

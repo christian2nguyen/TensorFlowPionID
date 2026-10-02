@@ -21,6 +21,11 @@ FEATURE_NAMES = [
 
 TRUTH_BRANCHES = ["truePiPlusCher", "truePiMinusCher", "truePi0"]
 
+RING_EVENT_FEATURE_BRANCHES = [
+    "numMRDTracks",
+    "clusterChargeBalance_tankcluster_pmt_filtered",
+]
+
 BDT_CUT_BRANCHES = [
     "simpleRecoFV",
     "promptMuonTotalPE",

@@ -236,6 +236,20 @@ python score_annie_ring.py artifacts/annie_ring_pion.h5 sample.root \
   --output annie_ring_scores.csv
 ```
 
+Export the trained hybrid model for C++ inference with the exporter in this
+project. Its serving signature includes both image tensors and the ordered
+two-value `event_features` tensor:
+
+```bash
+python export_annie_ring_saved_model.py \
+  artifacts/annie_ring_pion.h5 \
+  artifacts/annie_ring_pion_saved_model
+```
+
+The feature order saved in the JSON metadata and required by inference is
+`numMRDTracks` followed by
+`clusterChargeBalance_tankcluster_pmt_filtered`.
+
 For long input lists, place one ROOT path per line in a text file. Blank lines
 and comments beginning with `#` are ignored; relative paths are resolved from
 the list file's directory:
@@ -245,12 +259,19 @@ python train_annie_ring.py --file-list simulation_files.txt \
   --output artifacts/annie_ring_pion.h5
 ```
 
-This command is **Model A**, the PE-only, dual-view baseline. Each view uses
-exactly two channels (`hitPE` and `hitPE_tankcluster`) and no charge or timing
-inputs. Training also writes `annie_ring_pion.history.csv`, containing the
-per-epoch training and validation metrics used to identify the best stopping
-point. Events are split reproducibly and stratified by pion truth label into
-70% training, 15% validation, and 15% testing. Evaluation includes count and
+This command is **Model B**, a hybrid classifier. Its two image views each use
+exactly two channels (`hitPE` and `hitPE_tankcluster`), while a separate scalar
+input contains only `numMRDTracks` and
+`clusterChargeBalance_tankcluster_pmt_filtered`. The two scalar features are
+required to be finite and are normalized by a Keras normalization layer adapted
+only on the training subset. They are passed through a small dense embedding and
+joined to the two CNN image representations before the final classifier. The
+charge-balance value is an input feature, not an event-selection cut.
+
+Training also writes `annie_ring_pion.history.csv`, containing the per-epoch
+training and validation metrics used to identify the best stopping point.
+Events are split reproducibly and stratified by pion truth label into 70%
+training, 15% validation, and 15% testing. Evaluation includes count and
 true-class-normalized confusion matrices
 at the requested `--threshold`. A separate confidence-band confusion matrix
 classifies `score < 0.20` as non-pion-like and `score > 0.80` as pion-like;
@@ -274,7 +295,7 @@ to three events with all four PMT image views and pion-truth annotations.
 The annotations include the truth muon and leading-pion kinetic energies in GeV
 when their truth momentum vectors are available.
 
-By default, Model A uses the reconstructed-event selection from
+By default, Model B uses the reconstructed-event selection from
 `Fit_indivdiualPMT_Gaussian_Convolution.cpp`, with the charge-balance requirement
 intentionally omitted for training:
 
@@ -359,7 +380,7 @@ python view_annie_ring.py simulation.root 42 --pmt-mask all
 
 ### Optional per-PMT response tuning
 
-Model A uses raw PE by default. For simulated events it can replay the
+The ring model uses raw PE by default. For simulated events it can replay the
 `final_pmt_tuning_parameters` payload written by
 `Fit_indivdiualPMT_Gaussian_Convolution.cpp`. This payload has independent
 regional parameters for full-event `hitPE` (`branch_kind=0`) and tank-cluster
