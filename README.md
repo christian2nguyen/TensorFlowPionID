@@ -310,12 +310,12 @@ The annotations include the truth muon and leading-pion kinetic energies in GeV
 when their truth momentum vectors are available.
 
 By default, Model B uses the reconstructed-event selection from
-`Fit_indivdiualPMT_Gaussian_Convolution.cpp`, with the charge-balance requirement
-intentionally omitted for training:
+`Fit_indivdiualPMT_Gaussian_Convolution.cpp`, with the charge-balance and
+`sel_promptMuonTotalPE_pmt_filtered` requirements intentionally omitted for
+training:
 
 ```text
 sel_CC0pi_wc
-&& sel_promptMuonTotalPE_pmt_filtered
 && sel_clusterHist_tankcluster_branch
 && clusterHits_tankcluster > 55
 && match_found

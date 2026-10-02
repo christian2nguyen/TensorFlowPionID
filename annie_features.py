@@ -63,19 +63,17 @@ BDT_CUT_BRANCHES = [
 
 # Event selection based on the one used to derive the per-PMT response
 # calibration in Fit_indivdiualPMT_Gaussian_Convolution.cpp. The charge-balance
-# requirement is intentionally omitted for model training.
+# and prompt-muon-total-PE requirements are intentionally omitted for training.
 FIT_INDIVIDUAL_PMT_CUT_BRANCHES = [
     "sel_CC0pi_wc",
-    "sel_promptMuonTotalPE_pmt_filtered",
     "sel_clusterHist_tankcluster_branch",
     "clusterHits_tankcluster",
     "match_found",
 ]
 
 FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION = (
-    "sel_CC0pi_wc && sel_promptMuonTotalPE_pmt_filtered && "
-    "sel_clusterHist_tankcluster_branch && clusterHits_tankcluster > 55 && "
-    "match_found"
+    "sel_CC0pi_wc && sel_clusterHist_tankcluster_branch && "
+    "clusterHits_tankcluster > 55 && match_found"
 )
 
 TANKCLUSTER_ALIASES = [
@@ -220,10 +218,9 @@ def build_bdt_selection(arrays) -> np.ndarray:
 
 
 def build_fit_individual_pmt_selection(arrays) -> np.ndarray:
-    """Apply the fit-derived event cuts without a charge-balance requirement."""
+    """Apply the reduced fit-derived event selection used for training."""
     return (
         (_to_numpy(arrays["sel_CC0pi_wc"]) != 0)
-        & (_to_numpy(arrays["sel_promptMuonTotalPE_pmt_filtered"]) != 0)
         & (_to_numpy(arrays["sel_clusterHist_tankcluster_branch"]) != 0)
         & (_to_numpy(arrays["clusterHits_tankcluster"]) > 55)
         & (_to_numpy(arrays["match_found"]) != 0)
