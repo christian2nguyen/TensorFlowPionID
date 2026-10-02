@@ -34,7 +34,11 @@ from annie_pmt_response import (
 )
 from annie_features import (
     FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION,
-    RING_EVENT_FEATURE_BRANCHES,
+    MAX_MRD_TRACKS,
+    MRD_TRACK_PROPERTY_BRANCHES,
+    MRD_TRACK_START_BRANCHES,
+    RING_EVENT_FEATURE_NAMES,
+    RING_EVENT_SCALAR_BRANCHES,
 )
 from annie_ring_images import (
     DEFAULT_GEOMETRY,
@@ -171,7 +175,11 @@ def load_data(
     np.ndarray,
     np.ndarray,
     np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
     str,
+    int,
     int,
     PMTGeometry,
     PMTResponse,
@@ -186,6 +194,9 @@ def load_data(
     image_chunks: List[np.ndarray] = []
     detector_chunks: List[np.ndarray] = []
     event_feature_chunks: List[np.ndarray] = []
+    mrd_track_start_chunks: List[np.ndarray] = []
+    mrd_track_property_chunks: List[np.ndarray] = []
+    mrd_track_mask_chunks: List[np.ndarray] = []
     label_chunks: List[np.ndarray] = []
     truth_pion_chunks: List[np.ndarray] = []
     source_path_chunks: List[np.ndarray] = []
@@ -194,6 +205,7 @@ def load_data(
     n_read = 0
     n_selected = 0
     n_misaligned = 0
+    n_mrd_tracks_truncated = 0
     for chunk in iterate_ring_images(
         args.root_files,
         args.tree,
@@ -211,11 +223,14 @@ def load_data(
         True,
         args.charged_only,
         args.chunk_size,
-        event_feature_branches=RING_EVENT_FEATURE_BRANCHES,
+        include_ring_event_features=True,
     ):
         image_chunks.append(chunk["images"])
         detector_chunks.append(chunk["detector_images"])
         event_feature_chunks.append(chunk["event_features"])
+        mrd_track_start_chunks.append(chunk["mrd_track_starts"])
+        mrd_track_property_chunks.append(chunk["mrd_track_properties"])
+        mrd_track_mask_chunks.append(chunk["mrd_track_mask"])
         label_chunks.append(chunk["labels"])
         truth_pion_chunks.append(chunk["truth_pion_counts"])
         entries = chunk["entries"]
@@ -227,6 +242,7 @@ def load_data(
         n_read += int(chunk["n_read"])
         n_selected += int(chunk["n_selected"])
         n_misaligned += int(chunk["n_misaligned"])
+        n_mrd_tracks_truncated += int(chunk["n_mrd_tracks_truncated"])
         print(f"Read {n_read}; selected {n_selected}", end="\r", flush=True)
     print()
     if not image_chunks or n_selected == 0:
@@ -235,12 +251,16 @@ def load_data(
         np.concatenate(image_chunks),
         np.concatenate(detector_chunks),
         np.concatenate(event_feature_chunks),
+        np.concatenate(mrd_track_start_chunks),
+        np.concatenate(mrd_track_property_chunks),
+        np.concatenate(mrd_track_mask_chunks),
         np.concatenate(label_chunks),
         np.concatenate(source_path_chunks),
         np.concatenate(entry_chunks),
         np.concatenate(truth_pion_chunks),
         tank_branch,
         n_misaligned,
+        n_mrd_tracks_truncated,
         geometry,
         response,
     )
@@ -482,6 +502,9 @@ def build_model(
     angular_train: np.ndarray,
     detector_train: np.ndarray,
     event_features_train: np.ndarray,
+    mrd_track_starts_train: np.ndarray,
+    mrd_track_properties_train: np.ndarray,
+    mrd_track_mask_train: np.ndarray,
 ) -> tf.keras.Model:
     angular_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="angular_channel_normalization"
@@ -492,13 +515,38 @@ def build_model(
     event_feature_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="event_feature_normalization"
     )
+    mrd_track_normalizer = tf.keras.layers.Normalization(
+        axis=-1, name="mrd_track_coordinate_normalization"
+    )
+    mrd_property_normalizer = tf.keras.layers.Normalization(
+        axis=-1, name="mrd_track_property_normalization"
+    )
     angular_normalizer.adapt(angular_train)
     detector_normalizer.adapt(detector_train)
     event_feature_normalizer.adapt(event_features_train)
+    valid_track_starts = mrd_track_starts_train[
+        mrd_track_mask_train.astype(bool)
+    ]
+    valid_track_properties = mrd_track_properties_train[
+        mrd_track_mask_train.astype(bool)
+    ]
+    if len(valid_track_starts) == 0:
+        raise ValueError("At least one MRD track is required in the training split")
+    mrd_track_normalizer.adapt(valid_track_starts)
+    mrd_property_normalizer.adapt(valid_track_properties)
     angular_inputs = tf.keras.Input(shape=angular_shape, name="pmt_angular_image")
     detector_inputs = tf.keras.Input(shape=detector_shape, name="pmt_unfolded_image")
     event_feature_inputs = tf.keras.Input(
         shape=(event_features_train.shape[1],), name="event_features"
+    )
+    mrd_track_start_inputs = tf.keras.Input(
+        shape=(MAX_MRD_TRACKS, 3), name="mrd_track_starts"
+    )
+    mrd_track_property_inputs = tf.keras.Input(
+        shape=(MAX_MRD_TRACKS, 3), name="mrd_track_properties"
+    )
+    mrd_track_mask_inputs = tf.keras.Input(
+        shape=(MAX_MRD_TRACKS,), name="mrd_track_mask"
     )
     angular_features = _image_tower(angular_inputs, angular_normalizer, "angular")
     detector_features = _image_tower(detector_inputs, detector_normalizer, "detector")
@@ -506,14 +554,46 @@ def build_model(
     event_features = tf.keras.layers.Dense(
         8, activation="relu", name="event_feature_embedding"
     )(event_features)
+    normalized_track_starts = mrd_track_normalizer(mrd_track_start_inputs)
+    normalized_track_properties = mrd_property_normalizer(
+        mrd_track_property_inputs
+    )
+    mrd_track_features = tf.keras.layers.Concatenate(
+        axis=-1, name="combined_mrd_track_values"
+    )([normalized_track_starts, normalized_track_properties])
+    mrd_track_features = tf.keras.layers.Dense(
+        16, activation="relu", name="shared_mrd_track_embedding"
+    )(mrd_track_features)
+    expanded_track_mask = tf.keras.layers.Reshape(
+        (MAX_MRD_TRACKS, 1), name="expanded_mrd_track_mask"
+    )(mrd_track_mask_inputs)
+    mrd_track_features = tf.keras.layers.Multiply(
+        name="masked_mrd_track_embeddings"
+    )([mrd_track_features, expanded_track_mask])
+    mrd_track_features = tf.keras.layers.GlobalMaxPooling1D(
+        name="mrd_track_set_features"
+    )(mrd_track_features)
     x = tf.keras.layers.Concatenate(name="combined_views_and_event_features")(
-        [angular_features, detector_features, event_features]
+        [
+            angular_features,
+            detector_features,
+            event_features,
+            mrd_track_features,
+        ]
     )
     x = tf.keras.layers.Dense(32, activation="relu")(x)
     x = tf.keras.layers.Dropout(0.30)(x)
     outputs = tf.keras.layers.Dense(1, activation="sigmoid", name="pion_score")(x)
     model = tf.keras.Model(
-        [angular_inputs, detector_inputs, event_feature_inputs], outputs
+        [
+            angular_inputs,
+            detector_inputs,
+            event_feature_inputs,
+            mrd_track_start_inputs,
+            mrd_track_property_inputs,
+            mrd_track_mask_inputs,
+        ],
+        outputs,
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
@@ -980,10 +1060,41 @@ def plot_training_curves(history_path: Path, output: Path) -> str:
     return path.name
 
 
+def _format_event_features(
+    feature_values: np.ndarray,
+    track_starts: np.ndarray,
+    track_properties: np.ndarray,
+    track_mask: np.ndarray,
+) -> Tuple[str, str]:
+    """Format the MRD multiplicity and retained exact start positions."""
+    num_mrd_tracks = feature_values[0]
+    scalar_text = f"numMRDTracks={num_mrd_tracks:.0f}"
+    valid_positions = track_starts[track_mask.astype(bool)]
+    valid_properties = track_properties[track_mask.astype(bool)]
+    if len(valid_positions) == 0:
+        position_text = "MRD tracks: none"
+    else:
+        position_text = "MRD tracks: " + "; ".join(
+            (
+                f"{index}: start=({x:.3f}, {y:.3f}, {z:.3f}), "
+                f"dE={energy_loss:.3f}, L={length:.3f}, angle={angle:.3f}"
+            )
+            for index, ((x, y, z), (energy_loss, length, angle)) in enumerate(
+                zip(valid_positions, valid_properties)
+            )
+        )
+        if num_mrd_tracks > MAX_MRD_TRACKS:
+            position_text += f"; first {MAX_MRD_TRACKS} shown"
+    return scalar_text, position_text
+
+
 def plot_misclassified_gallery(
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
     event_features_test: np.ndarray,
+    mrd_track_starts_test: np.ndarray,
+    mrd_track_properties_test: np.ndarray,
+    mrd_track_mask_test: np.ndarray,
     y_test: np.ndarray,
     test_scores: np.ndarray,
     source_paths_test: np.ndarray,
@@ -1056,14 +1167,18 @@ def plot_misclassified_gallery(
                 if np.isfinite(pion_kinetic_energy)
                 else "Tπ=n/a"
             )
-            num_mrd_tracks, cluster_charge_balance = event_features_test[event_index]
+            scalar_text, position_text = _format_event_features(
+                event_features_test[event_index],
+                mrd_track_starts_test[event_index],
+                mrd_track_properties_test[event_index],
+                mrd_track_mask_test[event_index],
+            )
             caption = (
                 f"{title}\n{source_name} — entry {int(entries_test[event_index])}\n"
                 f"truth={true_label}, prediction={predicted_label}, "
                 f"score={test_scores[event_index]:.3f}\n"
                 f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}; {angle_text}\n"
-                f"numMRDTracks={num_mrd_tracks:.0f}, "
-                f"clusterChargeBalance={cluster_charge_balance:.3f}\n"
+                f"{scalar_text}\n{position_text}\n"
                 f"truth {muon_energy_text}, {pion_energy_text}"
             )
             axes[row_index, 0].imshow(
@@ -1086,6 +1201,9 @@ def plot_misclassified_event_pdf(
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
     event_features_test: np.ndarray,
+    mrd_track_starts_test: np.ndarray,
+    mrd_track_properties_test: np.ndarray,
+    mrd_track_mask_test: np.ndarray,
     y_test: np.ndarray,
     test_scores: np.ndarray,
     source_paths_test: np.ndarray,
@@ -1186,15 +1304,19 @@ def plot_misclassified_event_pdf(
                 if np.isfinite(pion_kinetic_energy)
                 else "Tπ=n/a"
             )
-            num_mrd_tracks, cluster_charge_balance = event_features_test[event_index]
+            scalar_text, position_text = _format_event_features(
+                event_features_test[event_index],
+                mrd_track_starts_test[event_index],
+                mrd_track_properties_test[event_index],
+                mrd_track_mask_test[event_index],
+            )
             category_title = category.replace("_", " ").title()
             annotation = (
                 f"{category_title}: truth={true_label}, prediction={predicted_label}, "
                 f"score={test_scores[event_index]:.3f}\n"
                 f"{source_name} - entry {int(entries_test[event_index])}\n"
                 f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}; {angle_text}; "
-                f"numMRDTracks={num_mrd_tracks:.0f}; "
-                f"clusterChargeBalance={cluster_charge_balance:.3f}\n"
+                f"{scalar_text}\n{position_text}\n"
                 f"truth {muon_energy_text}, {pion_energy_text}"
             )
 
@@ -1225,6 +1347,9 @@ def plot_pion_example_pages(
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
     event_features_test: np.ndarray,
+    mrd_track_starts_test: np.ndarray,
+    mrd_track_properties_test: np.ndarray,
+    mrd_track_mask_test: np.ndarray,
     y_test: np.ndarray,
     test_scores: np.ndarray,
     source_paths_test: np.ndarray,
@@ -1299,6 +1424,9 @@ def plot_pion_example_pages(
             "pmt_angular_image": angular_batch,
             "pmt_unfolded_image": detector_batch,
             "event_features": event_features_test[order],
+            "mrd_track_starts": mrd_track_starts_test[order],
+            "mrd_track_properties": mrd_track_properties_test[order],
+            "mrd_track_mask": mrd_track_mask_test[order],
         }
         angular_heatmaps = _grad_cam_heatmaps(
             model,
@@ -1387,13 +1515,17 @@ def plot_pion_example_pages(
                 if np.isfinite(pion_kinetic_energy)
                 else "Tπ=n/a"
             )
-            num_mrd_tracks, cluster_charge_balance = event_features_test[event_index]
+            scalar_text, position_text = _format_event_features(
+                event_features_test[event_index],
+                mrd_track_starts_test[event_index],
+                mrd_track_properties_test[event_index],
+                mrd_track_mask_test[event_index],
+            )
             axes[row_index, 0].set_ylabel(
                 f"{source_name}\nentry {int(entries_test[event_index])}\n"
                 f"score={test_scores[event_index]:.3f}\n"
                 f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}\n{angle_text}\n"
-                f"numMRDTracks={num_mrd_tracks:.0f}, "
-                f"charge balance={cluster_charge_balance:.3f}\n"
+                f"{scalar_text}\n{position_text}\n"
                 f"truth {muon_energy_text}, {pion_energy_text}",
                 fontsize=8,
             )
@@ -1440,6 +1572,9 @@ def plot_gradcam_examples(
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
     event_features_test: np.ndarray,
+    mrd_track_starts_test: np.ndarray,
+    mrd_track_properties_test: np.ndarray,
+    mrd_track_mask_test: np.ndarray,
     y_test: np.ndarray,
     test_scores: np.ndarray,
     output: Path,
@@ -1470,6 +1605,9 @@ def plot_gradcam_examples(
         "pmt_angular_image": angular_batch,
         "pmt_unfolded_image": detector_batch,
         "event_features": event_features_test[selected_indices],
+        "mrd_track_starts": mrd_track_starts_test[selected_indices],
+        "mrd_track_properties": mrd_track_properties_test[selected_indices],
+        "mrd_track_mask": mrd_track_mask_test[selected_indices],
     }
     angular_heatmaps = _grad_cam_heatmaps(
         model,
@@ -1526,6 +1664,9 @@ def evaluate_and_plot(
     images_test: np.ndarray,
     detector_images_test: np.ndarray,
     event_features_test: np.ndarray,
+    mrd_track_starts_test: np.ndarray,
+    mrd_track_properties_test: np.ndarray,
+    mrd_track_mask_test: np.ndarray,
     y_test: np.ndarray,
     source_paths_test: np.ndarray,
     entries_test: np.ndarray,
@@ -1541,6 +1682,9 @@ def evaluate_and_plot(
             "pmt_angular_image": images_test,
             "pmt_unfolded_image": detector_images_test,
             "event_features": event_features_test,
+            "mrd_track_starts": mrd_track_starts_test,
+            "mrd_track_properties": mrd_track_properties_test,
+            "mrd_track_mask": mrd_track_mask_test,
         },
         verbose=0,
     ).reshape(-1)
@@ -1570,6 +1714,19 @@ def evaluate_and_plot(
     truth_pion_kinetic_energy = _kinetic_energy(truth_pion_momenta, pion_mass)
 
     predictions_path = output.with_suffix(".test_predictions.csv")
+    track_column_names = [
+        name
+        for track_index in range(MAX_MRD_TRACKS)
+        for name in (
+            f"MRDTrackStartX_{track_index}",
+            f"MRDTrackStartY_{track_index}",
+            f"MRDTrackStartZ_{track_index}",
+            f"MRDEnergyLoss_{track_index}",
+            f"MRDTrackLength_{track_index}",
+            f"MRDTrackAngle_{track_index}",
+            f"MRDTrackValid_{track_index}",
+        )
+    ]
     with predictions_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
@@ -1583,26 +1740,39 @@ def evaluate_and_plot(
                 "truth_leading_pion_muon_opening_angle_deg",
                 "truth_muon_kinetic_energy_GeV",
                 "truth_leading_pion_kinetic_energy_GeV",
-                *RING_EVENT_FEATURE_BRANCHES,
+                *RING_EVENT_FEATURE_NAMES,
+                *track_column_names,
                 "pion_score",
             ]
         )
-        writer.writerows(
-            zip(
-                source_paths_test.tolist(),
-                entries_test.astype(int).tolist(),
-                y_test.astype(int).tolist(),
-                truth_pion_counts_test[:, 0].astype(int).tolist(),
-                truth_pion_counts_test[:, 1].astype(int).tolist(),
-                truth_pion_counts_test[:, 2].astype(int).tolist(),
-                truth_muon_pion_angles.astype(float).tolist(),
-                truth_muon_kinetic_energy.astype(float).tolist(),
-                truth_pion_kinetic_energy.astype(float).tolist(),
-                event_features_test[:, 0].astype(float).tolist(),
-                event_features_test[:, 1].astype(float).tolist(),
-                test_scores.astype(float).tolist(),
+        for event_index in range(len(y_test)):
+            track_values = []
+            for track_index in range(MAX_MRD_TRACKS):
+                track_values.extend(
+                    [
+                        *mrd_track_starts_test[event_index, track_index].astype(
+                            float
+                        ),
+                        *mrd_track_properties_test[
+                            event_index, track_index
+                        ].astype(float),
+                        int(mrd_track_mask_test[event_index, track_index] != 0),
+                    ]
+                )
+            writer.writerow(
+                [
+                    source_paths_test[event_index],
+                    int(entries_test[event_index]),
+                    int(y_test[event_index]),
+                    *truth_pion_counts_test[event_index].astype(int),
+                    float(truth_muon_pion_angles[event_index]),
+                    float(truth_muon_kinetic_energy[event_index]),
+                    float(truth_pion_kinetic_energy[event_index]),
+                    *event_features_test[event_index].astype(float),
+                    *track_values,
+                    float(test_scores[event_index]),
+                ]
             )
-        )
 
     roc_name, roc_auc_value, fpr, tpr, thresholds = plot_roc_curve(
         y_test, test_scores, output
@@ -1623,6 +1793,9 @@ def evaluate_and_plot(
         images_test,
         detector_images_test,
         event_features_test,
+        mrd_track_starts_test,
+        mrd_track_properties_test,
+        mrd_track_mask_test,
         y_test,
         test_scores,
         source_paths_test,
@@ -1701,6 +1874,9 @@ def evaluate_and_plot(
             images_test,
             detector_images_test,
             event_features_test,
+            mrd_track_starts_test,
+            mrd_track_properties_test,
+            mrd_track_mask_test,
             y_test,
             test_scores,
             source_paths_test,
@@ -1716,6 +1892,9 @@ def evaluate_and_plot(
             images_test,
             detector_images_test,
             event_features_test,
+            mrd_track_starts_test,
+            mrd_track_properties_test,
+            mrd_track_mask_test,
             y_test,
             test_scores,
             source_paths_test,
@@ -1733,6 +1912,9 @@ def evaluate_and_plot(
             images_test,
             detector_images_test,
             event_features_test,
+            mrd_track_starts_test,
+            mrd_track_properties_test,
+            mrd_track_mask_test,
             y_test,
             test_scores,
             output,
@@ -1755,15 +1937,24 @@ def main() -> None:
         images,
         detector_images,
         event_features,
+        mrd_track_starts,
+        mrd_track_properties,
+        mrd_track_mask,
         labels,
         source_paths,
         entries,
         truth_pion_counts,
         tank_branch,
         n_misaligned,
+        n_mrd_tracks_truncated,
         geometry,
         response,
     ) = load_data(args)
+    if n_mrd_tracks_truncated:
+        print(
+            f"Retained the first {MAX_MRD_TRACKS} MRD starts for "
+            f"{n_mrd_tracks_truncated} selected events with more tracks."
+        )
     counts = np.bincount(labels.astype(np.int64), minlength=2)
     if np.any(counts == 0):
         raise ValueError(f"Both classes are required; class counts are {counts.tolist()}")
@@ -1797,12 +1988,18 @@ def main() -> None:
         images[train_indices],
         detector_images[train_indices],
         event_features[train_indices],
+        mrd_track_starts[train_indices],
+        mrd_track_properties[train_indices],
+        mrd_track_mask[train_indices],
     )
     model.fit(
         {
             "pmt_angular_image": images[train_indices],
             "pmt_unfolded_image": detector_images[train_indices],
             "event_features": event_features[train_indices],
+            "mrd_track_starts": mrd_track_starts[train_indices],
+            "mrd_track_properties": mrd_track_properties[train_indices],
+            "mrd_track_mask": mrd_track_mask[train_indices],
         },
         y_train,
         validation_data=(
@@ -1810,6 +2007,9 @@ def main() -> None:
                 "pmt_angular_image": images[val_indices],
                 "pmt_unfolded_image": detector_images[val_indices],
                 "event_features": event_features[val_indices],
+                "mrd_track_starts": mrd_track_starts[val_indices],
+                "mrd_track_properties": mrd_track_properties[val_indices],
+                "mrd_track_mask": mrd_track_mask[val_indices],
             },
             y_val,
         ),
@@ -1837,6 +2037,9 @@ def main() -> None:
             "pmt_angular_image": images[test_indices],
             "pmt_unfolded_image": detector_images[test_indices],
             "event_features": event_features[test_indices],
+            "mrd_track_starts": mrd_track_starts[test_indices],
+            "mrd_track_properties": mrd_track_properties[test_indices],
+            "mrd_track_mask": mrd_track_mask[test_indices],
         },
         y_test,
         return_dict=True,
@@ -1852,6 +2055,9 @@ def main() -> None:
         images[test_indices],
         detector_images[test_indices],
         event_features[test_indices],
+        mrd_track_starts[test_indices],
+        mrd_track_properties[test_indices],
+        mrd_track_mask[test_indices],
         y_test,
         source_paths[test_indices],
         entries[test_indices],
@@ -1869,7 +2075,7 @@ def main() -> None:
     )
     metadata = {
         "model_type": "annie_pion_ring_cnn",
-        "model_variant": "B_PE_dual_view_plus_event_features",
+        "model_variant": "B_PE_dual_view_plus_mrd_track_set",
         "tensorflow_version": tf.__version__,
         "training_sources": [str(path) for path in args.root_files],
         "tree": args.tree,
@@ -1916,9 +2122,23 @@ def main() -> None:
             "annotation_free_unfolded_barrel_top_bottom",
         ],
         "event_feature_input_name": "event_features",
-        "event_feature_branches": RING_EVENT_FEATURE_BRANCHES,
+        "event_feature_names": RING_EVENT_FEATURE_NAMES,
+        "event_feature_scalar_branches": RING_EVENT_SCALAR_BRANCHES,
+        "mrd_track_start_input_name": "mrd_track_starts",
+        "mrd_track_property_input_name": "mrd_track_properties",
+        "mrd_track_mask_input_name": "mrd_track_mask",
+        "mrd_track_start_branches": MRD_TRACK_START_BRANCHES,
+        "mrd_track_property_branches": MRD_TRACK_PROPERTY_BRANCHES,
+        "mrd_track_coordinate_order": ["X", "Y", "Z"],
+        "mrd_track_property_order": MRD_TRACK_PROPERTY_BRANCHES,
+        "max_mrd_tracks": MAX_MRD_TRACKS,
+        "mrd_track_overflow_policy": "first_four_in_stored_branch_order",
+        "mrd_track_overflow_events": n_mrd_tracks_truncated,
         "event_feature_preprocessing": (
-            "finite_only_then_keras_normalization_adapted_on_training_split"
+            "numMRDTracks_scalar_plus_zero_padded_mrd_xyz_and_energy_loss_length_"
+            "angle_track_set_and_mask;_separate_normalization_adapted_on_valid_"
+            "training_tracks_only;_shared_dense_encoder_plus_masked_"
+            "permutation_invariant_max_pooling"
         ),
         "label": "charged_pion_present" if args.charged_only else "any_pion_present",
         "truth_branches": ["truePiPlusCher", "truePiMinusCher", "truePi0"],

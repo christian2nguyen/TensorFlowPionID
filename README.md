@@ -237,8 +237,8 @@ python score_annie_ring.py artifacts/annie_ring_pion.h5 sample.root \
 ```
 
 Export the trained hybrid model for C++ inference with the exporter in this
-project. Its serving signature includes both image tensors and the ordered
-two-value `event_features` tensor:
+project. Its serving signature includes both image tensors, the ordered
+`event_features` tensor, and the padded MRD track tensors:
 
 ```bash
 python export_annie_ring_saved_model.py \
@@ -246,9 +246,14 @@ python export_annie_ring_saved_model.py \
   artifacts/annie_ring_pion_saved_model
 ```
 
-The feature order saved in the JSON metadata and required by inference is
-`numMRDTracks` followed by
-`clusterChargeBalance_tankcluster_pmt_filtered`.
+The scalar feature order is saved in the JSON metadata and currently contains
+`numMRDTracks`. The exact MRD start positions are a separate
+`mrd_track_starts` tensor with shape `(batch, 4, 3)` in X/Y/Z order. A
+`mrd_track_properties` tensor with shape `(batch, 4, 3)` contains
+`MRDEnergyLoss`, `MRDTrackLength`, and `MRDTrackAngle` for those same tracks. A
+`mrd_track_mask` tensor with shape `(batch, 4)` is 1 for a real track and 0 for
+padding. Therefore a one-track event retains its exact start position without
+inventing three additional tracks.
 
 For long input lists, place one ROOT path per line in a text file. Blank lines
 and comments beginning with `#` are ignored; relative paths are resolved from
@@ -260,13 +265,22 @@ python train_annie_ring.py --file-list simulation_files.txt \
 ```
 
 This command is **Model B**, a hybrid classifier. Its two image views each use
-exactly two channels (`hitPE` and `hitPE_tankcluster`), while a separate scalar
-input contains only `numMRDTracks` and
-`clusterChargeBalance_tankcluster_pmt_filtered`. The two scalar features are
-required to be finite and are normalized by a Keras normalization layer adapted
-only on the training subset. They are passed through a small dense embedding and
-joined to the two CNN image representations before the final classifier. The
-charge-balance value is an input feature, not an event-selection cut.
+exactly two channels (`hitPE` and `hitPE_tankcluster`). A scalar input contains
+`numMRDTracks`, while a second input preserves up to four exact start positions
+from `MRDTrackStartX`, `MRDTrackStartY`, and `MRDTrackStartZ`. A third input
+provides the aligned per-track `MRDEnergyLoss`, `MRDTrackLength`, and
+`MRDTrackAngle` values. Starts and properties are normalized separately, then
+combined track by track. The same dense encoder is applied independently to
+every valid track, padding is removed with the mask, and global max pooling
+makes the result insensitive to track order. Normalization is adapted only to
+valid tracks in the training subset. Empty events contain four zero-padded
+positions, four zero-padded property rows, and an all-zero mask.
+Events with inconsistent X/Y/Z vector lengths or lengths inconsistent with
+`numMRDTracks` are rejected. Events with more than four tracks retain the first
+four entries in stored branch order; their full multiplicity remains available
+through `numMRDTracks`, and the truncated-event count is saved in the model JSON
+metadata. `clusterChargeBalance_tankcluster_pmt_filtered` is neither a model
+input nor an event-selection cut.
 
 Training also writes `annie_ring_pion.history.csv`, containing the per-epoch
 training and validation metrics used to identify the best stopping point.

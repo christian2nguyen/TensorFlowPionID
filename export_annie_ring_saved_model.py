@@ -28,13 +28,139 @@ def main() -> None:
     model = tf.keras.models.load_model(args.keras_model)
     shapes = _input_shapes(model)
     image_names = {"pmt_angular_image", "pmt_unfolded_image"}
-    expected_names = image_names | ({"event_features"} if "event_features" in shapes else set())
+    auxiliary_names = {
+        name
+        for name in (
+            "event_features",
+            "mrd_track_starts",
+            "mrd_track_properties",
+            "mrd_track_mask",
+        )
+        if name in shapes
+    }
+    expected_names = image_names | auxiliary_names
     if set(shapes) != expected_names:
         raise ValueError(
             f"Unexpected model inputs {sorted(shapes)}; expected {sorted(expected_names)}"
         )
 
-    if "event_features" in shapes:
+    if auxiliary_names == {
+        "event_features",
+        "mrd_track_starts",
+        "mrd_track_properties",
+        "mrd_track_mask",
+    }:
+
+        @tf.function(
+            input_signature=[
+                tf.TensorSpec(
+                    [None, *shapes["pmt_angular_image"]],
+                    tf.float32,
+                    name="pmt_angular_image",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["pmt_unfolded_image"]],
+                    tf.float32,
+                    name="pmt_unfolded_image",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["event_features"]],
+                    tf.float32,
+                    name="event_features",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["mrd_track_starts"]],
+                    tf.float32,
+                    name="mrd_track_starts",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["mrd_track_properties"]],
+                    tf.float32,
+                    name="mrd_track_properties",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["mrd_track_mask"]],
+                    tf.float32,
+                    name="mrd_track_mask",
+                ),
+            ]
+        )
+        def serve(
+            pmt_angular_image,
+            pmt_unfolded_image,
+            event_features,
+            mrd_track_starts,
+            mrd_track_properties,
+            mrd_track_mask,
+        ):
+            score = model(
+                {
+                    "pmt_angular_image": pmt_angular_image,
+                    "pmt_unfolded_image": pmt_unfolded_image,
+                    "event_features": event_features,
+                    "mrd_track_starts": mrd_track_starts,
+                    "mrd_track_properties": mrd_track_properties,
+                    "mrd_track_mask": mrd_track_mask,
+                },
+                training=False,
+            )
+            return {"pion_score": score}
+
+    elif auxiliary_names == {
+        "event_features",
+        "mrd_track_starts",
+        "mrd_track_mask",
+    }:
+
+        @tf.function(
+            input_signature=[
+                tf.TensorSpec(
+                    [None, *shapes["pmt_angular_image"]],
+                    tf.float32,
+                    name="pmt_angular_image",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["pmt_unfolded_image"]],
+                    tf.float32,
+                    name="pmt_unfolded_image",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["event_features"]],
+                    tf.float32,
+                    name="event_features",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["mrd_track_starts"]],
+                    tf.float32,
+                    name="mrd_track_starts",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["mrd_track_mask"]],
+                    tf.float32,
+                    name="mrd_track_mask",
+                ),
+            ]
+        )
+        def serve(
+            pmt_angular_image,
+            pmt_unfolded_image,
+            event_features,
+            mrd_track_starts,
+            mrd_track_mask,
+        ):
+            score = model(
+                {
+                    "pmt_angular_image": pmt_angular_image,
+                    "pmt_unfolded_image": pmt_unfolded_image,
+                    "event_features": event_features,
+                    "mrd_track_starts": mrd_track_starts,
+                    "mrd_track_mask": mrd_track_mask,
+                },
+                training=False,
+            )
+            return {"pion_score": score}
+
+    elif auxiliary_names == {"event_features"}:
 
         @tf.function(
             input_signature=[
@@ -66,7 +192,7 @@ def main() -> None:
             )
             return {"pion_score": score}
 
-    else:
+    elif not auxiliary_names:
 
         @tf.function(
             input_signature=[
@@ -91,6 +217,12 @@ def main() -> None:
                 training=False,
             )
             return {"pion_score": score}
+
+    else:
+        raise ValueError(
+            "Model has an incomplete auxiliary-input set: "
+            f"{sorted(auxiliary_names)}"
+        )
 
     args.saved_model_directory.parent.mkdir(parents=True, exist_ok=True)
     tf.saved_model.save(

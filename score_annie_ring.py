@@ -80,6 +80,7 @@ def main() -> None:
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     written = 0
+    n_mrd_tracks_truncated = 0
     if args.all_events:
         event_selection = "none"
     elif "event_selection" in metadata:
@@ -94,7 +95,31 @@ def main() -> None:
             "legacy_bdt" if metadata.get("bdt_preselection", False) else "none"
         )
     with args.output.open("w", newline="", encoding="utf-8") as handle:
-        event_feature_branches = list(metadata.get("event_feature_branches", []))
+        event_feature_names = list(metadata.get("event_feature_names", []))
+        has_mrd_track_set = bool(metadata.get("mrd_track_start_input_name"))
+        has_mrd_track_properties = bool(
+            metadata.get("mrd_track_property_input_name")
+        )
+        max_mrd_tracks = int(metadata.get("max_mrd_tracks", 0))
+        track_column_names = [
+            name
+            for track_index in range(max_mrd_tracks)
+            for name in (
+                f"MRDTrackStartX_{track_index}",
+                f"MRDTrackStartY_{track_index}",
+                f"MRDTrackStartZ_{track_index}",
+                *(
+                    (
+                        f"MRDEnergyLoss_{track_index}",
+                        f"MRDTrackLength_{track_index}",
+                        f"MRDTrackAngle_{track_index}",
+                    )
+                    if has_mrd_track_properties
+                    else ()
+                ),
+                f"MRDTrackValid_{track_index}",
+            )
+        ]
         writer = csv.DictWriter(
             handle,
             fieldnames=[
@@ -103,7 +128,8 @@ def main() -> None:
                 "pmt_response",
                 "pmt_tune_variant",
                 "pmt_response_payload_format",
-                *event_feature_branches,
+                *event_feature_names,
+                *track_column_names,
                 "pion_score",
                 "pion_prediction",
             ],
@@ -126,8 +152,11 @@ def main() -> None:
             False,
             False,
             args.chunk_size,
-            event_feature_branches=event_feature_branches,
+            include_ring_event_features=bool(
+                event_feature_names or has_mrd_track_set
+            ),
         ):
+            n_mrd_tracks_truncated += int(chunk["n_mrd_tracks_truncated"])
             images = chunk["images"]
             if len(images) == 0:
                 continue
@@ -135,8 +164,15 @@ def main() -> None:
                 "pmt_angular_image": images,
                 "pmt_unfolded_image": chunk["detector_images"],
             }
-            if event_feature_branches:
+            if event_feature_names:
                 model_inputs["event_features"] = chunk["event_features"]
+            if has_mrd_track_set:
+                model_inputs["mrd_track_starts"] = chunk["mrd_track_starts"]
+                model_inputs["mrd_track_mask"] = chunk["mrd_track_mask"]
+            if has_mrd_track_properties:
+                model_inputs["mrd_track_properties"] = chunk[
+                    "mrd_track_properties"
+                ]
             scores = model.predict(model_inputs, verbose=0).reshape(-1)
             threshold = float(metadata["threshold"])
             feature_rows = chunk.get("event_features")
@@ -155,13 +191,49 @@ def main() -> None:
                         {
                             name: float(feature_rows[row_index, feature_index])
                             for feature_index, name in enumerate(
-                                event_feature_branches
+                                event_feature_names
                             )
                         }
                     )
+                if has_mrd_track_set:
+                    for track_index in range(max_mrd_tracks):
+                        x, y, z = chunk["mrd_track_starts"][
+                            row_index, track_index
+                        ]
+                        output_row.update(
+                            {
+                                f"MRDTrackStartX_{track_index}": float(x),
+                                f"MRDTrackStartY_{track_index}": float(y),
+                                f"MRDTrackStartZ_{track_index}": float(z),
+                                f"MRDTrackValid_{track_index}": int(
+                                    chunk["mrd_track_mask"][
+                                        row_index, track_index
+                                    ]
+                                    != 0
+                                ),
+                            }
+                        )
+                        if has_mrd_track_properties:
+                            energy_loss, length, angle = chunk[
+                                "mrd_track_properties"
+                            ][row_index, track_index]
+                            output_row.update(
+                                {
+                                    f"MRDEnergyLoss_{track_index}": float(
+                                        energy_loss
+                                    ),
+                                    f"MRDTrackLength_{track_index}": float(length),
+                                    f"MRDTrackAngle_{track_index}": float(angle),
+                                }
+                            )
                 writer.writerow(output_row)
                 written += 1
     print(f"Wrote {written} selected event scores to {args.output}")
+    if n_mrd_tracks_truncated:
+        print(
+            f"Retained the first {max_mrd_tracks} MRD starts for "
+            f"{n_mrd_tracks_truncated} selected events with more tracks."
+        )
 
 
 if __name__ == "__main__":

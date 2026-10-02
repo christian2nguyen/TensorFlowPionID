@@ -13,10 +13,12 @@ import uproot
 from annie_features import (
     BDT_CUT_BRANCHES,
     FIT_INDIVIDUAL_PMT_CUT_BRANCHES,
+    RING_EVENT_REQUIRED_BRANCHES,
     TRUTH_BRANCHES,
     build_bdt_selection,
     build_fit_individual_pmt_selection,
     build_pion_labels,
+    build_ring_event_features,
     resolve_tankcluster_branch,
 )
 from annie_pmt_response import PMTResponse
@@ -427,7 +429,7 @@ def iterate_ring_images(
     include_truth: bool,
     charged_only: bool,
     chunk_size: str,
-    event_feature_branches: Optional[List[str]] = None,
+    include_ring_event_features: bool = False,
 ) -> Iterator[Dict[str, object]]:
     if isinstance(event_selection, bool):
         selection_mode = "fit_individual_pmt" if event_selection else "none"
@@ -456,8 +458,8 @@ def iterate_ring_images(
                 requested.extend(BDT_CUT_BRANCHES)
             if include_truth:
                 requested.extend(TRUTH_BRANCHES)
-            if event_feature_branches:
-                requested.extend(event_feature_branches)
+            if include_ring_event_features:
+                requested.extend(RING_EVENT_REQUIRED_BRANCHES)
             missing = [name for name in requested if name not in available]
             if missing:
                 raise ValueError(f"{path} is missing branches: {', '.join(missing)}")
@@ -502,11 +504,20 @@ def iterate_ring_images(
                 elif selection_mode == "legacy_bdt":
                     selected &= build_bdt_selection(arrays)
                 event_features = None
-                if event_feature_branches:
-                    event_features = np.column_stack(
-                        [_numpy(arrays[name]) for name in event_feature_branches]
-                    ).astype(np.float32, copy=False)
-                    selected &= np.isfinite(event_features).all(axis=1)
+                mrd_track_starts = None
+                mrd_track_properties = None
+                mrd_track_mask = None
+                mrd_track_overflow = np.zeros(n_entries, dtype=bool)
+                if include_ring_event_features:
+                    (
+                        event_features,
+                        mrd_track_starts,
+                        mrd_track_properties,
+                        mrd_track_mask,
+                        valid_event_features,
+                        mrd_track_overflow,
+                    ) = build_ring_event_features(arrays)
+                    selected &= valid_event_features
                 result: Dict[str, object] = {
                     "path": path,
                     "entries": entry_numbers[selected],
@@ -516,9 +527,15 @@ def iterate_ring_images(
                     "n_read": n_entries,
                     "n_selected": int(selected.sum()),
                     "n_misaligned": int((~aligned).sum()),
+                    "n_mrd_tracks_truncated": int(
+                        (selected & mrd_track_overflow).sum()
+                    ),
                 }
                 if event_features is not None:
                     result["event_features"] = event_features[selected]
+                    result["mrd_track_starts"] = mrd_track_starts[selected]
+                    result["mrd_track_properties"] = mrd_track_properties[selected]
+                    result["mrd_track_mask"] = mrd_track_mask[selected]
                 if include_truth:
                     result["labels"] = build_pion_labels(arrays, charged_only)[selected]
                     result["truth_pion_counts"] = np.column_stack(

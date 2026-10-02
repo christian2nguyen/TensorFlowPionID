@@ -21,9 +21,32 @@ FEATURE_NAMES = [
 
 TRUTH_BRANCHES = ["truePiPlusCher", "truePiMinusCher", "truePi0"]
 
-RING_EVENT_FEATURE_BRANCHES = [
+RING_EVENT_SCALAR_BRANCHES = [
     "numMRDTracks",
-    "clusterChargeBalance_tankcluster_pmt_filtered",
+]
+
+MRD_TRACK_START_BRANCHES = [
+    "MRDTrackStartX",
+    "MRDTrackStartY",
+    "MRDTrackStartZ",
+]
+
+MRD_TRACK_PROPERTY_BRANCHES = [
+    "MRDEnergyLoss",
+    "MRDTrackLength",
+    "MRDTrackAngle",
+]
+
+MAX_MRD_TRACKS = 4
+
+RING_EVENT_REQUIRED_BRANCHES = [
+    *RING_EVENT_SCALAR_BRANCHES,
+    *MRD_TRACK_START_BRANCHES,
+    *MRD_TRACK_PROPERTY_BRANCHES,
+]
+
+RING_EVENT_FEATURE_NAMES = [
+    *RING_EVENT_SCALAR_BRANCHES,
 ]
 
 BDT_CUT_BRANCHES = [
@@ -112,6 +135,65 @@ def build_pion_labels(arrays, charged_only: bool) -> np.ndarray:
         return charged.astype(np.float32)
     neutral = _to_numpy(arrays["truePi0"]) > 0
     return (charged | neutral).astype(np.float32)
+
+
+def build_ring_event_features(
+    arrays,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Build scalar features and a padded, permutation-invariant MRD track set."""
+    num_mrd_tracks = _to_numpy(arrays["numMRDTracks"])
+    track_counts = []
+    padded_track_values = {}
+    valid = np.isfinite(num_mrd_tracks) & (num_mrd_tracks >= 0.0)
+    for branch in [*MRD_TRACK_START_BRANCHES, *MRD_TRACK_PROPERTY_BRANCHES]:
+        values = arrays[branch]
+        counts = _to_numpy(ak.num(values, axis=1))
+        track_counts.append(counts)
+        valid &= ak.to_numpy(ak.all(np.isfinite(values), axis=1)).astype(bool)
+        padded_track_values[branch] = _to_numpy(
+            ak.fill_none(
+                ak.pad_none(values, MAX_MRD_TRACKS, axis=1, clip=True),
+                0.0,
+            )
+        )
+    valid &= np.isclose(num_mrd_tracks, np.rint(num_mrd_tracks))
+    for counts in track_counts:
+        valid &= counts == np.rint(num_mrd_tracks)
+    event_features = num_mrd_tracks[:, None].astype(np.float32, copy=False)
+    track_starts = np.stack(
+        [padded_track_values[branch] for branch in MRD_TRACK_START_BRANCHES],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+    track_properties = np.stack(
+        [padded_track_values[branch] for branch in MRD_TRACK_PROPERTY_BRANCHES],
+        axis=-1,
+    ).astype(
+        np.float32, copy=False
+    )
+    retained_counts = np.minimum(track_counts[0], MAX_MRD_TRACKS).astype(np.int64)
+    track_mask = (
+        np.arange(MAX_MRD_TRACKS, dtype=np.int64)[None, :]
+        < retained_counts[:, None]
+    ).astype(np.float32)
+    valid &= np.isfinite(event_features).all(axis=1)
+    valid &= np.isfinite(track_starts).all(axis=(1, 2))
+    valid &= np.isfinite(track_properties).all(axis=(1, 2))
+    overflow = valid & (track_counts[0] > MAX_MRD_TRACKS)
+    return (
+        event_features,
+        track_starts,
+        track_properties,
+        track_mask,
+        valid,
+        overflow,
+    )
 
 
 def build_bdt_selection(arrays) -> np.ndarray:
