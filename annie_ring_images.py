@@ -509,14 +509,21 @@ def iterate_ring_images(
                 mrd_track_mask = None
                 mrd_track_overflow = np.zeros(n_entries, dtype=bool)
                 if include_ring_event_features:
-                    (
-                        event_features,
-                        mrd_track_starts,
-                        mrd_track_properties,
-                        mrd_track_mask,
-                        valid_event_features,
-                        mrd_track_overflow,
-                    ) = build_ring_event_features(arrays)
+                    try:
+                        (
+                            event_features,
+                            mrd_track_starts,
+                            mrd_track_properties,
+                            mrd_track_mask,
+                            valid_event_features,
+                            mrd_track_overflow,
+                        ) = build_ring_event_features(arrays)
+                    except ValueError as error:
+                        raise ValueError(
+                            f"Invalid MRD branch layout in {path}, tree "
+                            f"{tree_name!r}, entries {entry_offset} through "
+                            f"{entry_offset + n_entries - 1}: {error}"
+                        ) from error
                     selected &= valid_event_features
                 result: Dict[str, object] = {
                     "path": path,

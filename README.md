@@ -262,6 +262,19 @@ retained track slot; the mask still removes padded slots. A scalar ROOT branch
 cannot provide distinct property values for multiple tracks, so the model uses
 it as shared event-level context for the track encoder.
 
+Compare the MRD schemas of a working and failing ROOT file with:
+
+```bash
+python inspect_annie_mrd_schema.py working.root different.root \
+  --tree phaseIITriggerTree
+```
+
+The report shows each ROOT type and whether Awkward reads it as an event scalar
+or a per-event vector. It also reports sampled vector-length ranges and their
+mismatch counts relative to `numMRDTracks`. The MRD start X/Y/Z inputs must be
+per-event vectors; an event-scalar start coordinate does not contain enough
+information to construct a multi-track set without an explicit interpretation.
+
 For long input lists, place one ROOT path per line in a text file. Blank lines
 and comments beginning with `#` are ignored; relative paths are resolved from
 the list file's directory:

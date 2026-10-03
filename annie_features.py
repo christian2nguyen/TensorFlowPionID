@@ -157,7 +157,14 @@ def build_ring_event_features(
     valid = np.isfinite(num_mrd_tracks) & (num_mrd_tracks >= 0.0)
     for branch in MRD_TRACK_START_BRANCHES:
         values = arrays[branch]
-        counts = _to_numpy(ak.num(values, axis=1))
+        try:
+            counts = _to_numpy(ak.num(values, axis=1))
+        except ValueError as error:
+            raise ValueError(
+                f"MRD start branch {branch!r} must be a per-event vector, but "
+                "this ROOT file stores it as a scalar. Compare the input-file "
+                "schemas with inspect_annie_mrd_schema.py."
+            ) from error
         track_counts.append(counts)
         valid &= ak.to_numpy(ak.all(np.isfinite(values), axis=1)).astype(bool)
         padded_track_values[branch] = _to_numpy(
