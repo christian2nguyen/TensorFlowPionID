@@ -255,6 +255,13 @@ The scalar feature order is saved in the JSON metadata and currently contains
 padding. Therefore a one-track event retains its exact start position without
 inventing three additional tracks.
 
+The three MRD property branches may be stored either as per-track vectors or as
+one scalar per event. Vector values are aligned with their corresponding track.
+When a property is an event scalar, that same value is broadcast to every valid
+retained track slot; the mask still removes padded slots. A scalar ROOT branch
+cannot provide distinct property values for multiple tracks, so the model uses
+it as shared event-level context for the track encoder.
+
 For long input lists, place one ROOT path per line in a text file. Blank lines
 and comments beginning with `#` are ignored; relative paths are resolved from
 the list file's directory:

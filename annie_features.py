@@ -145,12 +145,17 @@ def build_ring_event_features(
     np.ndarray,
     np.ndarray,
 ]:
-    """Build scalar features and a padded, permutation-invariant MRD track set."""
+    """Build scalar features and a padded, permutation-invariant MRD track set.
+
+    MRD start branches must be per-track vectors. Property branches may be
+    per-track vectors or event scalars; event scalars are repeated across the
+    retained valid track slots so they can condition every track embedding.
+    """
     num_mrd_tracks = _to_numpy(arrays["numMRDTracks"])
     track_counts = []
     padded_track_values = {}
     valid = np.isfinite(num_mrd_tracks) & (num_mrd_tracks >= 0.0)
-    for branch in [*MRD_TRACK_START_BRANCHES, *MRD_TRACK_PROPERTY_BRANCHES]:
+    for branch in MRD_TRACK_START_BRANCHES:
         values = arrays[branch]
         counts = _to_numpy(ak.num(values, axis=1))
         track_counts.append(counts)
@@ -161,6 +166,30 @@ def build_ring_event_features(
                 0.0,
             )
         )
+    for branch in MRD_TRACK_PROPERTY_BRANCHES:
+        values = arrays[branch]
+        try:
+            counts = _to_numpy(ak.num(values, axis=1))
+        except ValueError:
+            scalar_values = _to_numpy(values)
+            if scalar_values.ndim != 1:
+                raise ValueError(
+                    f"MRD property branch {branch!r} is neither an event scalar "
+                    "nor a per-track vector"
+                )
+            valid &= np.isfinite(scalar_values)
+            padded_track_values[branch] = np.repeat(
+                scalar_values[:, None], MAX_MRD_TRACKS, axis=1
+            )
+        else:
+            track_counts.append(counts)
+            valid &= ak.to_numpy(ak.all(np.isfinite(values), axis=1)).astype(bool)
+            padded_track_values[branch] = _to_numpy(
+                ak.fill_none(
+                    ak.pad_none(values, MAX_MRD_TRACKS, axis=1, clip=True),
+                    0.0,
+                )
+            )
     valid &= np.isclose(num_mrd_tracks, np.rint(num_mrd_tracks))
     for counts in track_counts:
         valid &= counts == np.rint(num_mrd_tracks)

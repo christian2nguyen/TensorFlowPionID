@@ -2131,6 +2131,9 @@ def main() -> None:
         "mrd_track_property_branches": MRD_TRACK_PROPERTY_BRANCHES,
         "mrd_track_coordinate_order": ["X", "Y", "Z"],
         "mrd_track_property_order": MRD_TRACK_PROPERTY_BRANCHES,
+        "mrd_track_property_layout_support": (
+            "per_track_vectors_or_event_scalars_broadcast_to_valid_track_slots"
+        ),
         "max_mrd_tracks": MAX_MRD_TRACKS,
         "mrd_track_overflow_policy": "first_four_in_stored_branch_order",
         "mrd_track_overflow_events": n_mrd_tracks_truncated,
