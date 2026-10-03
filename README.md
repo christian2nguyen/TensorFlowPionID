@@ -284,6 +284,31 @@ python train_annie_ring.py --file-list simulation_files.txt \
   --output artifacts/annie_ring_pion.h5
 ```
 
+To train with two explicitly different detector-response groups, use one list
+for MC that should be convolved on the fly and one list that should remain raw:
+
+```bash
+python train_annie_ring.py \
+  --tuned-file-list mc_to_convolve.txt \
+  --raw-file-list mc_to_leave_raw.txt \
+  --pmt-response-calibration fitted_calibration.root \
+  --pmt-tune-variant response \
+  --output artifacts/annie_ring_pion_mixed_response.h5
+```
+
+`--convolved-file-list` is an alias for `--tuned-file-list`, and
+`--unconvolved-file-list` is an alias for `--raw-file-list`. Files in the tuned
+list are convolved during image construction; therefore, a ROOT file whose PE
+branches are already convolved belongs in the raw list to avoid applying the
+response twice. The `response` tune variant applies the Gain/Delta/Sigma
+response, while `final` also replays residual hits. The saved JSON records each
+source group, its response mode, and its selected-event count.
+
+Do not put the same events in both lists merely as raw and tuned copies. The
+current event-level random split could place one copy in training and the other
+in validation or testing, producing overly optimistic metrics. Use independent
+event samples in the two lists.
+
 This command is **Model B**, a hybrid classifier. Its two image views each use
 exactly two channels (`hitPE` and `hitPE_tankcluster`). A scalar input contains
 `numMRDTracks`, while a second input preserves up to four exact start positions

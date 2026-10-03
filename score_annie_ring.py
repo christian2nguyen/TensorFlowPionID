@@ -57,12 +57,16 @@ def main() -> None:
     )
     print(response.describe())
     training_response = metadata.get("training_pmt_response", "raw")
-    if response.mode == "tuned" and training_response != "tuned":
+    if response.mode == "tuned" and training_response not in {"tuned", "mixed"}:
         raise ValueError(
             "Cannot apply tuned PMT response to a model trained with raw response"
         )
     training_variant = metadata.get("pmt_tune_variant", "final")
-    if response.mode == "tuned" and tune_variant != training_variant:
+    if (
+        response.mode == "tuned"
+        and training_response in {"tuned", "mixed"}
+        and tune_variant != training_variant
+    ):
         raise ValueError(
             "The scoring tune variant differs from the variant used for training"
         )
@@ -77,6 +81,11 @@ def main() -> None:
         print(
             "Using raw PMT response with a tuned-MC model; this is intended for "
             "detector data. Use --pmt-response tuned for simulated input."
+        )
+    elif training_response == "mixed":
+        print(
+            "This model was trained with both raw and tuned PMT-response inputs; "
+            f"scoring with {response.mode} input."
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     written = 0

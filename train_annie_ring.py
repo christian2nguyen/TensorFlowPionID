@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import csv
 import json
 import random
@@ -73,6 +74,21 @@ CHARGED_PION_MASS_GEV = 0.13957039
 NEUTRAL_PION_MASS_GEV = 0.1349768
 
 
+def _read_root_file_list(parser, option: str, path: Path) -> List[Path]:
+    if not path.is_file():
+        parser.error(f"{option} {path} does not exist")
+    paths = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        listed_path = Path(stripped).expanduser()
+        if not listed_path.is_absolute():
+            listed_path = path.parent / listed_path
+        paths.append(listed_path)
+    return paths
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -84,7 +100,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--file-list",
         type=Path,
-        help="Text file containing one ROOT file path per line",
+        help=(
+            "ROOT paths using the global --pmt-response mode; retained for "
+            "backward compatibility"
+        ),
+    )
+    parser.add_argument(
+        "--tuned-file-list",
+        "--convolved-file-list",
+        dest="tuned_file_list",
+        type=Path,
+        help=(
+            "ROOT paths whose PE values should receive the configured PMT-response "
+            "convolution during image construction"
+        ),
+    )
+    parser.add_argument(
+        "--raw-file-list",
+        "--unconvolved-file-list",
+        dest="raw_file_list",
+        type=Path,
+        help="ROOT paths whose PE values should remain unconvolved/raw",
     )
     parser.add_argument("--tree", default="phaseIITriggerTree")
     parser.add_argument("--geometry", type=Path, default=DEFAULT_GEOMETRY)
@@ -148,20 +184,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260620)
     args = parser.parse_args()
     if args.file_list is not None:
-        if not args.file_list.is_file():
-            parser.error(f"--file-list {args.file_list} does not exist")
-        listed_files = []
-        for line in args.file_list.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            listed_path = Path(stripped).expanduser()
-            if not listed_path.is_absolute():
-                listed_path = args.file_list.parent / listed_path
-            listed_files.append(listed_path)
-        args.root_files.extend(listed_files)
-    if not args.root_files:
-        parser.error("No ROOT files given: use positional paths or --file-list")
+        args.root_files.extend(
+            _read_root_file_list(parser, "--file-list", args.file_list)
+        )
+    args.tuned_root_files = (
+        _read_root_file_list(
+            parser, "--tuned-file-list/--convolved-file-list", args.tuned_file_list
+        )
+        if args.tuned_file_list is not None
+        else []
+    )
+    args.raw_root_files = (
+        _read_root_file_list(
+            parser, "--raw-file-list/--unconvolved-file-list", args.raw_file_list
+        )
+        if args.raw_file_list is not None
+        else []
+    )
+    all_paths = [*args.root_files, *args.tuned_root_files, *args.raw_root_files]
+    if not all_paths:
+        parser.error(
+            "No ROOT files given: use positional paths, --file-list, "
+            "--tuned-file-list, or --raw-file-list"
+        )
+    path_counts = Counter(all_paths)
+    duplicate_paths = sorted(
+        (path for path, count in path_counts.items() if count > 1), key=str
+    )
+    if duplicate_paths:
+        parser.error(
+            "The same ROOT path appears in more than one input group: "
+            + ", ".join(str(path) for path in duplicate_paths)
+        )
     return args
 
 
@@ -182,15 +236,40 @@ def load_data(
     int,
     int,
     PMTGeometry,
-    PMTResponse,
+    Dict[str, object],
 ]:
     geometry = PMTGeometry(args.geometry, args.pmt_mask)
-    response = PMTResponse(
-        args.pmt_response,
-        args.pmt_response_calibration,
-        args.pmt_tune_variant,
+    needs_tuned_response = bool(args.tuned_root_files) or (
+        bool(args.root_files) and args.pmt_response == "tuned"
     )
-    print(response.describe())
+    needs_raw_response = bool(args.raw_root_files) or (
+        bool(args.root_files) and args.pmt_response == "raw"
+    )
+    responses = {}
+    if needs_tuned_response:
+        responses["tuned"] = PMTResponse(
+            "tuned",
+            args.pmt_response_calibration,
+            args.pmt_tune_variant,
+        )
+    if needs_raw_response:
+        responses["raw"] = PMTResponse(
+            "raw",
+            tune_variant=args.pmt_tune_variant,
+        )
+    input_groups = []
+    if args.root_files:
+        input_groups.append(
+            ("configured", args.root_files, responses[args.pmt_response])
+        )
+    if args.tuned_root_files:
+        input_groups.append(
+            ("tuned", args.tuned_root_files, responses["tuned"])
+        )
+    if args.raw_root_files:
+        input_groups.append(("raw", args.raw_root_files, responses["raw"]))
+    for mode, response in responses.items():
+        print(f"{mode.capitalize()} input — {response.describe()}")
     image_chunks: List[np.ndarray] = []
     detector_chunks: List[np.ndarray] = []
     event_feature_chunks: List[np.ndarray] = []
@@ -206,44 +285,61 @@ def load_data(
     n_selected = 0
     n_misaligned = 0
     n_mrd_tracks_truncated = 0
-    for chunk in iterate_ring_images(
-        args.root_files,
-        args.tree,
-        geometry,
-        args.hitpe_branch,
-        args.hitid_branch,
-        args.tankcluster_branch,
-        args.tankcluster_id_branch,
-        args.image_height,
-        args.image_width,
-        args.detector_height,
-        args.detector_width,
-        response,
-        not args.no_event_cuts,
-        True,
-        args.charged_only,
-        args.chunk_size,
-        include_ring_event_features=True,
-    ):
-        image_chunks.append(chunk["images"])
-        detector_chunks.append(chunk["detector_images"])
-        event_feature_chunks.append(chunk["event_features"])
-        mrd_track_start_chunks.append(chunk["mrd_track_starts"])
-        mrd_track_property_chunks.append(chunk["mrd_track_properties"])
-        mrd_track_mask_chunks.append(chunk["mrd_track_mask"])
-        label_chunks.append(chunk["labels"])
-        truth_pion_chunks.append(chunk["truth_pion_counts"])
-        entries = chunk["entries"]
-        entry_chunks.append(entries)
-        source_path_chunks.append(
-            np.full(len(entries), str(chunk["path"]), dtype=object)
+    group_summaries = []
+    for group_name, group_paths, response in input_groups:
+        group_read = 0
+        group_selected = 0
+        for chunk in iterate_ring_images(
+            group_paths,
+            args.tree,
+            geometry,
+            args.hitpe_branch,
+            args.hitid_branch,
+            args.tankcluster_branch,
+            args.tankcluster_id_branch,
+            args.image_height,
+            args.image_width,
+            args.detector_height,
+            args.detector_width,
+            response,
+            not args.no_event_cuts,
+            True,
+            args.charged_only,
+            args.chunk_size,
+            include_ring_event_features=True,
+        ):
+            image_chunks.append(chunk["images"])
+            detector_chunks.append(chunk["detector_images"])
+            event_feature_chunks.append(chunk["event_features"])
+            mrd_track_start_chunks.append(chunk["mrd_track_starts"])
+            mrd_track_property_chunks.append(chunk["mrd_track_properties"])
+            mrd_track_mask_chunks.append(chunk["mrd_track_mask"])
+            label_chunks.append(chunk["labels"])
+            truth_pion_chunks.append(chunk["truth_pion_counts"])
+            entries = chunk["entries"]
+            entry_chunks.append(entries)
+            source_path_chunks.append(
+                np.full(len(entries), str(chunk["path"]), dtype=object)
+            )
+            tank_branch = str(chunk["tankcluster_branch"])
+            chunk_read = int(chunk["n_read"])
+            chunk_selected = int(chunk["n_selected"])
+            n_read += chunk_read
+            n_selected += chunk_selected
+            group_read += chunk_read
+            group_selected += chunk_selected
+            n_misaligned += int(chunk["n_misaligned"])
+            n_mrd_tracks_truncated += int(chunk["n_mrd_tracks_truncated"])
+            print(f"Read {n_read}; selected {n_selected}", end="\r", flush=True)
+        group_summaries.append(
+            {
+                "name": group_name,
+                "pmt_response": response.mode,
+                "sources": [str(path) for path in group_paths],
+                "events_read": group_read,
+                "events_selected": group_selected,
+            }
         )
-        tank_branch = str(chunk["tankcluster_branch"])
-        n_read += int(chunk["n_read"])
-        n_selected += int(chunk["n_selected"])
-        n_misaligned += int(chunk["n_misaligned"])
-        n_mrd_tracks_truncated += int(chunk["n_mrd_tracks_truncated"])
-        print(f"Read {n_read}; selected {n_selected}", end="\r", flush=True)
     print()
     if not image_chunks or n_selected == 0:
         raise ValueError("No events passed ring-image construction and selection")
@@ -262,7 +358,10 @@ def load_data(
         n_misaligned,
         n_mrd_tracks_truncated,
         geometry,
-        response,
+        {
+            "groups": group_summaries,
+            "responses": responses,
+        },
     )
 
 
@@ -1948,8 +2047,19 @@ def main() -> None:
         n_misaligned,
         n_mrd_tracks_truncated,
         geometry,
-        response,
+        response_info,
     ) = load_data(args)
+    responses = response_info["responses"]
+    response_modes = sorted(responses)
+    training_pmt_response = (
+        response_modes[0] if len(response_modes) == 1 else "mixed"
+    )
+    metadata_response = responses.get("tuned", responses.get("raw"))
+    training_sources = [
+        source
+        for group in response_info["groups"]
+        for source in group["sources"]
+    ]
     if n_mrd_tracks_truncated:
         print(
             f"Retained the first {MAX_MRD_TRACKS} MRD starts for "
@@ -2077,26 +2187,29 @@ def main() -> None:
         "model_type": "annie_pion_ring_cnn",
         "model_variant": "B_PE_dual_view_plus_mrd_track_set",
         "tensorflow_version": tf.__version__,
-        "training_sources": [str(path) for path in args.root_files],
+        "training_sources": training_sources,
+        "training_source_groups": response_info["groups"],
         "tree": args.tree,
         "geometry_file": args.geometry.name,
         "pmt_mask": args.pmt_mask,
         "pmt_count_included": geometry.included_count,
         "excluded_pmt_ids": geometry.excluded_ids,
-        "training_pmt_response": response.mode,
+        "training_pmt_response": training_pmt_response,
         "pmt_response_scope": (
             "separate_branch_kind_0_hitPE_and_branch_kind_1_tankcluster"
-            if response.payload_format == "final_pmt_tuning_parameters"
+            if metadata_response.payload_format == "final_pmt_tuning_parameters"
             else "shared_legacy_map_hitPE_and_hitPE_tankcluster"
         ),
         "pmt_response_calibration_file": (
-            response.calibration_path.name if response.calibration_path else None
+            metadata_response.calibration_path.name
+            if metadata_response.calibration_path
+            else None
         ),
-        "pmt_response_calibration_sha256": response.calibration_sha256,
-        "pmt_response_payload_format": response.payload_format,
-        "pmt_tune_variant": response.tune_variant,
-        "pmt_tune_random_stream_version": response.random_stream_version,
-        "pmt_response_mapped_pmt_count": response.mapped_pmt_count,
+        "pmt_response_calibration_sha256": metadata_response.calibration_sha256,
+        "pmt_response_payload_format": metadata_response.payload_format,
+        "pmt_tune_variant": metadata_response.tune_variant,
+        "pmt_tune_random_stream_version": metadata_response.random_stream_version,
+        "pmt_response_mapped_pmt_count": metadata_response.mapped_pmt_count,
         "hitpe_branch": args.hitpe_branch,
         "hitid_branch": args.hitid_branch,
         "tankcluster_branch": tank_branch,
@@ -2107,14 +2220,22 @@ def main() -> None:
         "detector_width": args.detector_width,
         "channels": [
             (
-                "log1p_tuned_hitPE"
-                if response.mode == "tuned"
-                else "log1p_hitPE"
+                "log1p_mixed_raw_and_tuned_hitPE"
+                if training_pmt_response == "mixed"
+                else (
+                    "log1p_tuned_hitPE"
+                    if training_pmt_response == "tuned"
+                    else "log1p_hitPE"
+                )
             ),
             (
-                "log1p_tuned_hitPE_tankcluster"
-                if response.mode == "tuned"
-                else "log1p_hitPE_tankcluster"
+                "log1p_mixed_raw_and_tuned_hitPE_tankcluster"
+                if training_pmt_response == "mixed"
+                else (
+                    "log1p_tuned_hitPE_tankcluster"
+                    if training_pmt_response == "tuned"
+                    else "log1p_hitPE_tankcluster"
+                )
             ),
         ],
         "projections": [
