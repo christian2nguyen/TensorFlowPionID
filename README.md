@@ -1,10 +1,14 @@
 # PionID
 
-A TensorFlow baseline for binary charged-pion identification from tabular detector
-features (for example momentum, dE/dx, time of flight, calorimeter energy, and
-Cherenkov response).
+This repository contains a generic tabular pion-ID baseline and the recommended
+ANNIE Model C workflow. Model C is a supervised, two-head TensorFlow classifier
+that predicts both pion presence and fiducial-volume membership from PMT images
+and reconstructed MRD information.
 
-## Expected data
+## Expected data for the generic tabular baseline
+
+This section describes `train.py`, not the ANNIE ring-image Model C workflow.
+Model C branch requirements are listed later in this README.
 
 Supply either CSV files or ROOT files containing a flat TTree/RNTuple with one
 track per entry, numeric feature branches, and an `is_pion` label (`1` for pion,
@@ -21,19 +25,74 @@ truth-level variables, particle ID codes, or columns derived from the label.
 
 ## Setup and training
 
-This project is compatible with Python 3.8–3.10 and pinned to TensorFlow 2.10.0.
-TensorFlow 2.10 wheels are not available for Python 3.11. On Apple silicon, the
-dependency file selects `tensorflow-macos`; elsewhere it selects `tensorflow`.
+The current environment is pinned to TensorFlow/Keras 2.13.1. It supports the
+Python 3.8.13 environment used for ANNIE training and uses NumPy 1.22–1.24.3;
+NumPy 1.23.5 is known to work. On Apple silicon the dependency file selects
+`tensorflow-macos`; elsewhere it selects `tensorflow`.
 
 ```bash
-python3.10 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -c "import tensorflow as tf; print(tf.__version__)"
+python -c "import tensorflow as tf, numpy, uproot, awkward, sklearn; print(tf.__version__)"
+python -m pip check
 
 python train.py tracks.csv \
   --features momentum dedx tof ecal_energy \
   --output artifacts/pion_classifier.h5
+```
+
+The TensorFlow message saying that AVX2/FMA could be enabled by rebuilding is
+informational; it does not mean training failed. `pip check` should not report a
+TensorFlow dependency conflict. In particular, TensorFlow 2.13.1 requires
+`gast <= 0.4.0`, which is pinned in `requirements.txt`.
+
+### ANNIE shared Python packages
+
+On the ANNIE system, first activate the Python 3.9/TensorFlow environment and
+then source the project setup:
+
+```bash
+cd /exp/annie/app/users/cnguyen/tensorflow_PionID/TensorFlowPionID
+source setup.sh
+```
+
+The script makes this shared directory available:
+
+```text
+/exp/annie/app/users/dajana/myboy/lib/python3.9/site-packages
+```
+
+It explicitly selects shared Awkward 2.8.12 and Uproot 5.6.9, adds the rest of
+the directory as a fallback after the active environment's own site-packages,
+and prints the resolved version and path of every requested package. This lets
+it replace an older LCG Awkward 1.x without replacing the compatible NumPy.
+Do not prepend the complete shared path directly to `PYTHONPATH`: it contains
+NumPy 1.26.4, which would override the TensorFlow-2.13-compatible NumPy 1.23.5
+environment.
+
+The currently observed shared versions are:
+
+| Package | Shared version | Requested range | Setup behavior |
+| --- | ---: | --- | --- |
+| NumPy | 1.26.4 | `>=1.22,<=1.24.3` | Critical incompatibility if selected; setup fails |
+| pandas | 2.3.3 | `>=1.5,<2.1` | Warning when selected |
+| scikit-learn | 1.6.1 | `>=1.1,<1.4` | Warning when selected |
+| Uproot | 5.6.9 | `>=5.0,<6` | Compatible |
+| Awkward | 2.8.12 | `>=2.0,<3` | Compatible |
+| Matplotlib | 3.9.4 | `>=3.5,<3.8` | Warning when selected |
+
+The shared directory is built for Python 3.9, so `setup.sh` rejects a different
+Python minor version. NumPy, Uproot, and Awkward are treated as critical because
+they directly affect TensorFlow compatibility and ROOT/jagged-array reading.
+The other out-of-range packages are reported as warnings so their shared builds
+can still be tested deliberately. The checker also requires TensorFlow 2.13.1
+and `gast <= 0.4.0`. The original NumPy range is narrowed to
+`>=1.22,<=1.24.3` to match TensorFlow 2.13.1. The environment checker is also
+available on its own:
+
+```bash
+python3 verify_python_environment.py
 ```
 
 For ROOT files, give the tree path and branch names:
@@ -150,7 +209,8 @@ information:
    `Draw_ANNIE_Single_Event_Detector_Image.cpp`.
 5. Full-event `hitPE` and tank-cluster `hitPE` form two channels in both views.
 6. Two convolutional towers combine the ring-centered and detector-layout
-   information before making one event-level pion prediction.
+   information with the MRD inputs before making independent event-level
+   `pion_score` and `fv_score` predictions.
 
 Before training, render several pion and no-pion events and confirm that the
 projection is sensible:
@@ -225,11 +285,47 @@ preview title reports the three pion counts. When an odd number is requested,
 the extra preview is assigned to the pion class; therefore `--preview-count 1`
 requests one pion example.
 
+`build_annie_training_images.py` is the inspectable Model A image-builder path;
+it does not train the two-head Model C network. Model C reads the ROOT files
+directly with `train_annie_ring.py` so it can also load MRD inputs and `trueFV`.
+
+### Model C ROOT branches
+
+Model C reads the following branches. Training-only truth branches are not
+requested when applying a saved model to detector data.
+
+| Purpose | Branches | Expected layout |
+| --- | --- | --- |
+| Full-event PMT image | `hitPE`, `hitDetID` | Aligned per-event vectors |
+| Tank-cluster PMT image | `hitPE_tankcluster` or `hitPE_tankclusters`, `hitDetID_tankcluster` | Aligned per-event vectors |
+| Image direction | `simpleRecoVtxX`, `simpleRecoVtxY`, `simpleRecoVtxZ` | Event scalars |
+| Default physics selection | `sel_nu_mu_cc` | Boolean or 0/1 event scalar |
+| MRD multiplicity | `numMRDTracks` | Event scalar |
+| MRD track starts | `MRDTrackStartX`, `MRDTrackStartY`, `MRDTrackStartZ` | Per-event vectors; all three lengths must agree with `numMRDTracks` |
+| MRD track properties | `MRDEnergyLoss`, `MRDTrackLength`, `MRDTrackAngle` | Per-track vectors or event scalars |
+| Pion supervision | `truePiPlusCher`, `truePiMinusCher`, `truePi0` | Training-only event scalars |
+| FV supervision | `trueFV` | Training-only Boolean or 0/1 event scalar |
+
+The default pion label is true when any of the three pion truth counts is
+positive. `--charged-only` changes it to require `truePiPlusCher` or
+`truePiMinusCher`; it does not alter the FV label. The FV label is true exactly
+when `trueFV` is true. Both pion classes and both FV classes must remain after
+selection so the two heads can be trained and evaluated.
+
+Truth momentum or opening-angle branches are optional. When available, they
+are used only to annotate held-out diagnostic figures and never enter either
+network head.
+
 Train and score the ring model:
 
 ```bash
 python train_annie_ring.py simulation_*.root \
   --tree phaseIITriggerTree \
+  --pion-threshold 0.70 \
+  --fv-threshold 0.50 \
+  --fv-loss-weight 0.30 \
+  --epochs 100 \
+  --batch-size 128 \
   --output artifacts/annie_ring_pion.h5
 
 python score_annie_ring.py artifacts/annie_ring_pion.h5 sample.root \
@@ -238,15 +334,74 @@ python score_annie_ring.py artifacts/annie_ring_pion.h5 sample.root \
   --output annie_ring_scores.csv
 ```
 
-The two cuts are independent: `pion_prediction` is determined only by
-`pion_score`, and `fv_prediction` is determined only by `fv_score`. Omit either
-threshold option to use its value stored in the model JSON. Changing these cuts
-does not require retraining. The scoring CSV records both scores, both applied
-thresholds, and both decisions for every event.
+`--epochs` is a maximum: early stopping restores the best weights after 12
+epochs without improvement in validation pion PR AUC. The learning rate is
+halved after five stagnant epochs. `--seed` controls the reproducible 70/15/15
+split and defaults to `20260620`. `--chunk-size` controls bounded ROOT reading,
+but the selected tensors are concatenated in memory before model fitting, so it
+does not cap total training memory.
+
+### Independent pion and fiducial-volume predictions
+
+The two output heads share the image and MRD feature extractor but have
+separate dense layers, binary-cross-entropy losses, truth labels, metrics, and
+decision thresholds:
+
+```text
+pion_prediction = pion_score >= pion_threshold
+fv_prediction   = fv_score   >= fv_threshold
+total_loss      = pion_loss + fv_loss_weight * fv_loss
+```
+
+`--fv-loss-weight` controls how strongly learning the FV task changes the
+shared representation; its default is `0.30`. It does not multiply either
+output score. The training sample weights balance pion/no-pion and
+inside/outside-FV classes independently. Early stopping and learning-rate
+reduction continue to monitor validation pion PR AUC, so the primary training
+objective remains pion identification.
+
+No correlation penalty, score multiplication, or conditional gate is applied.
+The scores can naturally be correlated if the underlying event populations are
+correlated, but the model is not required to make them agree. A later physics
+selection may require both predictions, for example:
+
+```python
+selected = (pion_score >= 0.70) & (fv_score >= 0.50)
+```
+
+Omit either scoring threshold option to use its value stored in the model JSON.
+Changing a threshold changes only the binary decision and does not require
+retraining. The two threshold options control evaluation and inference; they do
+not change either training loss. `trueFV` is required while training because it
+supplies the FV target, but it is not a network input and is not needed in
+detector data during inference.
+
+By default, scoring reapplies the saved `sel_nu_mu_cc == true` selection. Use
+`--all-events` only when the input was already selected elsewhere or when scores
+are intentionally needed for every event. The scoring CSV records both scores,
+both applied thresholds, and both independent decisions for every written
+event.
+
+For `--output artifacts/annie_ring_pion.h5`, the main artifacts are:
+
+| Artifact | Contents |
+| --- | --- |
+| `annie_ring_pion.h5` | Keras Model C network and adapted normalization layers |
+| `annie_ring_pion.json` | Inputs, PMT response provenance, both thresholds, split/class counts, metrics, and diagnostic filenames |
+| `annie_ring_pion.history.csv` | Per-epoch training and validation losses and metrics for both heads |
+| `annie_ring_pion.test_predictions.csv` | Held-out provenance, truth, model inputs, both scores, both thresholds, and both decisions |
+| `annie_ring_pion.training_curves.png` | Total loss plus pion/FV ROC-AUC and PR-AUC histories |
+| `annie_ring_pion.misclassified_events.pdf` | Up to 20 annotated pion-head false positives and false negatives in one PDF |
+| `annie_ring_pion.gradcam_examples.png` | Pion-head Grad-CAM examples for both image towers |
+
+The pion and FV validation figures described below are written beside these
+files with the same model stem.
 
 Export the trained hybrid model for C++ inference with the exporter in this
 project. Its serving signature includes both image tensors, the ordered
-`event_features` tensor, and the padded MRD track tensors:
+`event_features` tensor, and the padded MRD track tensors. Its outputs are the
+continuous `pion_score` and `fv_score` tensors; downstream C++ should read the
+two thresholds from the neighboring JSON and apply them independently:
 
 ```bash
 python export_annie_ring_saved_model.py \
@@ -348,10 +503,10 @@ SavedModel contain both scores.
 Training also writes `annie_ring_pion.history.csv`, containing the per-epoch
 training and validation metrics used to identify the best stopping point.
 Events are split reproducibly and stratified by the joint pion/`trueFV` truth
-category into 70%
-training, 15% validation, and 15% testing. Evaluation includes count and
-true-class-normalized confusion matrices
-at the requested `--threshold`. A separate confidence-band confusion matrix
+category into 70% training, 15% validation, and 15% testing. Joint
+stratification preserves the four possible pion/FV label combinations when
+they are present. Evaluation includes count and true-class-normalized confusion
+matrices at the requested `--pion-threshold`. A separate confidence-band matrix
 classifies `score < 0.20` as non-pion-like and `score > 0.80` as pion-like;
 events in the middle band are excluded and their count is printed on the plot.
 This confidence-band matrix is written in count and true-class-normalized forms.
@@ -365,11 +520,29 @@ boundaries and the configured `--threshold`. The CSV and JSON metadata also
 record specificity, balanced accuracy, ordinary accuracy, F1, and the Matthews
 correlation coefficient at each evaluated operating point. A Brier score
 provides a threshold-independent check of probability calibration.
-The FV head separately produces ROC and precision-recall curves, count and
-normalized confusion matrices at `--fv-threshold`, an operating point, and a
-Brier score. It also writes `annie_ring_pion.fv_score_distribution.png`, a
-normalized held-out test-set histogram comparing `fv_score` for truth-outside
-and truth-inside FV events, with the configured FV cut drawn as a dashed line.
+
+### Fiducial-volume validation outputs
+
+The held-out test set produces a separate FV validation suite:
+
+- `annie_ring_pion.fv_score_distribution.png` compares normalized `fv_score`
+  distributions for `trueFV = 0` and `trueFV = 1`, with `--fv-threshold` drawn
+  as a dashed line. This is the main FV signal-separation figure.
+- `annie_ring_pion.fv_roc_curve.png` reports the outside-FV false-positive rate,
+  inside-FV efficiency, and ROC AUC.
+- `annie_ring_pion.fv_precision_recall_curve.png` reports inside-FV efficiency,
+  FV purity, and average precision.
+- `annie_ring_pion.fv_confusion_matrix.png` and
+  `annie_ring_pion.fv_confusion_matrix_normalized.png` show count and
+  truth-class-normalized decisions at the configured FV threshold.
+- The model JSON records `fv_roc_auc`, `fv_average_precision`, `fv_brier_score`,
+  and the FV operating point. The operating point includes efficiency, purity,
+  efficiency times purity, specificity, balanced accuracy, accuracy, F1, MCC,
+  and the four confusion-matrix counts.
+
+The FV plots are independent of the pion confidence-band plots. The FV
+confusion matrix always uses `fv_score >= fv_threshold`; it does not use the
+special pion score bands of 0.20/0.80 or 0.30/0.70.
 
 Four held-out truth-pion image pages are produced for visual validation: a
 dedicated charged-pion page, the highest-scoring pions, pions nearest the
@@ -388,6 +561,9 @@ Use `--no-event-cuts` to disable this selection. The older spelling
 `--no-bdt-cuts` remains available as an alias. Image construction also follows
 the calibration feature ranges: full-event PE must be finite and non-negative,
 while tank-cluster PE must be finite and in the half-open range `[0, 350)` PE.
+Misaligned PMT charge/ID vectors, non-finite model inputs, and inconsistent MRD
+track-vector lengths are rejected as input-quality requirements; they are not
+additional physics selection cuts.
 
 Training also writes test-set diagnostic products beside the model: ROC and
 precision-recall curves, score distributions, efficiency/background rejection
@@ -412,9 +588,11 @@ reported in GeV. If the ROOT file instead contains a scalar angle in
 degrees, select it explicitly with
 `--muon-pion-opening-angle-deg-branch BRANCH_NAME`. The test CSV contains the
 same truth counts, opening angle, muon kinetic energy, and leading-pion kinetic
-energy together with each event's source, entry, binary truth label, and pion
-score. Their filenames and summary metrics are stored under `evaluation` in the
-model JSON.
+energy together with each event's source and entry. It also records the pion
+truth label, `trueFV`, all scalar and padded MRD inputs, `pion_score`,
+`pion_threshold`, `pion_prediction`, `fv_score`, `fv_threshold`, and
+`fv_prediction`. Its filename and all summary metrics are stored under
+`evaluation` in the model JSON.
 
 The misclassified-event output keeps the combined gallery and writes the
 selected events to one multipage PDF named
@@ -518,14 +696,15 @@ python score_annie_ring.py artifacts/annie_ring_pion_tuned.h5 simulation.root \
 
 Scoring defaults to the tune variant stored with the model and rejects a
 different calibration checksum or tune variant. Detector data remains raw.
-The stored six event-selection branches are not recomputed after tuning, so
-this replay changes the CNN images but does not model migration across those
-preselection boundaries.
+The stored `sel_nu_mu_cc` decision is not recomputed after tuning, so this
+replay changes the CNN images but does not model migration across that
+preselection boundary.
 
-This is an event-level, weakly supervised ring classifier: the available truth
-labels say whether a pion is present, but do not give a ring center or radius.
-Localizing or counting individual rings requires corresponding per-ring truth
-targets (for example particle direction and vertex) or manually labeled images.
+This is an event-level, weakly supervised, multi-task classifier: one truth
+label says whether a pion is present and the other says whether the event is in
+the fiducial volume, but neither provides a ring center or radius. Localizing or
+counting individual rings requires corresponding per-ring truth targets (for
+example particle direction and vertex) or manually labeled images.
 
 ## Moving the project
 
@@ -534,7 +713,7 @@ only relative paths, so it does not depend on its current location. On the targe
 
 ```bash
 cd PionID
-python3.10 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 python -c "import tensorflow as tf; print(tf.__version__)"
@@ -550,8 +729,10 @@ artifacts/annie_ring_pion.h5
 artifacts/annie_ring_pion.json
 ```
 
-The `.h5` file contains the network and normalization layer. The `.json` file
-stores preprocessing settings and the classification threshold. Keep the
+The `.h5` file contains the network and normalization layers. The `.json` file
+stores preprocessing settings, both output-head definitions, both decision
+thresholds, the FV loss weight, response-tuning provenance, class counts, data
+split, test metrics, and diagnostic filenames. Keep the
 bundled `PMT_position_id_info.cvs` beside the Python files when moving the ring
 model. ROOT itself is not required on the target because `uproot` reads the
 files in Python.
