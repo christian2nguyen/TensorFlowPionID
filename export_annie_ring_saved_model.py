@@ -19,6 +19,16 @@ def _input_shapes(model: tf.keras.Model) -> Dict[str, Tuple[int, ...]]:
     return shapes
 
 
+def _serving_outputs(predictions):
+    if isinstance(predictions, dict):
+        return {
+            name: predictions[name]
+            for name in ("pion_score", "fv_score")
+            if name in predictions
+        }
+    return {"pion_score": predictions}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("keras_model", type=Path)
@@ -104,7 +114,7 @@ def main() -> None:
                 },
                 training=False,
             )
-            return {"pion_score": score}
+            return _serving_outputs(score)
 
     elif auxiliary_names == {
         "event_features",
@@ -158,7 +168,7 @@ def main() -> None:
                 },
                 training=False,
             )
-            return {"pion_score": score}
+            return _serving_outputs(score)
 
     elif auxiliary_names == {"event_features"}:
 
@@ -190,7 +200,7 @@ def main() -> None:
                 },
                 training=False,
             )
-            return {"pion_score": score}
+            return _serving_outputs(score)
 
     elif not auxiliary_names:
 
@@ -216,7 +226,7 @@ def main() -> None:
                 },
                 training=False,
             )
-            return {"pion_score": score}
+            return _serving_outputs(score)
 
     else:
         raise ValueError(

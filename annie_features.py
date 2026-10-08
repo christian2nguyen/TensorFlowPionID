@@ -61,9 +61,9 @@ BDT_CUT_BRANCHES = [
     "NoVeto",
 ]
 
-# Event selection based on the one used to derive the per-PMT response
-# calibration in Fit_indivdiualPMT_Gaussian_Convolution.cpp. The charge-balance
-# and prompt-muon-total-PE requirements are intentionally omitted for training.
+# Legacy event selection based on the one used to derive the per-PMT response
+# calibration in Fit_indivdiualPMT_Gaussian_Convolution.cpp. It remains here so
+# models whose metadata names this selection can still be scored reproducibly.
 FIT_INDIVIDUAL_PMT_CUT_BRANCHES = [
     "sel_CC0pi_wc",
     "sel_clusterHist_tankcluster_branch",
@@ -75,6 +75,9 @@ FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION = (
     "sel_CC0pi_wc && sel_clusterHist_tankcluster_branch && "
     "clusterHits_tankcluster > 55 && match_found"
 )
+
+NU_MU_CC_CUT_BRANCHES = ["sel_nu_mu_cc"]
+NU_MU_CC_SELECTION_EXPRESSION = "sel_nu_mu_cc == true"
 
 TANKCLUSTER_ALIASES = [
     "hitPE_tankcluster",
@@ -254,13 +257,18 @@ def build_bdt_selection(arrays) -> np.ndarray:
 
 
 def build_fit_individual_pmt_selection(arrays) -> np.ndarray:
-    """Apply the reduced fit-derived event selection used for training."""
+    """Apply the legacy reduced fit-derived event selection."""
     return (
         (_to_numpy(arrays["sel_CC0pi_wc"]) != 0)
         & (_to_numpy(arrays["sel_clusterHist_tankcluster_branch"]) != 0)
         & (_to_numpy(arrays["clusterHits_tankcluster"]) > 55)
         & (_to_numpy(arrays["match_found"]) != 0)
     )
+
+
+def build_nu_mu_cc_selection(arrays) -> np.ndarray:
+    """Apply the sole physics preselection used by the ring training."""
+    return _to_numpy(arrays["sel_nu_mu_cc"]) == 1
 
 
 def iterate_root_features(

@@ -233,8 +233,16 @@ python train_annie_ring.py simulation_*.root \
   --output artifacts/annie_ring_pion.h5
 
 python score_annie_ring.py artifacts/annie_ring_pion.h5 sample.root \
+  --pion-threshold 0.70 \
+  --fv-threshold 0.50 \
   --output annie_ring_scores.csv
 ```
+
+The two cuts are independent: `pion_prediction` is determined only by
+`pion_score`, and `fv_prediction` is determined only by `fv_score`. Omit either
+threshold option to use its value stored in the model JSON. Changing these cuts
+does not require retraining. The scoring CSV records both scores, both applied
+thresholds, and both decisions for every event.
 
 Export the trained hybrid model for C++ inference with the exporter in this
 project. Its serving signature includes both image tensors, the ordered
@@ -309,7 +317,7 @@ current event-level random split could place one copy in training and the other
 in validation or testing, producing overly optimistic metrics. Use independent
 event samples in the two lists.
 
-This command is **Model B**, a hybrid classifier. Its two image views each use
+This command is **Model C**, a hybrid two-head classifier. Its two image views each use
 exactly two channels (`hitPE` and `hitPE_tankcluster`). A scalar input contains
 `numMRDTracks`, while a second input preserves up to four exact start positions
 from `MRDTrackStartX`, `MRDTrackStartY`, and `MRDTrackStartZ`. A third input
@@ -327,9 +335,20 @@ through `numMRDTracks`, and the truncated-event count is saved in the model JSON
 metadata. `clusterChargeBalance_tankcluster_pmt_filtered` is neither a model
 input nor an event-selection cut.
 
+The shared representation feeds two independent head-specific dense layers:
+`pion_score` is supervised by the pion truth label, while `fv_score` is
+supervised by `trueFV`. `trueFV` is never supplied as a model input. No
+correlation loss, score multiplication, or conditional gating is applied. The
+two decisions use separate options, `--pion-threshold` (also accepted as
+`--threshold`) for pion ID and
+`--fv-threshold` for FV classification. The FV auxiliary loss has relative
+weight `--fv-loss-weight` (default `0.3`). Scoring CSVs and the exported
+SavedModel contain both scores.
+
 Training also writes `annie_ring_pion.history.csv`, containing the per-epoch
 training and validation metrics used to identify the best stopping point.
-Events are split reproducibly and stratified by pion truth label into 70%
+Events are split reproducibly and stratified by the joint pion/`trueFV` truth
+category into 70%
 training, 15% validation, and 15% testing. Evaluation includes count and
 true-class-normalized confusion matrices
 at the requested `--threshold`. A separate confidence-band confusion matrix
@@ -346,6 +365,11 @@ boundaries and the configured `--threshold`. The CSV and JSON metadata also
 record specificity, balanced accuracy, ordinary accuracy, F1, and the Matthews
 correlation coefficient at each evaluated operating point. A Brier score
 provides a threshold-independent check of probability calibration.
+The FV head separately produces ROC and precision-recall curves, count and
+normalized confusion matrices at `--fv-threshold`, an operating point, and a
+Brier score. It also writes `annie_ring_pion.fv_score_distribution.png`, a
+normalized held-out test-set histogram comparing `fv_score` for truth-outside
+and truth-inside FV events, with the configured FV cut drawn as a dashed line.
 
 Four held-out truth-pion image pages are produced for visual validation: a
 dedicated charged-pion page, the highest-scoring pions, pions nearest the
@@ -354,16 +378,10 @@ to three events with all four PMT image views and pion-truth annotations.
 The annotations include the truth muon and leading-pion kinetic energies in GeV
 when their truth momentum vectors are available.
 
-By default, Model B uses the reconstructed-event selection from
-`Fit_indivdiualPMT_Gaussian_Convolution.cpp`, with the charge-balance and
-`sel_promptMuonTotalPE_pmt_filtered` requirements intentionally omitted for
-training:
+By default, Model C applies only this physics event-selection cut:
 
 ```text
-sel_CC0pi_wc
-&& sel_clusterHist_tankcluster_branch
-&& clusterHits_tankcluster > 55
-&& match_found
+sel_nu_mu_cc == true
 ```
 
 Use `--no-event-cuts` to disable this selection. The older spelling

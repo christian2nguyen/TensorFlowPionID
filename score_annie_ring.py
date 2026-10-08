@@ -27,6 +27,18 @@ def main() -> None:
     parser.add_argument("--chunk-size", default="100 MB")
     parser.add_argument("--all-events", action="store_true")
     parser.add_argument(
+        "--pion-threshold",
+        "--threshold",
+        dest="pion_threshold",
+        type=float,
+        help="Override the pion cut stored in the model metadata",
+    )
+    parser.add_argument(
+        "--fv-threshold",
+        type=float,
+        help="Override the independent FV cut stored in the model metadata",
+    )
+    parser.add_argument(
         "--pmt-response",
         choices=PMT_RESPONSE_CHOICES,
         default="raw",
@@ -43,6 +55,12 @@ def main() -> None:
         help="Defaults to the tune variant stored with the trained model",
     )
     args = parser.parse_args()
+    for option, value in (
+        ("--pion-threshold", args.pion_threshold),
+        ("--fv-threshold", args.fv_threshold),
+    ):
+        if value is not None and not 0.0 <= value <= 1.0:
+            parser.error(f"{option} must be between 0 and 1")
 
     metadata = json.loads(args.model.with_suffix(".json").read_text(encoding="utf-8"))
     if metadata.get("model_type") != "annie_pion_ring_cnn":
@@ -109,6 +127,24 @@ def main() -> None:
         has_mrd_track_properties = bool(
             metadata.get("mrd_track_property_input_name")
         )
+        has_fv_output = "fv_score" in getattr(model, "output_names", [])
+        if args.fv_threshold is not None and not has_fv_output:
+            raise ValueError(
+                "--fv-threshold was supplied, but this model has no fv_score output"
+            )
+        threshold = float(
+            metadata["threshold"]
+            if args.pion_threshold is None
+            else args.pion_threshold
+        )
+        fv_threshold = float(
+            metadata.get("fv_threshold", 0.5)
+            if args.fv_threshold is None
+            else args.fv_threshold
+        )
+        print(f"Pion decision: pion_score >= {threshold:.3f}")
+        if has_fv_output:
+            print(f"FV decision: fv_score >= {fv_threshold:.3f}")
         max_mrd_tracks = int(metadata.get("max_mrd_tracks", 0))
         track_column_names = [
             name
@@ -140,7 +176,13 @@ def main() -> None:
                 *event_feature_names,
                 *track_column_names,
                 "pion_score",
+                "pion_threshold",
                 "pion_prediction",
+                *(
+                    ["fv_score", "fv_threshold", "fv_prediction"]
+                    if has_fv_output
+                    else []
+                ),
             ],
         )
         writer.writeheader()
@@ -182,8 +224,17 @@ def main() -> None:
                 model_inputs["mrd_track_properties"] = chunk[
                     "mrd_track_properties"
                 ]
-            scores = model.predict(model_inputs, verbose=0).reshape(-1)
-            threshold = float(metadata["threshold"])
+            prediction_outputs = model.predict(model_inputs, verbose=0)
+            if isinstance(prediction_outputs, dict):
+                scores = prediction_outputs["pion_score"].reshape(-1)
+                fv_scores = (
+                    prediction_outputs["fv_score"].reshape(-1)
+                    if has_fv_output
+                    else None
+                )
+            else:
+                scores = prediction_outputs.reshape(-1)
+                fv_scores = None
             feature_rows = chunk.get("event_features")
             for row_index, (entry, score) in enumerate(zip(chunk["entries"], scores)):
                 output_row = {
@@ -193,8 +244,18 @@ def main() -> None:
                     "pmt_tune_variant": response.tune_variant,
                     "pmt_response_payload_format": response.payload_format,
                     "pion_score": float(score),
+                    "pion_threshold": threshold,
                     "pion_prediction": int(score >= threshold),
                 }
+                if fv_scores is not None:
+                    fv_score = float(fv_scores[row_index])
+                    output_row.update(
+                        {
+                            "fv_score": fv_score,
+                            "fv_threshold": fv_threshold,
+                            "fv_prediction": int(fv_score >= fv_threshold),
+                        }
+                    )
                 if feature_rows is not None:
                     output_row.update(
                         {

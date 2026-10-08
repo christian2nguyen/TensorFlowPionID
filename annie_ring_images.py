@@ -13,10 +13,12 @@ import uproot
 from annie_features import (
     BDT_CUT_BRANCHES,
     FIT_INDIVIDUAL_PMT_CUT_BRANCHES,
+    NU_MU_CC_CUT_BRANCHES,
     RING_EVENT_REQUIRED_BRANCHES,
     TRUTH_BRANCHES,
     build_bdt_selection,
     build_fit_individual_pmt_selection,
+    build_nu_mu_cc_selection,
     build_pion_labels,
     build_ring_event_features,
     resolve_tankcluster_branch,
@@ -31,6 +33,7 @@ DEFAULT_DETECTOR_HEIGHT = 48
 DEFAULT_DETECTOR_WIDTH = 32
 BEAM_SPLIT_Z = 1.681
 VERTEX_BRANCHES = ["simpleRecoVtxX", "simpleRecoVtxY", "simpleRecoVtxZ"]
+TRUE_FV_BRANCH = "trueFV"
 
 # Synchronized with PMTPositionInfo::ShutoffRecords and UsePMTForTankBDT in
 # stv-analysis-Joint. PMT 358 is intentionally retained by the BDT workflow.
@@ -430,12 +433,18 @@ def iterate_ring_images(
     charged_only: bool,
     chunk_size: str,
     include_ring_event_features: bool = False,
+    include_fv_truth: bool = False,
 ) -> Iterator[Dict[str, object]]:
     if isinstance(event_selection, bool):
         selection_mode = "fit_individual_pmt" if event_selection else "none"
     else:
         selection_mode = str(event_selection)
-    if selection_mode not in {"none", "fit_individual_pmt", "legacy_bdt"}:
+    if selection_mode not in {
+        "none",
+        "nu_mu_cc",
+        "fit_individual_pmt",
+        "legacy_bdt",
+    }:
         raise ValueError(f"Unknown event selection mode {selection_mode!r}")
     chain_entry_offset = 0
     for path in paths:
@@ -452,12 +461,16 @@ def iterate_ring_images(
                 tankcluster_id_branch,
                 *VERTEX_BRANCHES,
             ]
-            if selection_mode == "fit_individual_pmt":
+            if selection_mode == "nu_mu_cc":
+                requested.extend(NU_MU_CC_CUT_BRANCHES)
+            elif selection_mode == "fit_individual_pmt":
                 requested.extend(FIT_INDIVIDUAL_PMT_CUT_BRANCHES)
             elif selection_mode == "legacy_bdt":
                 requested.extend(BDT_CUT_BRANCHES)
             if include_truth:
                 requested.extend(TRUTH_BRANCHES)
+            if include_fv_truth:
+                requested.append(TRUE_FV_BRANCH)
             if include_ring_event_features:
                 requested.extend(RING_EVENT_REQUIRED_BRANCHES)
             missing = [name for name in requested if name not in available]
@@ -499,7 +512,9 @@ def iterate_ring_images(
                 )
                 aligned &= detector_aligned
                 selected = aligned.copy()
-                if selection_mode == "fit_individual_pmt":
+                if selection_mode == "nu_mu_cc":
+                    selected &= build_nu_mu_cc_selection(arrays)
+                elif selection_mode == "fit_individual_pmt":
                     selected &= build_fit_individual_pmt_selection(arrays)
                 elif selection_mode == "legacy_bdt":
                     selected &= build_bdt_selection(arrays)
@@ -548,6 +563,10 @@ def iterate_ring_images(
                     result["truth_pion_counts"] = np.column_stack(
                         [_numpy(arrays[name], np.int64) for name in TRUTH_BRANCHES]
                     )[selected]
+                if include_fv_truth:
+                    result["fv_labels"] = (
+                        _numpy(arrays[TRUE_FV_BRANCH], np.float32) != 0
+                    ).astype(np.float32)[selected]
                 yield result
                 entry_offset += n_entries
             chain_entry_offset += int(tree.num_entries)

@@ -85,7 +85,7 @@ def find_pion_events(args, geometry) -> list:
                 raise ValueError(f"Tree {args.tree!r} was not found in {path}")
             chain_offset += int(root_file[args.tree].num_entries)
     raw_response = PMTResponse("raw", tune_variant=args.pmt_tune_variant)
-    selection = "none" if args.no_event_cuts else "fit_individual_pmt"
+    selection = "none" if args.no_event_cuts else "nu_mu_cc"
     for chunk in iterate_ring_images(
         args.root_files,
         args.tree,

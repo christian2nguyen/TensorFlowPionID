@@ -34,10 +34,10 @@ from annie_pmt_response import (
     PMTResponse,
 )
 from annie_features import (
-    FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION,
     MAX_MRD_TRACKS,
     MRD_TRACK_PROPERTY_BRANCHES,
     MRD_TRACK_START_BRANCHES,
+    NU_MU_CC_SELECTION_EXPRESSION,
     RING_EVENT_FEATURE_NAMES,
     RING_EVENT_SCALAR_BRANCHES,
 )
@@ -170,7 +170,7 @@ def parse_args() -> argparse.Namespace:
         dest="no_event_cuts",
         action="store_true",
         help=(
-            "Disable the Fit_indivdiualPMT_Gaussian_Convolution event selection; "
+            "Disable the sel_nu_mu_cc == true training selection; "
             "--no-bdt-cuts is retained as a compatibility alias"
         ),
     )
@@ -180,7 +180,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--threshold",
+        "--pion-threshold",
+        dest="threshold",
+        type=float,
+        default=0.5,
+        help="Independent pion-score decision threshold (default: 0.5)",
+    )
+    parser.add_argument(
+        "--fv-threshold",
+        type=float,
+        default=0.5,
+        help="Independent true-FV prediction threshold (default: 0.5)",
+    )
+    parser.add_argument(
+        "--fv-loss-weight",
+        type=float,
+        default=0.3,
+        help="Relative weight of the independent FV loss (default: 0.3)",
+    )
     parser.add_argument("--seed", type=int, default=20260620)
     args = parser.parse_args()
     if args.file_list is not None:
@@ -222,6 +241,7 @@ def parse_args() -> argparse.Namespace:
 def load_data(
     args: argparse.Namespace,
 ) -> Tuple[
+    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -277,6 +297,7 @@ def load_data(
     mrd_track_property_chunks: List[np.ndarray] = []
     mrd_track_mask_chunks: List[np.ndarray] = []
     label_chunks: List[np.ndarray] = []
+    fv_label_chunks: List[np.ndarray] = []
     truth_pion_chunks: List[np.ndarray] = []
     source_path_chunks: List[np.ndarray] = []
     entry_chunks: List[np.ndarray] = []
@@ -302,11 +323,12 @@ def load_data(
             args.detector_height,
             args.detector_width,
             response,
-            not args.no_event_cuts,
+            "none" if args.no_event_cuts else "nu_mu_cc",
             True,
             args.charged_only,
             args.chunk_size,
             include_ring_event_features=True,
+            include_fv_truth=True,
         ):
             image_chunks.append(chunk["images"])
             detector_chunks.append(chunk["detector_images"])
@@ -315,6 +337,7 @@ def load_data(
             mrd_track_property_chunks.append(chunk["mrd_track_properties"])
             mrd_track_mask_chunks.append(chunk["mrd_track_mask"])
             label_chunks.append(chunk["labels"])
+            fv_label_chunks.append(chunk["fv_labels"])
             truth_pion_chunks.append(chunk["truth_pion_counts"])
             entries = chunk["entries"]
             entry_chunks.append(entries)
@@ -351,6 +374,7 @@ def load_data(
         np.concatenate(mrd_track_property_chunks),
         np.concatenate(mrd_track_mask_chunks),
         np.concatenate(label_chunks),
+        np.concatenate(fv_label_chunks),
         np.concatenate(source_path_chunks),
         np.concatenate(entry_chunks),
         np.concatenate(truth_pion_chunks),
@@ -604,6 +628,7 @@ def build_model(
     mrd_track_starts_train: np.ndarray,
     mrd_track_properties_train: np.ndarray,
     mrd_track_mask_train: np.ndarray,
+    fv_loss_weight: float,
 ) -> tf.keras.Model:
     angular_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="angular_channel_normalization"
@@ -680,9 +705,24 @@ def build_model(
             mrd_track_features,
         ]
     )
-    x = tf.keras.layers.Dense(32, activation="relu")(x)
-    x = tf.keras.layers.Dropout(0.30)(x)
-    outputs = tf.keras.layers.Dense(1, activation="sigmoid", name="pion_score")(x)
+    shared_features = tf.keras.layers.Dense(
+        32, activation="relu", name="shared_event_embedding"
+    )(x)
+    shared_features = tf.keras.layers.Dropout(
+        0.30, name="shared_event_dropout"
+    )(shared_features)
+    pion_features = tf.keras.layers.Dense(
+        16, activation="relu", name="pion_head_embedding"
+    )(shared_features)
+    fv_features = tf.keras.layers.Dense(
+        16, activation="relu", name="fv_head_embedding"
+    )(shared_features)
+    pion_output = tf.keras.layers.Dense(
+        1, activation="sigmoid", name="pion_score"
+    )(pion_features)
+    fv_output = tf.keras.layers.Dense(
+        1, activation="sigmoid", name="fv_score"
+    )(fv_features)
     model = tf.keras.Model(
         [
             angular_inputs,
@@ -692,17 +732,29 @@ def build_model(
             mrd_track_property_inputs,
             mrd_track_mask_inputs,
         ],
-        outputs,
+        {"pion_score": pion_output, "fv_score": fv_output},
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss="binary_crossentropy",
-        metrics=[
-            tf.keras.metrics.AUC(name="roc_auc"),
-            tf.keras.metrics.AUC(curve="PR", name="pr_auc"),
-            tf.keras.metrics.Precision(name="precision"),
-            tf.keras.metrics.Recall(name="recall"),
-        ],
+        loss={
+            "pion_score": "binary_crossentropy",
+            "fv_score": "binary_crossentropy",
+        },
+        loss_weights={"pion_score": 1.0, "fv_score": fv_loss_weight},
+        metrics={
+            "pion_score": [
+                tf.keras.metrics.AUC(name="roc_auc"),
+                tf.keras.metrics.AUC(curve="PR", name="pr_auc"),
+                tf.keras.metrics.Precision(name="precision"),
+                tf.keras.metrics.Recall(name="recall"),
+            ],
+            "fv_score": [
+                tf.keras.metrics.AUC(name="roc_auc"),
+                tf.keras.metrics.AUC(curve="PR", name="pr_auc"),
+                tf.keras.metrics.Precision(name="precision"),
+                tf.keras.metrics.Recall(name="recall"),
+            ],
+        },
     )
     return model
 
@@ -777,6 +829,113 @@ def plot_precision_recall(
     fig.savefig(path, dpi=160)
     plt.close(fig)
     return path.name, average_precision
+
+
+def plot_fv_diagnostics(
+    fv_labels: np.ndarray,
+    fv_scores: np.ndarray,
+    output: Path,
+    threshold: float,
+) -> Dict[str, object]:
+    """Write independent fiducial-volume classifier diagnostics."""
+    fig, axis = plt.subplots(figsize=(7, 5))
+    bins = np.linspace(0.0, 1.0, 41)
+    axis.hist(
+        fv_scores[fv_labels == 0],
+        bins=bins,
+        alpha=0.6,
+        density=True,
+        label="Outside FV (truth)",
+        color="C0",
+    )
+    axis.hist(
+        fv_scores[fv_labels == 1],
+        bins=bins,
+        alpha=0.6,
+        density=True,
+        label="Inside FV (truth)",
+        color="C1",
+    )
+    axis.axvline(
+        threshold,
+        color="black",
+        linestyle="--",
+        label=f"FV cut = {threshold:.2f}",
+    )
+    axis.set_xlim(0.0, 1.0)
+    axis.set_xlabel("Model fv_score")
+    axis.set_ylabel("Normalized event density")
+    axis.set_title("Test-set FV signal separation")
+    axis.legend()
+    fig.tight_layout()
+    separation_path = output.with_suffix(".fv_score_distribution.png")
+    fig.savefig(separation_path, dpi=160)
+    plt.close(fig)
+
+    fpr, tpr, _ = roc_curve(fv_labels, fv_scores)
+    roc_auc_value = float(auc(fpr, tpr))
+    fig, axis = plt.subplots(figsize=(6, 6))
+    axis.plot(fpr, tpr, label=f"FV ROC (AUC = {roc_auc_value:.4f})")
+    axis.plot([0, 1], [0, 1], color="gray", linestyle="--", label="Chance")
+    axis.set_xlabel("False positive rate (outside FV classified inside)")
+    axis.set_ylabel("True positive rate (true-FV efficiency)")
+    axis.set_title("Independent FV prediction ROC curve")
+    axis.legend(loc="lower right")
+    fig.tight_layout()
+    roc_path = output.with_suffix(".fv_roc_curve.png")
+    fig.savefig(roc_path, dpi=160)
+    plt.close(fig)
+
+    precision, recall, _ = precision_recall_curve(fv_labels, fv_scores)
+    average_precision = float(average_precision_score(fv_labels, fv_scores))
+    fig, axis = plt.subplots(figsize=(6, 6))
+    axis.plot(
+        recall,
+        precision,
+        color="C2",
+        label=f"FV PR (AP = {average_precision:.4f})",
+    )
+    axis.set_xlabel("Recall (true-FV efficiency)")
+    axis.set_ylabel("Precision (true-FV purity)")
+    axis.set_title("Independent FV prediction precision-recall curve")
+    axis.legend(loc="lower left")
+    fig.tight_layout()
+    pr_path = output.with_suffix(".fv_precision_recall_curve.png")
+    fig.savefig(pr_path, dpi=160)
+    plt.close(fig)
+
+    return {
+        "fv_score_distribution": separation_path.name,
+        "fv_roc_curve": roc_path.name,
+        "fv_roc_auc": roc_auc_value,
+        "fv_precision_recall_curve": pr_path.name,
+        "fv_average_precision": average_precision,
+        "fv_brier_score": float(brier_score_loss(fv_labels, fv_scores)),
+        "fv_operating_point": pion_operating_point(
+            fv_labels, fv_scores, threshold
+        ),
+        "fv_confusion_matrix": plot_confusion_matrix(
+            fv_labels,
+            fv_scores,
+            threshold,
+            output,
+            filename_suffix=".fv_confusion_matrix.png",
+            negative_label="outside FV",
+            positive_label="inside FV",
+            score_name="fv_score",
+        ),
+        "fv_confusion_matrix_normalized": plot_confusion_matrix(
+            fv_labels,
+            fv_scores,
+            threshold,
+            output,
+            normalize=True,
+            filename_suffix=".fv_confusion_matrix_normalized.png",
+            negative_label="outside FV",
+            positive_label="inside FV",
+            score_name="fv_score",
+        ),
+    }
 
 
 def plot_efficiency_rejection_vs_threshold(
@@ -951,11 +1110,14 @@ def plot_confusion_matrix(
     *,
     normalize: bool = False,
     filename_suffix: str = ".confusion_matrix.png",
+    negative_label: str = "no pion",
+    positive_label: str = "pion",
+    score_name: str = "pion_score",
 ) -> str:
     predictions = (test_scores >= threshold).astype(int)
     rule_text = (
-        f"non-pion-like if score < {threshold:.2f}; "
-        f"pion-like if score >= {threshold:.2f}"
+        f"{negative_label} if {score_name} < {threshold:.2f}; "
+        f"{positive_label} if {score_name} >= {threshold:.2f}"
     )
     counts = confusion_matrix(y_test, predictions, labels=[0, 1])
     if normalize:
@@ -976,9 +1138,9 @@ def plot_confusion_matrix(
         vmax=1.0 if normalize else None,
     )
     axis.set_xticks([0, 1])
-    axis.set_xticklabels(["no pion", "pion"])
+    axis.set_xticklabels([negative_label, positive_label])
     axis.set_yticks([0, 1])
-    axis.set_yticklabels(["no pion", "pion"])
+    axis.set_yticklabels([negative_label, positive_label])
     axis.set_xlabel("Predicted")
     axis.set_ylabel("Truth")
     title = (
@@ -1133,8 +1295,10 @@ def plot_training_curves(history_path: Path, output: Path) -> str:
     epochs = np.array([float(row["epoch"]) for row in rows])
     pairs = [
         ("loss", "val_loss"),
-        ("roc_auc", "val_roc_auc"),
-        ("pr_auc", "val_pr_auc"),
+        ("pion_score_roc_auc", "val_pion_score_roc_auc"),
+        ("pion_score_pr_auc", "val_pion_score_pr_auc"),
+        ("fv_score_roc_auc", "val_fv_score_roc_auc"),
+        ("fv_score_pr_auc", "val_fv_score_pr_auc"),
     ]
     pairs = [pair for pair in pairs if pair[0] in rows[0] and pair[1] in rows[0]]
     if not pairs:
@@ -1648,7 +1812,11 @@ def _grad_cam_heatmaps(
 ) -> np.ndarray:
     """Calculate batched Grad-CAM maps for one convolutional tower."""
     grad_model = tf.keras.Model(
-        model.inputs, [model.get_layer(conv_layer_name).output, model.output]
+        model.inputs,
+        [
+            model.get_layer(conv_layer_name).output,
+            model.get_layer("pion_score").output,
+        ],
     )
     tensors = {name: tf.convert_to_tensor(value) for name, value in inputs.items()}
     with tf.GradientTape() as tape:
@@ -1767,16 +1935,18 @@ def evaluate_and_plot(
     mrd_track_properties_test: np.ndarray,
     mrd_track_mask_test: np.ndarray,
     y_test: np.ndarray,
+    fv_labels_test: np.ndarray,
     source_paths_test: np.ndarray,
     entries_test: np.ndarray,
     truth_pion_counts_test: np.ndarray,
     history_path: Path,
     output: Path,
     threshold: float,
+    fv_threshold: float,
     tree_name: str,
     opening_angle_degree_branch: str = "",
 ) -> Dict[str, object]:
-    test_scores = model.predict(
+    prediction_outputs = model.predict(
         {
             "pmt_angular_image": images_test,
             "pmt_unfolded_image": detector_images_test,
@@ -1786,7 +1956,9 @@ def evaluate_and_plot(
             "mrd_track_mask": mrd_track_mask_test,
         },
         verbose=0,
-    ).reshape(-1)
+    )
+    test_scores = np.asarray(prediction_outputs["pion_score"]).reshape(-1)
+    fv_scores = np.asarray(prediction_outputs["fv_score"]).reshape(-1)
     (
         truth_muon_pion_angles,
         truth_muon_momenta,
@@ -1833,6 +2005,7 @@ def evaluate_and_plot(
                 "source_file",
                 "tree_entry",
                 "true_label",
+                "trueFV",
                 "truePiPlusCher",
                 "truePiMinusCher",
                 "truePi0",
@@ -1842,6 +2015,11 @@ def evaluate_and_plot(
                 *RING_EVENT_FEATURE_NAMES,
                 *track_column_names,
                 "pion_score",
+                "pion_threshold",
+                "pion_prediction",
+                "fv_score",
+                "fv_threshold",
+                "fv_prediction",
             ]
         )
         for event_index in range(len(y_test)):
@@ -1863,6 +2041,7 @@ def evaluate_and_plot(
                     source_paths_test[event_index],
                     int(entries_test[event_index]),
                     int(y_test[event_index]),
+                    int(fv_labels_test[event_index]),
                     *truth_pion_counts_test[event_index].astype(int),
                     float(truth_muon_pion_angles[event_index]),
                     float(truth_muon_kinetic_energy[event_index]),
@@ -1870,6 +2049,11 @@ def evaluate_and_plot(
                     *event_features_test[event_index].astype(float),
                     *track_values,
                     float(test_scores[event_index]),
+                    float(threshold),
+                    int(test_scores[event_index] >= threshold),
+                    float(fv_scores[event_index]),
+                    float(fv_threshold),
+                    int(fv_scores[event_index] >= fv_threshold),
                 ]
             )
 
@@ -2019,11 +2203,23 @@ def evaluate_and_plot(
             output,
             threshold,
         ),
+        **plot_fv_diagnostics(
+            fv_labels_test,
+            fv_scores,
+            output,
+            fv_threshold,
+        ),
     }
 
 
 def main() -> None:
     args = parse_args()
+    if not 0.0 <= args.threshold <= 1.0:
+        raise ValueError("--threshold must be between 0 and 1")
+    if not 0.0 <= args.fv_threshold <= 1.0:
+        raise ValueError("--fv-threshold must be between 0 and 1")
+    if args.fv_loss_weight <= 0.0:
+        raise ValueError("--fv-loss-weight must be positive")
     if args.image_height < 4 or args.image_width < 8:
         raise ValueError("The PMT image must be at least 4 x 8 bins")
     if args.detector_height < 24 or args.detector_width < 16:
@@ -2040,6 +2236,7 @@ def main() -> None:
         mrd_track_properties,
         mrd_track_mask,
         labels,
+        fv_labels,
         source_paths,
         entries,
         truth_pion_counts,
@@ -2068,26 +2265,52 @@ def main() -> None:
     counts = np.bincount(labels.astype(np.int64), minlength=2)
     if np.any(counts == 0):
         raise ValueError(f"Both classes are required; class counts are {counts.tolist()}")
+    fv_counts = np.bincount(fv_labels.astype(np.int64), minlength=2)
+    if np.any(fv_counts == 0):
+        raise ValueError(
+            f"Both trueFV classes are required; class counts are {fv_counts.tolist()}"
+        )
     indices = np.arange(len(labels))
+    joint_strata = (
+        2 * labels.astype(np.int64) + fv_labels.astype(np.int64)
+    )
     train_indices, temp_indices = train_test_split(
         indices,
         test_size=VALIDATION_FRACTION + TEST_FRACTION,
         random_state=args.seed,
-        stratify=labels,
+        stratify=joint_strata,
     )
     val_indices, test_indices = train_test_split(
         temp_indices,
         test_size=TEST_FRACTION / (VALIDATION_FRACTION + TEST_FRACTION),
         random_state=args.seed,
-        stratify=labels[temp_indices],
+        stratify=joint_strata[temp_indices],
     )
     y_train = labels[train_indices]
     y_val = labels[val_indices]
     y_test = labels[test_indices]
+    fv_train = fv_labels[train_indices]
+    fv_val = fv_labels[val_indices]
+    fv_test = fv_labels[test_indices]
     train_counts = np.bincount(y_train.astype(np.int64), minlength=2)
-    class_weight = {
+    pion_class_weight = {
         0: len(y_train) / (2.0 * train_counts[0]),
         1: len(y_train) / (2.0 * train_counts[1]),
+    }
+    fv_train_counts = np.bincount(fv_train.astype(np.int64), minlength=2)
+    fv_class_weight = {
+        0: len(fv_train) / (2.0 * fv_train_counts[0]),
+        1: len(fv_train) / (2.0 * fv_train_counts[1]),
+    }
+    training_sample_weights = {
+        "pion_score": np.array(
+            [pion_class_weight[int(label)] for label in y_train],
+            dtype=np.float32,
+        ),
+        "fv_score": np.array(
+            [fv_class_weight[int(label)] for label in fv_train],
+            dtype=np.float32,
+        ),
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -2101,6 +2324,7 @@ def main() -> None:
         mrd_track_starts[train_indices],
         mrd_track_properties[train_indices],
         mrd_track_mask[train_indices],
+        args.fv_loss_weight,
     )
     model.fit(
         {
@@ -2111,7 +2335,8 @@ def main() -> None:
             "mrd_track_properties": mrd_track_properties[train_indices],
             "mrd_track_mask": mrd_track_mask[train_indices],
         },
-        y_train,
+        {"pion_score": y_train, "fv_score": fv_train},
+        sample_weight=training_sample_weights,
         validation_data=(
             {
                 "pmt_angular_image": images[val_indices],
@@ -2121,17 +2346,19 @@ def main() -> None:
                 "mrd_track_properties": mrd_track_properties[val_indices],
                 "mrd_track_mask": mrd_track_mask[val_indices],
             },
-            y_val,
+            {"pion_score": y_val, "fv_score": fv_val},
         ),
         epochs=args.epochs,
         batch_size=args.batch_size,
-        class_weight=class_weight,
         callbacks=[
             tf.keras.callbacks.EarlyStopping(
-                monitor="val_pr_auc", mode="max", patience=12, restore_best_weights=True
+                monitor="val_pion_score_pr_auc",
+                mode="max",
+                patience=12,
+                restore_best_weights=True,
             ),
             tf.keras.callbacks.ReduceLROnPlateau(
-                monitor="val_pr_auc",
+                monitor="val_pion_score_pr_auc",
                 mode="max",
                 factor=0.5,
                 patience=5,
@@ -2151,7 +2378,7 @@ def main() -> None:
             "mrd_track_properties": mrd_track_properties[test_indices],
             "mrd_track_mask": mrd_track_mask[test_indices],
         },
-        y_test,
+        {"pion_score": y_test, "fv_score": fv_test},
         return_dict=True,
         verbose=0,
     )
@@ -2169,12 +2396,14 @@ def main() -> None:
         mrd_track_properties[test_indices],
         mrd_track_mask[test_indices],
         y_test,
+        fv_test,
         source_paths[test_indices],
         entries[test_indices],
         truth_pion_counts[test_indices],
         history_path,
         args.output,
         args.threshold,
+        args.fv_threshold,
         args.tree,
         args.muon_pion_opening_angle_deg_branch or "",
     )
@@ -2183,9 +2412,14 @@ def main() -> None:
         f"{evaluation_files['roc_auc_sklearn']:.5f}; "
         f"average precision: {evaluation_files['average_precision']:.5f}"
     )
+    print(
+        "FV ROC AUC cross-check: "
+        f"{evaluation_files['fv_roc_auc']:.5f}; "
+        f"average precision: {evaluation_files['fv_average_precision']:.5f}"
+    )
     metadata = {
         "model_type": "annie_pion_ring_cnn",
-        "model_variant": "B_PE_dual_view_plus_mrd_track_set",
+        "model_variant": "C_independent_pion_and_fv_heads",
         "tensorflow_version": tf.__version__,
         "training_sources": training_sources,
         "training_source_groups": response_info["groups"],
@@ -2265,6 +2499,10 @@ def main() -> None:
             "permutation_invariant_max_pooling"
         ),
         "label": "charged_pion_present" if args.charged_only else "any_pion_present",
+        "output_heads": ["pion_score", "fv_score"],
+        "fv_label": "trueFV",
+        "fv_truth_used_as_input": False,
+        "fv_loss_weight": args.fv_loss_weight,
         "truth_branches": ["truePiPlusCher", "truePiMinusCher", "truePi0"],
         "truth_muon_pion_opening_angle_annotation_only": True,
         "truth_muon_pion_kinetic_energy_annotation_only": True,
@@ -2279,12 +2517,13 @@ def main() -> None:
         "requested_muon_pion_opening_angle_degree_branch": (
             args.muon_pion_opening_angle_deg_branch
         ),
-        "event_selection": "fit_individual_pmt",
-        "event_selection_source": "Fit_indivdiualPMT_Gaussian_Convolution.cpp",
-        "event_selection_expression": FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION,
+        "event_selection": "nu_mu_cc",
+        "event_selection_source": "user_requested_training_preselection",
+        "event_selection_expression": NU_MU_CC_SELECTION_EXPRESSION,
         "event_selection_applied": not args.no_event_cuts,
-        "bdt_preselection": not args.no_event_cuts,
+        "bdt_preselection": False,
         "threshold": args.threshold,
+        "fv_threshold": args.fv_threshold,
         "data_split": {
             "training_fraction": TRAIN_FRACTION,
             "validation_fraction": VALIDATION_FRACTION,
@@ -2292,10 +2531,14 @@ def main() -> None:
             "training_events": int(len(train_indices)),
             "validation_events": int(len(val_indices)),
             "testing_events": int(len(test_indices)),
-            "stratified_by_truth_label": True,
+            "stratified_by_joint_pion_and_trueFV_label": True,
             "random_seed": args.seed,
         },
         "class_counts": {"no_pion": int(counts[0]), "pion": int(counts[1])},
+        "fv_class_counts": {
+            "outside_fv": int(fv_counts[0]),
+            "inside_fv": int(fv_counts[1]),
+        },
         "misaligned_events_rejected": n_misaligned,
         "test_metrics": {name: float(value) for name, value in metrics.items()},
         "training_history": history_path.name,
@@ -2335,6 +2578,14 @@ def main() -> None:
             f"F1={point['f1_score']:.5f}, "
             f"MCC={point['matthews_correlation_coefficient']:.5f}"
         )
+    fv_point = evaluation_files["fv_operating_point"]
+    print(
+        f"FV operating point at threshold={fv_point['threshold']:.2f}: "
+        f"efficiency={fv_point['efficiency']:.5f}, "
+        f"purity={fv_point['purity']:.5f}, "
+        f"specificity={fv_point['specificity']:.5f}, "
+        f"balanced_accuracy={fv_point['balanced_accuracy']:.5f}"
+    )
 
 
 if __name__ == "__main__":

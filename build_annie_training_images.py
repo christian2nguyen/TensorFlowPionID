@@ -10,7 +10,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from annie_features import FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION
+from annie_features import NU_MU_CC_SELECTION_EXPRESSION
 from annie_pmt_response import (
     PMT_RESPONSE_CHOICES,
     PMT_TUNE_VARIANT_CHOICES,
@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         dest="no_event_cuts",
         action="store_true",
         help=(
-            "Disable the Fit_indivdiualPMT_Gaussian_Convolution event selection; "
+            "Disable the sel_nu_mu_cc == true training selection; "
             "--no-bdt-cuts is retained as a compatibility alias"
         ),
     )
@@ -177,7 +177,7 @@ def main() -> None:
         args.detector_height,
         args.detector_width,
         response,
-        not args.no_event_cuts,
+        "none" if args.no_event_cuts else "nu_mu_cc",
         True,
         args.charged_only,
         args.chunk_size,
@@ -311,11 +311,11 @@ def main() -> None:
             "annotation_free_unfolded_barrel_top_bottom",
         ],
         "label": "charged_pion_present" if args.charged_only else "any_pion_present",
-        "event_selection": "fit_individual_pmt",
-        "event_selection_source": "Fit_indivdiualPMT_Gaussian_Convolution.cpp",
-        "event_selection_expression": FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION,
+        "event_selection": "nu_mu_cc",
+        "event_selection_source": "user_requested_training_preselection",
+        "event_selection_expression": NU_MU_CC_SELECTION_EXPRESSION,
         "event_selection_applied": not args.no_event_cuts,
-        "bdt_preselection": not args.no_event_cuts,
+        "bdt_preselection": False,
         "events_read": total_read,
         "events_written": total_selected,
         "misaligned_events_rejected": total_misaligned,
