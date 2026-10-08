@@ -24,13 +24,12 @@ if [ "${_pionid_python_version}" != "3.9" ]; then
     return 1 2>/dev/null || exit 1
 fi
 
-# sitecustomize explicitly selects shared Awkward/Uproot, then appends the full
-# shared directory as a fallback. This is deliberate: directly prepending the
-# directory would replace TensorFlow 2.13.1's compatible NumPy with NumPy 1.26.4.
-export PIONID_SHARED_SITE_PACKAGES="${_pionid_shared_site}"
-case ":${PYTHONPATH:-}:" in
-    *":${_pionid_setup_dir}/python_startup:"*) ;;
-    *) export PYTHONPATH="${_pionid_setup_dir}/python_startup${PYTHONPATH:+:${PYTHONPATH}}" ;;
+# The ANNIE shared directory contains one tested TensorFlow 2.20 scientific
+# Python stack. Put the complete stack first so TensorFlow, NumPy, Awkward,
+# Uproot, and their compiled extensions always come from the same environment.
+case "${PYTHONPATH:-}" in
+    "${_pionid_shared_site}"|"${_pionid_shared_site}:"*) ;;
+    *) export PYTHONPATH="${_pionid_shared_site}${PYTHONPATH:+:${PYTHONPATH}}" ;;
 esac
 
 python3 "${_pionid_setup_dir}/verify_python_environment.py"

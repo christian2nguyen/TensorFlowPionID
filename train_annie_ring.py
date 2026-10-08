@@ -176,7 +176,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--chunk-size", default="100 MB")
     parser.add_argument(
-        "--output", type=Path, default=Path("artifacts/annie_ring_pion.h5")
+        "--output", type=Path, default=Path("artifacts/annie_ring_pion.keras")
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)

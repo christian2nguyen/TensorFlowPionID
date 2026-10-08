@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report where PionID dependencies resolve and enforce critical versions."""
+"""Report where PionID dependencies resolve and verify the ANNIE stack."""
 
 from __future__ import annotations
 
@@ -12,22 +12,24 @@ from packaging.specifiers import SpecifierSet
 
 
 DEPENDENCIES = (
-    ("numpy", "numpy", ">=1.22,<=1.24.3", True),
-    ("pandas", "pandas", ">=1.5,<2.1", False),
-    ("scikit-learn", "sklearn", ">=1.1,<1.4", False),
-    ("uproot", "uproot", ">=5.0,<6", True),
-    ("awkward", "awkward", ">=2.0,<3", True),
-    ("matplotlib", "matplotlib", ">=3.5,<3.8", False),
-    ("gast", "gast", ">=0.2.1,<=0.4.0", True),
-    ("tensorflow", "tensorflow", "==2.13.1", True),
+    ("numpy", "numpy", "==1.26.4"),
+    ("pandas", "pandas", "==2.3.3"),
+    ("scikit-learn", "sklearn", "==1.6.1"),
+    ("scipy", "scipy", "==1.13.1"),
+    ("uproot", "uproot", "==5.6.9"),
+    ("awkward", "awkward", "==2.8.12"),
+    ("awkward-cpp", "awkward_cpp", "==51"),
+    ("matplotlib", "matplotlib", "==3.9.4"),
+    ("gast", "gast", "==0.7.0"),
+    ("tensorflow", "tensorflow", "==2.20.0"),
+    ("keras", "keras", ">=3.10,<4"),
 )
 
 
 def main() -> int:
     print(f"Python: {sys.version.split()[0]} ({sys.executable})")
     failures = []
-    warnings = []
-    for distribution, module_name, requirement, critical in DEPENDENCIES:
+    for distribution, module_name, requirement in DEPENDENCIES:
         try:
             module = import_module(module_name)
             installed = str(
@@ -47,20 +49,17 @@ def main() -> int:
             f"  loaded from: {location}"
         )
         if not compatible:
-            message = f"{distribution} {installed} does not satisfy {requirement}"
-            (failures if critical else warnings).append(message)
+            failures.append(
+                f"{distribution} {installed} does not satisfy {requirement}"
+            )
 
-    if warnings:
-        print("Warnings:", file=sys.stderr)
-        for message in warnings:
-            print(f"  - {message}", file=sys.stderr)
     if failures:
         print("Errors:", file=sys.stderr)
         for message in failures:
             print(f"  - {message}", file=sys.stderr)
         print(
-            "Keep a TensorFlow-2.13-compatible NumPy in the active environment; "
-            "the shared NumPy 1.26.4 must not take priority.",
+            "The project expects the tested TensorFlow 2.20 stack from "
+            "/exp/annie/app/users/dajana/myboy/lib/python3.9/site-packages.",
             file=sys.stderr,
         )
         return 1

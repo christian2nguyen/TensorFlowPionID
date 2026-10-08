@@ -36,7 +36,7 @@ def main() -> None:
     if not np.isfinite(values).all():
         raise ValueError("Prediction features contain missing or infinite values")
 
-    model = tf.keras.models.load_model(args.model)
+    model = tf.keras.models.load_model(args.model, compile=False)
     scores = model.predict(values, verbose=0).reshape(-1)
     frame["pion_score"] = scores
     frame["pion_prediction"] = (scores >= metadata["threshold"]).astype(np.int8)

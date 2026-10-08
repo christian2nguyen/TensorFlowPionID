@@ -36,7 +36,9 @@ def parse_args() -> argparse.Namespace:
         help="Train without the preselection used by the earlier BDT",
     )
     parser.add_argument("--chunk-size", default="100 MB")
-    parser.add_argument("--output", type=Path, default=Path("artifacts/annie_pion.h5"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("artifacts/annie_pion.keras")
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -163,4 +165,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -25,10 +25,10 @@ truth-level variables, particle ID codes, or columns derived from the label.
 
 ## Setup and training
 
-The current environment is pinned to TensorFlow/Keras 2.13.1. It supports the
-Python 3.8.13 environment used for ANNIE training and uses NumPy 1.22–1.24.3;
-NumPy 1.23.5 is known to work. On Apple silicon the dependency file selects
-`tensorflow-macos`; elsewhere it selects `tensorflow`.
+The current ANNIE environment is Python 3.9 with TensorFlow 2.20 and the Keras 3
+API. `requirements.txt` records the exact shared-package versions used on
+`anniegpvm01`, including NumPy 1.26.4, so a separate environment can reproduce
+the same software stack.
 
 ```bash
 python3 -m venv .venv
@@ -39,13 +39,13 @@ python -m pip check
 
 python train.py tracks.csv \
   --features momentum dedx tof ecal_energy \
-  --output artifacts/pion_classifier.h5
+  --output artifacts/pion_classifier.keras
 ```
 
-The TensorFlow message saying that AVX2/FMA could be enabled by rebuilding is
-informational; it does not mean training failed. `pip check` should not report a
-TensorFlow dependency conflict. In particular, TensorFlow 2.13.1 requires
-`gast <= 0.4.0`, which is pinned in `requirements.txt`.
+The messages saying that CUDA drivers are unavailable and AVX2/FMA could be
+enabled are informational. They mean this host will train on the CPU; they do
+not indicate a failed TensorFlow import. `pip check` should not report a
+TensorFlow dependency conflict.
 
 ### ANNIE shared Python packages
 
@@ -63,33 +63,30 @@ The script makes this shared directory available:
 /exp/annie/app/users/dajana/myboy/lib/python3.9/site-packages
 ```
 
-It explicitly selects shared Awkward 2.8.12 and Uproot 5.6.9, adds the rest of
-the directory as a fallback after the active environment's own site-packages,
-and prints the resolved version and path of every requested package. This lets
-it replace an older LCG Awkward 1.x without replacing the compatible NumPy.
-Do not prepend the complete shared path directly to `PYTHONPATH`: it contains
-NumPy 1.26.4, which would override the TensorFlow-2.13-compatible NumPy 1.23.5
-environment.
+It puts that complete directory first on `PYTHONPATH` and prints the resolved
+version and location of every required package. Keeping TensorFlow, NumPy,
+Awkward, Uproot, and their compiled extensions in one shared stack avoids
+mixing them with older LCG packages.
 
 The currently observed shared versions are:
 
-| Package | Shared version | Requested range | Setup behavior |
-| --- | ---: | --- | --- |
-| NumPy | 1.26.4 | `>=1.22,<=1.24.3` | Critical incompatibility if selected; setup fails |
-| pandas | 2.3.3 | `>=1.5,<2.1` | Warning when selected |
-| scikit-learn | 1.6.1 | `>=1.1,<1.4` | Warning when selected |
-| Uproot | 5.6.9 | `>=5.0,<6` | Compatible |
-| Awkward | 2.8.12 | `>=2.0,<3` | Compatible |
-| Matplotlib | 3.9.4 | `>=3.5,<3.8` | Warning when selected |
+| Package | Tested version | Setup behavior |
+| --- | ---: | --- |
+| TensorFlow | 2.20.0 | Required |
+| Keras | 3.10 or newer (major version 3) | Required |
+| NumPy | 1.26.4 | Required |
+| pandas | 2.3.3 | Required |
+| scikit-learn | 1.6.1 | Required |
+| SciPy | 1.13.1 | Required |
+| Uproot | 5.6.9 | Required |
+| Awkward | 2.8.12 | Required |
+| awkward-cpp | 51 | Required |
+| Matplotlib | 3.9.4 | Required |
+| gast | 0.7.0 | Required |
 
 The shared directory is built for Python 3.9, so `setup.sh` rejects a different
-Python minor version. NumPy, Uproot, and Awkward are treated as critical because
-they directly affect TensorFlow compatibility and ROOT/jagged-array reading.
-The other out-of-range packages are reported as warnings so their shared builds
-can still be tested deliberately. The checker also requires TensorFlow 2.13.1
-and `gast <= 0.4.0`. The original NumPy range is narrowed to
-`>=1.22,<=1.24.3` to match TensorFlow 2.13.1. The environment checker is also
-available on its own:
+Python minor version. It also fails immediately if a package is missing or does
+not match the tested stack. The environment checker is available on its own:
 
 ```bash
 python3 verify_python_environment.py
@@ -102,7 +99,7 @@ python train.py run_001.root run_002.root \
   --tree events/tracks \
   --features momentum dedx tof ecal_energy \
   --label is_pion \
-  --output artifacts/pion_classifier.h5
+  --output artifacts/pion_classifier.keras
 ```
 
 To discover the tree path and available branches:
@@ -118,7 +115,7 @@ the same track.
 
 The command prints validation and test metrics and writes:
 
-- the trained `.h5` model (including its normalization layer), and
+- the trained `.keras` model (including its normalization layer), and
 - a neighboring `.json` metadata file containing the ordered feature names and
   classification threshold.
 
@@ -130,7 +127,7 @@ same event.
 ## Prediction
 
 ```bash
-python predict.py artifacts/pion_classifier.h5 new_tracks.csv \
+python predict.py artifacts/pion_classifier.keras new_tracks.csv \
   --keep event_id track_id \
   --output pion_scores.csv
 ```
@@ -166,7 +163,7 @@ The earlier BDT preselection is enabled by default. Train with:
 ```bash
 python train_annie_pion.py simulation_*.root \
   --tree phaseIITriggerTree \
-  --output artifacts/annie_pion.h5
+  --output artifacts/annie_pion.keras
 ```
 
 Useful variations:
@@ -186,7 +183,7 @@ python train_annie_pion.py simulation.root --no-bdt-cuts
 Apply the trained network to ROOT files:
 
 ```bash
-python score_annie_pion.py artifacts/annie_pion.h5 sample.root \
+python score_annie_pion.py artifacts/annie_pion.keras sample.root \
   --output annie_pion_scores.csv
 ```
 
@@ -326,9 +323,9 @@ python train_annie_ring.py simulation_*.root \
   --fv-loss-weight 0.30 \
   --epochs 100 \
   --batch-size 128 \
-  --output artifacts/annie_ring_pion.h5
+  --output artifacts/annie_ring_pion.keras
 
-python score_annie_ring.py artifacts/annie_ring_pion.h5 sample.root \
+python score_annie_ring.py artifacts/annie_ring_pion.keras sample.root \
   --pion-threshold 0.70 \
   --fv-threshold 0.50 \
   --output annie_ring_scores.csv
@@ -382,11 +379,11 @@ are intentionally needed for every event. The scoring CSV records both scores,
 both applied thresholds, and both independent decisions for every written
 event.
 
-For `--output artifacts/annie_ring_pion.h5`, the main artifacts are:
+For `--output artifacts/annie_ring_pion.keras`, the main artifacts are:
 
 | Artifact | Contents |
 | --- | --- |
-| `annie_ring_pion.h5` | Keras Model C network and adapted normalization layers |
+| `annie_ring_pion.keras` | Keras Model C network and adapted normalization layers |
 | `annie_ring_pion.json` | Inputs, PMT response provenance, both thresholds, split/class counts, metrics, and diagnostic filenames |
 | `annie_ring_pion.history.csv` | Per-epoch training and validation losses and metrics for both heads |
 | `annie_ring_pion.test_predictions.csv` | Held-out provenance, truth, model inputs, both scores, both thresholds, and both decisions |
@@ -405,7 +402,7 @@ two thresholds from the neighboring JSON and apply them independently:
 
 ```bash
 python export_annie_ring_saved_model.py \
-  artifacts/annie_ring_pion.h5 \
+  artifacts/annie_ring_pion.keras \
   artifacts/annie_ring_pion_saved_model
 ```
 
@@ -444,7 +441,7 @@ the list file's directory:
 
 ```bash
 python train_annie_ring.py --file-list simulation_files.txt \
-  --output artifacts/annie_ring_pion.h5
+  --output artifacts/annie_ring_pion.keras
 ```
 
 To train with two explicitly different detector-response groups, use one list
@@ -456,7 +453,7 @@ python train_annie_ring.py \
   --raw-file-list mc_to_leave_raw.txt \
   --pmt-response-calibration fitted_calibration.root \
   --pmt-tune-variant response \
-  --output artifacts/annie_ring_pion_mixed_response.h5
+  --output artifacts/annie_ring_pion_mixed_response.keras
 ```
 
 `--convolved-file-list` is an alias for `--tuned-file-list`, and
@@ -652,7 +649,7 @@ python train_annie_ring.py simulation.root \
   --pmt-response tuned \
   --pmt-response-calibration individual_pmt_fit_output.root \
   --pmt-tune-variant final \
-  --output artifacts/annie_ring_pion_tuned.h5
+  --output artifacts/annie_ring_pion_tuned.keras
 ```
 
 For each hit, Python selects the saved row matching PMT ID, branch kind, and
@@ -688,7 +685,7 @@ The response map transforms **simulation toward detector data**. Therefore:
 For example, scoring tuned simulation requires:
 
 ```bash
-python score_annie_ring.py artifacts/annie_ring_pion_tuned.h5 simulation.root \
+python score_annie_ring.py artifacts/annie_ring_pion_tuned.keras simulation.root \
   --pmt-response tuned \
   --pmt-response-calibration individual_pmt_fit_output.root \
   --output tuned_mc_scores.csv
@@ -722,14 +719,14 @@ python -c "import tensorflow as tf; print(tf.__version__)"
 Each final model consists of two files that must remain together, for example:
 
 ```text
-artifacts/pion_classifier.h5
+artifacts/pion_classifier.keras
 artifacts/pion_classifier.json
 
-artifacts/annie_ring_pion.h5
+artifacts/annie_ring_pion.keras
 artifacts/annie_ring_pion.json
 ```
 
-The `.h5` file contains the network and normalization layers. The `.json` file
+The `.keras` file contains the network and normalization layers. The `.json` file
 stores preprocessing settings, both output-head definitions, both decision
 thresholds, the FV loss weight, response-tuning provenance, class counts, data
 split, test metrics, and diagnostic filenames. Keep the

@@ -35,7 +35,7 @@ def main() -> None:
     parser.add_argument("saved_model_directory", type=Path)
     args = parser.parse_args()
 
-    model = tf.keras.models.load_model(args.keras_model)
+    model = tf.keras.models.load_model(args.keras_model, compile=False)
     shapes = _input_shapes(model)
     image_names = {"pmt_angular_image", "pmt_unfolded_image"}
     auxiliary_names = {

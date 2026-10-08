@@ -27,7 +27,7 @@ def main() -> None:
     args = parser.parse_args()
 
     metadata = json.loads(args.model.with_suffix(".json").read_text(encoding="utf-8"))
-    model = tf.keras.models.load_model(args.model)
+    model = tf.keras.models.load_model(args.model, compile=False)
     rows = []
     for chunk in iterate_root_features(
         args.root_files,

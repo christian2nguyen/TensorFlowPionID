@@ -65,7 +65,7 @@ def main() -> None:
     metadata = json.loads(args.model.with_suffix(".json").read_text(encoding="utf-8"))
     if metadata.get("model_type") != "annie_pion_ring_cnn":
         raise ValueError("The supplied model is not an ANNIE ring CNN")
-    model = tf.keras.models.load_model(args.model)
+    model = tf.keras.models.load_model(args.model, compile=False)
     geometry = PMTGeometry(args.geometry, metadata.get("pmt_mask", "bdt"))
     tune_variant = args.pmt_tune_variant or metadata.get("pmt_tune_variant", "final")
     response = PMTResponse(

@@ -24,7 +24,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tree", help="TTree/RNTuple path inside ROOT files")
     parser.add_argument("--validation-data", nargs="+", type=Path)
     parser.add_argument("--test-data", nargs="+", type=Path)
-    parser.add_argument("--output", type=Path, default=Path("artifacts/pion_classifier.h5"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("artifacts/pion_classifier.keras")
+    )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=256)
