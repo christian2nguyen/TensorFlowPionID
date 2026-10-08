@@ -20,6 +20,7 @@ DEPENDENCIES = (
     ("awkward", "awkward", "==2.8.12"),
     ("awkward-cpp", "awkward_cpp", "==51"),
     ("matplotlib", "matplotlib", "==3.9.4"),
+    ("packaging", "packaging", "==26.1"),
     ("gast", "gast", "==0.7.0"),
     ("tensorflow", "tensorflow", "==2.20.0"),
     ("keras", "keras", ">=3.10,<4"),

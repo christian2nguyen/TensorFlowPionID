@@ -82,6 +82,7 @@ The currently observed shared versions are:
 | Awkward | 2.8.12 | Required |
 | awkward-cpp | 51 | Required |
 | Matplotlib | 3.9.4 | Required |
+| packaging | 26.1 | Required |
 | gast | 0.7.0 | Required |
 
 The shared directory is built for Python 3.9, so `setup.sh` rejects a different
