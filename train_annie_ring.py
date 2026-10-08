@@ -181,6 +181,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument(
+        "--mrd-ablation-repeats",
+        type=int,
+        default=5,
+        help=(
+            "number of held-out MRD permutation tests used to measure how much "
+            "the trained model relies on MRD information (default: 5)"
+        ),
+    )
+    parser.add_argument(
+        "--mrd-branch-importance-repeats",
+        type=int,
+        default=3,
+        help=(
+            "number of single-branch MRD permutations used for the SHAP-style "
+            "impact ranking and beeswarm (default: 3)"
+        ),
+    )
+    parser.add_argument(
         "--threshold",
         "--pion-threshold",
         dest="threshold",
@@ -1015,6 +1033,449 @@ def pion_operating_point(
         "false_positive": false_positive,
         "false_negative": false_negative,
         "true_negative": true_negative,
+    }
+
+
+def _ablation_metrics(
+    pion_labels: np.ndarray,
+    pion_scores: np.ndarray,
+    pion_threshold: float,
+    fv_labels: np.ndarray,
+    fv_scores: np.ndarray,
+    fv_threshold: float,
+) -> Dict[str, float]:
+    """Summarize both output heads for an MRD permutation trial."""
+    pion_fpr, pion_tpr, _ = roc_curve(pion_labels, pion_scores)
+    fv_fpr, fv_tpr, _ = roc_curve(fv_labels, fv_scores)
+    pion_point = pion_operating_point(pion_labels, pion_scores, pion_threshold)
+    fv_point = pion_operating_point(fv_labels, fv_scores, fv_threshold)
+    return {
+        "pion_roc_auc": float(auc(pion_fpr, pion_tpr)),
+        "pion_average_precision": float(
+            average_precision_score(pion_labels, pion_scores)
+        ),
+        "pion_brier_score": float(brier_score_loss(pion_labels, pion_scores)),
+        "pion_efficiency": float(pion_point["efficiency"]),
+        "pion_purity": float(pion_point["purity"]),
+        "pion_efficiency_x_purity": float(
+            pion_point["efficiency_x_purity"]
+        ),
+        "fv_roc_auc": float(auc(fv_fpr, fv_tpr)),
+        "fv_average_precision": float(
+            average_precision_score(fv_labels, fv_scores)
+        ),
+        "fv_brier_score": float(brier_score_loss(fv_labels, fv_scores)),
+        "fv_efficiency": float(fv_point["efficiency"]),
+        "fv_purity": float(fv_point["purity"]),
+    }
+
+
+def evaluate_mrd_permutation_importance(
+    model: tf.keras.Model,
+    images_test: np.ndarray,
+    detector_images_test: np.ndarray,
+    event_features_test: np.ndarray,
+    mrd_track_starts_test: np.ndarray,
+    mrd_track_properties_test: np.ndarray,
+    mrd_track_mask_test: np.ndarray,
+    pion_labels: np.ndarray,
+    fv_labels: np.ndarray,
+    full_pion_scores: np.ndarray,
+    full_fv_scores: np.ndarray,
+    pion_threshold: float,
+    fv_threshold: float,
+    output: Path,
+    seed: int,
+    repeats: int,
+) -> Dict[str, object]:
+    """Measure held-out performance loss when all MRD inputs are shuffled."""
+    full_metrics = _ablation_metrics(
+        pion_labels,
+        full_pion_scores,
+        pion_threshold,
+        fv_labels,
+        full_fv_scores,
+        fv_threshold,
+    )
+    rng = np.random.default_rng(seed + 104729)
+    trial_rows = []
+    for repeat in range(repeats):
+        permutation = rng.permutation(len(pion_labels))
+        outputs = model.predict(
+            {
+                "pmt_angular_image": images_test,
+                "pmt_unfolded_image": detector_images_test,
+                "event_features": event_features_test[permutation],
+                "mrd_track_starts": mrd_track_starts_test[permutation],
+                "mrd_track_properties": mrd_track_properties_test[permutation],
+                "mrd_track_mask": mrd_track_mask_test[permutation],
+            },
+            verbose=0,
+        )
+        trial_metrics = _ablation_metrics(
+            pion_labels,
+            np.asarray(outputs["pion_score"]).reshape(-1),
+            pion_threshold,
+            fv_labels,
+            np.asarray(outputs["fv_score"]).reshape(-1),
+            fv_threshold,
+        )
+        trial_rows.append(
+            {"mode": "mrd_permuted", "repeat": repeat + 1, **trial_metrics}
+        )
+
+    metric_names = list(full_metrics)
+    shuffled_mean = {
+        name: float(np.mean([row[name] for row in trial_rows]))
+        for name in metric_names
+    }
+    shuffled_std = {
+        name: float(np.std([row[name] for row in trial_rows]))
+        for name in metric_names
+    }
+    performance_drop = {
+        name: float(
+            shuffled_mean[name] - full_metrics[name]
+            if name.endswith("brier_score")
+            else full_metrics[name] - shuffled_mean[name]
+        )
+        for name in metric_names
+    }
+
+    csv_path = output.with_suffix(".mrd_permutation_ablation.csv")
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["mode", "repeat", *metric_names]
+        )
+        writer.writeheader()
+        writer.writerow({"mode": "full_model", "repeat": 0, **full_metrics})
+        writer.writerows(trial_rows)
+
+    plotted_metrics = [
+        "pion_roc_auc",
+        "pion_average_precision",
+        "pion_efficiency_x_purity",
+        "fv_roc_auc",
+        "fv_average_precision",
+    ]
+    plotted_labels = [
+        "Pion ROC AUC",
+        "Pion average precision",
+        "Pion efficiency × purity",
+        "FV ROC AUC",
+        "FV average precision",
+    ]
+    positions = np.arange(len(plotted_metrics))
+    width = 0.36
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].bar(
+        positions - width / 2,
+        [full_metrics[name] for name in plotted_metrics],
+        width,
+        label="Normal test data",
+    )
+    axes[0].bar(
+        positions + width / 2,
+        [shuffled_mean[name] for name in plotted_metrics],
+        width,
+        yerr=[shuffled_std[name] for name in plotted_metrics],
+        capsize=3,
+        label="MRD shuffled",
+    )
+    axes[0].set_ylim(0.0, 1.05)
+    axes[0].set_ylabel("Metric value")
+    axes[0].set_xticks(positions, plotted_labels, rotation=25, ha="right")
+    axes[0].set_title("Held-out performance")
+    axes[0].legend()
+    axes[1].barh(
+        plotted_labels,
+        [performance_drop[name] for name in plotted_metrics],
+        xerr=[shuffled_std[name] for name in plotted_metrics],
+        capsize=3,
+    )
+    axes[1].axvline(0.0, color="black", linewidth=1)
+    axes[1].set_xlabel("Performance decrease after shuffling MRD")
+    axes[1].set_title("MRD permutation importance\n(positive means MRD is useful)")
+    fig.tight_layout()
+    plot_path = output.with_suffix(".mrd_permutation_ablation.png")
+    fig.savefig(plot_path, dpi=160)
+    plt.close(fig)
+
+    return {
+        "mrd_permutation_ablation_csv": csv_path.name,
+        "mrd_permutation_ablation_plot": plot_path.name,
+        "mrd_permutation_importance": {
+            "method": (
+                "All MRD inputs, including numMRDTracks, track positions, track "
+                "properties, and masks, were permuted together across held-out "
+                "events while PMT images and truth labels stayed fixed."
+            ),
+            "interpretation": (
+                "A positive performance_drop means performance worsened when the "
+                "event-to-MRD association was broken, indicating useful MRD "
+                "information. This measures model reliance, not the causal gain "
+                "from retraining a separate image-only model."
+            ),
+            "repeats": repeats,
+            "full_model": full_metrics,
+            "mrd_permuted_mean": shuffled_mean,
+            "mrd_permuted_std": shuffled_std,
+            "performance_drop": performance_drop,
+        },
+    }
+
+
+def _masked_event_mean(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Reduce a padded per-track branch to one display value per event."""
+    valid = mask.astype(bool)
+    counts = np.sum(valid, axis=1)
+    sums = np.sum(np.where(valid, values, 0.0), axis=1)
+    return np.divide(
+        sums,
+        counts,
+        out=np.full(len(values), np.nan, dtype=np.float64),
+        where=counts > 0,
+    )
+
+
+def _permute_valid_track_values(
+    values: np.ndarray,
+    mask: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Permute a branch within each valid padded track slot."""
+    shuffled = np.array(values, copy=True)
+    for track_index in range(values.shape[1]):
+        valid_indices = np.flatnonzero(mask[:, track_index] != 0)
+        if len(valid_indices) > 1:
+            shuffled[valid_indices, track_index] = values[
+                rng.permutation(valid_indices), track_index
+            ]
+    return shuffled
+
+
+def evaluate_mrd_branch_importance(
+    model: tf.keras.Model,
+    images_test: np.ndarray,
+    detector_images_test: np.ndarray,
+    event_features_test: np.ndarray,
+    mrd_track_starts_test: np.ndarray,
+    mrd_track_properties_test: np.ndarray,
+    mrd_track_mask_test: np.ndarray,
+    pion_labels: np.ndarray,
+    full_pion_scores: np.ndarray,
+    output: Path,
+    seed: int,
+    repeats: int,
+) -> Dict[str, object]:
+    """Rank individual MRD branches using held-out permutation impacts."""
+    branch_specs = [
+        ("numMRDTracks", "event", 0),
+        ("MRDTrackStartX", "starts", 0),
+        ("MRDTrackStartY", "starts", 1),
+        ("MRDTrackStartZ", "starts", 2),
+        ("MRDEnergyLoss", "properties", 0),
+        ("MRDTrackLength", "properties", 1),
+        ("MRDTrackAngle", "properties", 2),
+    ]
+    full_fpr, full_tpr, _ = roc_curve(pion_labels, full_pion_scores)
+    full_roc_auc = float(auc(full_fpr, full_tpr))
+    full_average_precision = float(
+        average_precision_score(pion_labels, full_pion_scores)
+    )
+    rng = np.random.default_rng(seed + 130363)
+    results = []
+    impact_by_branch = {}
+    display_value_by_branch = {}
+
+    for branch_name, input_group, column in branch_specs:
+        repeat_impacts = []
+        repeat_roc_auc = []
+        repeat_average_precision = []
+        for _ in range(repeats):
+            event_features = event_features_test
+            track_starts = mrd_track_starts_test
+            track_properties = mrd_track_properties_test
+            if input_group == "event":
+                event_features = np.array(event_features_test, copy=True)
+                event_features[:, column] = event_features_test[
+                    rng.permutation(len(event_features_test)), column
+                ]
+            elif input_group == "starts":
+                track_starts = np.array(mrd_track_starts_test, copy=True)
+                track_starts[:, :, column] = _permute_valid_track_values(
+                    mrd_track_starts_test[:, :, column],
+                    mrd_track_mask_test,
+                    rng,
+                )
+            else:
+                track_properties = np.array(mrd_track_properties_test, copy=True)
+                track_properties[:, :, column] = _permute_valid_track_values(
+                    mrd_track_properties_test[:, :, column],
+                    mrd_track_mask_test,
+                    rng,
+                )
+            outputs = model.predict(
+                {
+                    "pmt_angular_image": images_test,
+                    "pmt_unfolded_image": detector_images_test,
+                    "event_features": event_features,
+                    "mrd_track_starts": track_starts,
+                    "mrd_track_properties": track_properties,
+                    "mrd_track_mask": mrd_track_mask_test,
+                },
+                verbose=0,
+            )
+            permuted_scores = np.asarray(outputs["pion_score"]).reshape(-1)
+            repeat_impacts.append(full_pion_scores - permuted_scores)
+            fpr, tpr, _ = roc_curve(pion_labels, permuted_scores)
+            repeat_roc_auc.append(float(auc(fpr, tpr)))
+            repeat_average_precision.append(
+                float(average_precision_score(pion_labels, permuted_scores))
+            )
+
+        mean_event_impact = np.mean(np.stack(repeat_impacts), axis=0)
+        impact_by_branch[branch_name] = mean_event_impact
+        if input_group == "event":
+            display_values = event_features_test[:, column].astype(np.float64)
+        elif input_group == "starts":
+            display_values = _masked_event_mean(
+                mrd_track_starts_test[:, :, column], mrd_track_mask_test
+            )
+        else:
+            display_values = _masked_event_mean(
+                mrd_track_properties_test[:, :, column], mrd_track_mask_test
+            )
+        display_value_by_branch[branch_name] = display_values
+        permuted_roc_auc_mean = float(np.mean(repeat_roc_auc))
+        permuted_ap_mean = float(np.mean(repeat_average_precision))
+        results.append(
+            {
+                "branch": branch_name,
+                "mean_abs_pion_score_impact": float(
+                    np.mean(np.abs(mean_event_impact))
+                ),
+                "mean_signed_pion_score_impact": float(
+                    np.mean(mean_event_impact)
+                ),
+                "pion_roc_auc_drop": full_roc_auc - permuted_roc_auc_mean,
+                "pion_roc_auc_drop_std": float(np.std(repeat_roc_auc)),
+                "pion_average_precision_drop": (
+                    full_average_precision - permuted_ap_mean
+                ),
+                "pion_average_precision_drop_std": float(
+                    np.std(repeat_average_precision)
+                ),
+            }
+        )
+
+    ranking = [
+        {"rank": rank, **row}
+        for rank, row in enumerate(
+            sorted(
+                results,
+                key=lambda item: item["mean_abs_pion_score_impact"],
+                reverse=True,
+            ),
+            start=1,
+        )
+    ]
+    csv_path = output.with_suffix(".mrd_branch_importance.csv")
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(ranking[0]))
+        writer.writeheader()
+        writer.writerows(ranking)
+
+    max_points = 2000
+    plot_rng = np.random.default_rng(seed + 155921)
+    fig, (swarm_axis, rank_axis) = plt.subplots(
+        1,
+        2,
+        figsize=(15, 6),
+        gridspec_kw={"width_ratios": [2.3, 1.0]},
+        sharey=True,
+    )
+    y_positions = np.arange(len(ranking))
+    for y_position, row in zip(y_positions, ranking):
+        branch_name = str(row["branch"])
+        impacts = impact_by_branch[branch_name]
+        values = display_value_by_branch[branch_name]
+        available = np.arange(len(impacts))
+        if len(available) > max_points:
+            available = plot_rng.choice(
+                available, size=max_points, replace=False
+            )
+        plot_impacts = impacts[available]
+        plot_values = values[available]
+        finite_values = plot_values[np.isfinite(plot_values)]
+        if len(finite_values):
+            low, high = np.nanpercentile(finite_values, [5.0, 95.0])
+            scale = high - low
+            colors = (
+                np.clip((plot_values - low) / scale, 0.0, 1.0)
+                if scale > 0.0
+                else np.full(len(plot_values), 0.5)
+            )
+            colors = np.where(np.isfinite(colors), colors, 0.5)
+        else:
+            colors = np.full(len(plot_values), 0.5)
+        jitter = plot_rng.normal(0.0, 0.10, size=len(plot_impacts))
+        swarm_axis.scatter(
+            plot_impacts,
+            y_position + jitter,
+            c=colors,
+            cmap="coolwarm",
+            vmin=0.0,
+            vmax=1.0,
+            s=10,
+            alpha=0.55,
+            linewidths=0,
+        )
+
+    swarm_axis.axvline(0.0, color="black", linewidth=1)
+    swarm_axis.set_yticks(y_positions, [str(row["branch"]) for row in ranking])
+    swarm_axis.invert_yaxis()
+    swarm_axis.set_xlabel(
+        "Pion-score impact: original score − score after branch permutation"
+    )
+    swarm_axis.set_title("Event-level MRD branch impacts")
+    rank_axis.barh(
+        y_positions,
+        [row["mean_abs_pion_score_impact"] for row in ranking],
+        color="tab:blue",
+        alpha=0.8,
+    )
+    rank_axis.set_xlabel("Mean |pion-score impact|")
+    rank_axis.set_title("Global ranking")
+    color_scale = plt.cm.ScalarMappable(cmap="coolwarm")
+    color_scale.set_array([])
+    colorbar = fig.colorbar(color_scale, ax=swarm_axis, pad=0.01)
+    colorbar.set_ticks([0.0, 1.0], labels=["low", "high"])
+    colorbar.set_label("Event branch value (within-branch scale)")
+    fig.suptitle(
+        "SHAP-style MRD permutation-impact beeswarm\n"
+        "Vector branch colors show the mean across valid tracks",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    plot_path = output.with_suffix(".mrd_branch_importance_beeswarm.png")
+    fig.savefig(plot_path, dpi=180)
+    plt.close(fig)
+
+    return {
+        "mrd_branch_importance_csv": csv_path.name,
+        "mrd_branch_importance_beeswarm": plot_path.name,
+        "mrd_branch_importance": {
+            "method": (
+                "One MRD branch at a time was permuted across held-out events. "
+                "Per-event impact is the original pion score minus the score "
+                "after permutation. This is SHAP-style permutation impact, not "
+                "an exact SHAP value."
+            ),
+            "repeats": repeats,
+            "ranking_metric": "mean_abs_pion_score_impact",
+            "ranking": ranking,
+        },
     }
 
 
@@ -1945,6 +2406,9 @@ def evaluate_and_plot(
     fv_threshold: float,
     tree_name: str,
     opening_angle_degree_branch: str = "",
+    seed: int = 0,
+    mrd_ablation_repeats: int = 5,
+    mrd_branch_importance_repeats: int = 3,
 ) -> Dict[str, object]:
     prediction_outputs = model.predict(
         {
@@ -1959,6 +2423,38 @@ def evaluate_and_plot(
     )
     test_scores = np.asarray(prediction_outputs["pion_score"]).reshape(-1)
     fv_scores = np.asarray(prediction_outputs["fv_score"]).reshape(-1)
+    mrd_ablation = evaluate_mrd_permutation_importance(
+        model,
+        images_test,
+        detector_images_test,
+        event_features_test,
+        mrd_track_starts_test,
+        mrd_track_properties_test,
+        mrd_track_mask_test,
+        y_test,
+        fv_labels_test,
+        test_scores,
+        fv_scores,
+        threshold,
+        fv_threshold,
+        output,
+        seed,
+        mrd_ablation_repeats,
+    )
+    mrd_branch_importance = evaluate_mrd_branch_importance(
+        model,
+        images_test,
+        detector_images_test,
+        event_features_test,
+        mrd_track_starts_test,
+        mrd_track_properties_test,
+        mrd_track_mask_test,
+        y_test,
+        test_scores,
+        output,
+        seed,
+        mrd_branch_importance_repeats,
+    )
     (
         truth_muon_pion_angles,
         truth_muon_momenta,
@@ -2209,6 +2705,8 @@ def evaluate_and_plot(
             output,
             fv_threshold,
         ),
+        **mrd_ablation,
+        **mrd_branch_importance,
     }
 
 
@@ -2220,6 +2718,10 @@ def main() -> None:
         raise ValueError("--fv-threshold must be between 0 and 1")
     if args.fv_loss_weight <= 0.0:
         raise ValueError("--fv-loss-weight must be positive")
+    if args.mrd_ablation_repeats < 1:
+        raise ValueError("--mrd-ablation-repeats must be at least 1")
+    if args.mrd_branch_importance_repeats < 1:
+        raise ValueError("--mrd-branch-importance-repeats must be at least 1")
     if args.image_height < 4 or args.image_width < 8:
         raise ValueError("The PMT image must be at least 4 x 8 bins")
     if args.detector_height < 24 or args.detector_width < 16:
@@ -2406,6 +2908,9 @@ def main() -> None:
         args.fv_threshold,
         args.tree,
         args.muon_pion_opening_angle_deg_branch or "",
+        args.seed,
+        args.mrd_ablation_repeats,
+        args.mrd_branch_importance_repeats,
     )
     print(
         "Test ROC AUC cross-check: "
@@ -2586,6 +3091,26 @@ def main() -> None:
         f"specificity={fv_point['specificity']:.5f}, "
         f"balanced_accuracy={fv_point['balanced_accuracy']:.5f}"
     )
+    mrd_report = evaluation_files["mrd_permutation_importance"]
+    mrd_drop = mrd_report["performance_drop"]
+    print(
+        "MRD permutation importance (positive means MRD was useful): "
+        f"pion ROC-AUC drop={mrd_drop['pion_roc_auc']:.5f}, "
+        f"pion average-precision drop="
+        f"{mrd_drop['pion_average_precision']:.5f}, "
+        f"pion efficiency*purity drop="
+        f"{mrd_drop['pion_efficiency_x_purity']:.5f}"
+    )
+    print("MRD branch ranking by mean absolute pion-score impact:")
+    for rank, branch_result in enumerate(
+        evaluation_files["mrd_branch_importance"]["ranking"], start=1
+    ):
+        print(
+            f"  {rank}. {branch_result['branch']}: "
+            f"mean |impact|="
+            f"{branch_result['mean_abs_pion_score_impact']:.6f}, "
+            f"ROC-AUC drop={branch_result['pion_roc_auc_drop']:.5f}"
+        )
 
 
 if __name__ == "__main__":

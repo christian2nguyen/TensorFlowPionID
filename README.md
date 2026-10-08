@@ -389,11 +389,74 @@ For `--output artifacts/annie_ring_pion.keras`, the main artifacts are:
 | `annie_ring_pion.history.csv` | Per-epoch training and validation losses and metrics for both heads |
 | `annie_ring_pion.test_predictions.csv` | Held-out provenance, truth, model inputs, both scores, both thresholds, and both decisions |
 | `annie_ring_pion.training_curves.png` | Total loss plus pion/FV ROC-AUC and PR-AUC histories |
+| `annie_ring_pion.mrd_permutation_ablation.png` | Full-model performance compared with the same test events after their MRD information is shuffled |
+| `annie_ring_pion.mrd_permutation_ablation.csv` | Full metrics and every MRD-shuffling repeat for quantitative comparisons |
+| `annie_ring_pion.mrd_branch_importance_beeswarm.png` | SHAP-style event-level impact plot and global ranking for each MRD branch |
+| `annie_ring_pion.mrd_branch_importance.csv` | Ranked MRD branch impacts and ROC-AUC/average-precision decreases |
 | `annie_ring_pion.misclassified_events.pdf` | Up to 20 annotated pion-head false positives and false negatives in one PDF |
 | `annie_ring_pion.gradcam_examples.png` | Pion-head Grad-CAM examples for both image towers |
 
 The pion and FV validation figures described below are written beside these
 files with the same model stem.
+
+### Measuring whether the MRD inputs help
+
+Training now automatically runs an MRD permutation-ablation test on the held-out
+test events. For each repeat, it keeps the PMT images and truth labels fixed but
+shuffles all MRD inputs together between events: `numMRDTracks`, track-start
+positions, energy loss, track length, track angle, and the track mask. It then
+recalculates pion and FV ROC-AUC, average precision, Brier score, efficiency,
+and purity.
+
+The terminal prints the decreases in pion ROC-AUC, average precision, and
+efficiency × purity. A clearly positive decrease means the trained network is
+using event-correlated MRD information. A result near zero means the MRD inputs
+are adding little measurable information on that held-out sample. Negative
+values mean the shuffled inputs performed better, which can indicate statistical
+fluctuation or that the model is using the MRD information poorly.
+
+The default is five deterministic shuffling repeats. Increase it for a more
+stable uncertainty estimate at the cost of additional inference time:
+
+```bash
+python train_annie_ring.py \
+  --file-list mc_files.txt \
+  --mrd-ablation-repeats 20 \
+  --output artifacts/annie_ring_pion.keras
+```
+
+This permutation test measures how much the trained model relies on the MRD
+inputs. The strongest measurement of their incremental benefit is still to
+train an otherwise identical image-only model with the same event split and
+compare the two held-out results.
+
+Training also creates a SHAP-style beeswarm that separately ranks:
+
+- `numMRDTracks`
+- `MRDTrackStartX`, `MRDTrackStartY`, and `MRDTrackStartZ`
+- `MRDEnergyLoss`, `MRDTrackLength`, and `MRDTrackAngle`
+
+For each branch, the plot shows the event-level change
+`original pion_score - score after branch permutation`. Positive points mean
+the event's real branch information increased its pion score; negative points
+mean it decreased the score. Point color shows whether the original branch
+value was relatively low or high. For vector branches, the displayed color is
+the mean value across valid MRD tracks, while the permutation itself operates
+on every retained track slot. The right side ranks branches by mean absolute
+pion-score impact.
+
+This is a model-agnostic permutation-impact diagnostic designed to resemble a
+SHAP beeswarm; it is not an exact SHAP decomposition. Its default three repeats
+require 21 additional inference passes for the seven MRD branches. Change the
+precision/runtime tradeoff with:
+
+```bash
+--mrd-branch-importance-repeats 10
+```
+
+Because the MRD branches can be correlated, their individual permutation
+importance can be shared or redistributed between related branches. Interpret
+the ranking together with the all-MRD ablation, not as a causal ordering.
 
 Export the trained hybrid model for C++ inference with the exporter in this
 project. Its serving signature includes both image tensors, the ordered
