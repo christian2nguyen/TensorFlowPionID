@@ -13,8 +13,10 @@ import uproot
 from annie_features import (
     BDT_CUT_BRANCHES,
     FIT_INDIVIDUAL_PMT_CUT_BRANCHES,
+    MRD_TRACK_PROPERTY_BRANCHES,
+    MRD_TRACK_START_BRANCHES,
     NU_MU_CC_CUT_BRANCHES,
-    RING_EVENT_REQUIRED_BRANCHES,
+    RING_EVENT_FEATURE_NAMES,
     TRUTH_BRANCHES,
     build_bdt_selection,
     build_fit_individual_pmt_selection,
@@ -459,6 +461,7 @@ def iterate_ring_images(
     include_fv_truth: bool = False,
     include_numu_truth: bool = False,
     tankcluster_only: bool = False,
+    ring_event_feature_names: Optional[List[str]] = None,
 ) -> Iterator[Dict[str, object]]:
     if isinstance(event_selection, bool):
         selection_mode = "fit_individual_pmt" if event_selection else "none"
@@ -471,6 +474,11 @@ def iterate_ring_images(
         "legacy_bdt",
     }:
         raise ValueError(f"Unknown event selection mode {selection_mode!r}")
+    scalar_feature_names = (
+        list(RING_EVENT_FEATURE_NAMES)
+        if ring_event_feature_names is None
+        else list(ring_event_feature_names)
+    )
     chain_entry_offset = 0
     for path in paths:
         with uproot.open(path) as root_file:
@@ -495,7 +503,9 @@ def iterate_ring_images(
             if include_numu_truth:
                 requested.append(TRUE_NUMU_BRANCH)
             if include_ring_event_features:
-                requested.extend(RING_EVENT_REQUIRED_BRANCHES)
+                requested.extend(scalar_feature_names)
+                requested.extend(MRD_TRACK_START_BRANCHES)
+                requested.extend(MRD_TRACK_PROPERTY_BRANCHES)
             missing = [name for name in requested if name not in available]
             if missing:
                 raise ValueError(f"{path} is missing branches: {', '.join(missing)}")
@@ -557,7 +567,9 @@ def iterate_ring_images(
                             mrd_track_mask,
                             valid_event_features,
                             mrd_track_overflow,
-                        ) = build_ring_event_features(arrays)
+                        ) = build_ring_event_features(
+                            arrays, scalar_feature_names
+                        )
                     except ValueError as error:
                         raise ValueError(
                             f"Invalid MRD branch layout in {path}, tree "

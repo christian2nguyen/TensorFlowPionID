@@ -362,6 +362,7 @@ def load_data(
             include_ring_event_features=True,
             include_fv_truth=True,
             include_numu_truth=True,
+            ring_event_feature_names=RING_EVENT_FEATURE_NAMES,
         ):
             image_chunks.append(chunk["images"])
             detector_chunks.append(chunk["detector_images"])
@@ -671,6 +672,13 @@ def build_model(
             "Head-specific image routing requires channel 0 = hitPE and "
             "channel 1 = hitPE_tankcluster"
         )
+    if RING_EVENT_FEATURE_NAMES != ["numMRDTracks", "NoVeto"]:
+        raise ValueError(
+            "Head-specific scalar routing requires event features ordered as "
+            "numMRDTracks, NoVeto"
+        )
+    if event_features_train.shape[1] != 2:
+        raise ValueError("Model C requires numMRDTracks and NoVeto inputs")
     angular_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="angular_channel_normalization"
     )
@@ -683,8 +691,11 @@ def build_model(
     detector_tank_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="detector_tankcluster_normalization"
     )
-    event_feature_normalizer = tf.keras.layers.Normalization(
-        axis=-1, name="event_feature_normalization"
+    mrd_count_normalizer = tf.keras.layers.Normalization(
+        axis=-1, name="num_mrd_tracks_normalization"
+    )
+    no_veto_normalizer = tf.keras.layers.Normalization(
+        axis=-1, name="no_veto_normalization"
     )
     mrd_track_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="mrd_track_coordinate_normalization"
@@ -696,7 +707,8 @@ def build_model(
     detector_normalizer.adapt(detector_train)
     angular_tank_normalizer.adapt(angular_train[..., 1:2])
     detector_tank_normalizer.adapt(detector_train[..., 1:2])
-    event_feature_normalizer.adapt(event_features_train)
+    mrd_count_normalizer.adapt(event_features_train[:, 0:1])
+    no_veto_normalizer.adapt(event_features_train[:, 1:2])
     valid_track_starts = mrd_track_starts_train[
         mrd_track_mask_train.astype(bool)
     ]
@@ -739,6 +751,26 @@ def build_model(
         kernel_initializer=tf.keras.initializers.Constant(tank_selector_kernel),
         name="detector_tankcluster_channel",
     )(detector_inputs)
+    mrd_count_selector_kernel = np.array([[1.0], [0.0]], dtype=np.float32)
+    no_veto_selector_kernel = np.array([[0.0], [1.0]], dtype=np.float32)
+    mrd_count_input = tf.keras.layers.Dense(
+        1,
+        use_bias=False,
+        trainable=False,
+        kernel_initializer=tf.keras.initializers.Constant(
+            mrd_count_selector_kernel
+        ),
+        name="num_mrd_tracks_channel",
+    )(event_feature_inputs)
+    no_veto_input = tf.keras.layers.Dense(
+        1,
+        use_bias=False,
+        trainable=False,
+        kernel_initializer=tf.keras.initializers.Constant(
+            no_veto_selector_kernel
+        ),
+        name="no_veto_channel",
+    )(event_feature_inputs)
     angular_features = _image_tower(angular_inputs, angular_normalizer, "angular")
     detector_features = _image_tower(detector_inputs, detector_normalizer, "detector")
     angular_tank_features = _image_tower(
@@ -747,10 +779,14 @@ def build_model(
     detector_tank_features = _image_tower(
         detector_tank_inputs, detector_tank_normalizer, "detector_tankcluster"
     )
-    event_features = event_feature_normalizer(event_feature_inputs)
-    event_features = tf.keras.layers.Dense(
+    mrd_count_features = mrd_count_normalizer(mrd_count_input)
+    mrd_count_features = tf.keras.layers.Dense(
         8, activation="relu", name="event_feature_embedding"
-    )(event_features)
+    )(mrd_count_features)
+    no_veto_features = no_veto_normalizer(no_veto_input)
+    no_veto_features = tf.keras.layers.Dense(
+        4, activation="relu", name="numu_no_veto_embedding"
+    )(no_veto_features)
     normalized_track_starts = mrd_track_normalizer(mrd_track_start_inputs)
     normalized_track_properties = mrd_property_normalizer(
         mrd_track_property_inputs
@@ -776,18 +812,29 @@ def build_model(
         [
             angular_features,
             detector_features,
-            event_features,
+            mrd_count_features,
             mrd_track_features,
         ]
     )
-    fv_numu_inputs = tf.keras.layers.Concatenate(
-        name="fv_numu_tankcluster_inputs"
+    fv_inputs = tf.keras.layers.Concatenate(
+        name="fv_tankcluster_inputs"
     )(
         [
             angular_tank_features,
             detector_tank_features,
-            event_features,
+            mrd_count_features,
             mrd_track_features,
+        ]
+    )
+    numu_inputs = tf.keras.layers.Concatenate(
+        name="numu_full_and_tankcluster_inputs"
+    )(
+        [
+            angular_features,
+            detector_features,
+            mrd_count_features,
+            mrd_track_features,
+            no_veto_features,
         ]
     )
     pion_shared_features = tf.keras.layers.Dense(
@@ -796,21 +843,27 @@ def build_model(
     pion_shared_features = tf.keras.layers.Dropout(
         0.30, name="pion_event_dropout"
     )(pion_shared_features)
-    fv_numu_shared_features = tf.keras.layers.Dense(
-        32, activation="relu", name="fv_numu_event_embedding"
-    )(fv_numu_inputs)
-    fv_numu_shared_features = tf.keras.layers.Dropout(
-        0.30, name="fv_numu_event_dropout"
-    )(fv_numu_shared_features)
+    fv_shared_features = tf.keras.layers.Dense(
+        32, activation="relu", name="fv_event_embedding"
+    )(fv_inputs)
+    fv_shared_features = tf.keras.layers.Dropout(
+        0.30, name="fv_event_dropout"
+    )(fv_shared_features)
+    numu_shared_features = tf.keras.layers.Dense(
+        32, activation="relu", name="numu_event_embedding"
+    )(numu_inputs)
+    numu_shared_features = tf.keras.layers.Dropout(
+        0.30, name="numu_event_dropout"
+    )(numu_shared_features)
     pion_features = tf.keras.layers.Dense(
         16, activation="relu", name="pion_head_embedding"
     )(pion_shared_features)
     fv_features = tf.keras.layers.Dense(
         16, activation="relu", name="fv_head_embedding"
-    )(fv_numu_shared_features)
+    )(fv_shared_features)
     numu_features = tf.keras.layers.Dense(
         16, activation="relu", name="numu_head_embedding"
-    )(fv_numu_shared_features)
+    )(numu_shared_features)
     pion_output = tf.keras.layers.Dense(
         1, activation="sigmoid", name="pion_score"
     )(pion_features)
@@ -1322,11 +1375,13 @@ def evaluate_mrd_permutation_importance(
     trial_rows = []
     for repeat in range(repeats):
         permutation = rng.permutation(len(pion_labels))
+        shuffled_event_features = np.array(event_features_test, copy=True)
+        shuffled_event_features[:, 0] = event_features_test[permutation, 0]
         outputs = model.predict(
             {
                 "pmt_angular_image": images_test,
                 "pmt_unfolded_image": detector_images_test,
-                "event_features": event_features_test[permutation],
+                "event_features": shuffled_event_features,
                 "mrd_track_starts": mrd_track_starts_test[permutation],
                 "mrd_track_properties": mrd_track_properties_test[permutation],
                 "mrd_track_mask": mrd_track_mask_test[permutation],
@@ -1436,7 +1491,7 @@ def evaluate_mrd_permutation_importance(
             "method": (
                 "All MRD inputs, including numMRDTracks, track positions, track "
                 "properties, and masks, were permuted together across held-out "
-                "events while PMT images and truth labels stayed fixed."
+                "events while PMT images, NoVeto, and truth labels stayed fixed."
             ),
             "interpretation": (
                 "A positive performance_drop means performance worsened when the "
@@ -2022,7 +2077,10 @@ def _format_event_features(
 ) -> Tuple[str, str]:
     """Format the MRD multiplicity and retained exact start positions."""
     num_mrd_tracks = feature_values[0]
-    scalar_text = f"numMRDTracks={num_mrd_tracks:.0f}"
+    no_veto = feature_values[1]
+    scalar_text = (
+        f"numMRDTracks={num_mrd_tracks:.0f}, NoVeto={no_veto:.0f}"
+    )
     valid_positions = track_starts[track_mask.astype(bool)]
     valid_properties = track_properties[track_mask.astype(bool)]
     if len(valid_positions) == 0:
@@ -3231,7 +3289,7 @@ def main() -> None:
     )
     metadata = {
         "model_type": "annie_pion_ring_cnn",
-        "model_variant": "C_head_specific_image_routing_pion_fv_numu",
+        "model_variant": "C_head_specific_image_and_scalar_routing_pion_fv_numu",
         "tensorflow_version": tf.__version__,
         "training_sources": training_sources,
         "training_source_groups": response_info["groups"],
@@ -3269,7 +3327,12 @@ def main() -> None:
         "head_image_channels": {
             "pion_score": [args.hitpe_branch, tank_branch],
             "fv_score": [tank_branch],
-            "numu_score": [tank_branch],
+            "numu_score": [args.hitpe_branch, tank_branch],
+        },
+        "head_scalar_features": {
+            "pion_score": ["numMRDTracks"],
+            "fv_score": ["numMRDTracks"],
+            "numu_score": ["numMRDTracks", "NoVeto"],
         },
         "channels": [
             (

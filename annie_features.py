@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import awkward as ak
 import numpy as np
@@ -23,6 +23,7 @@ TRUTH_BRANCHES = ["truePiPlusCher", "truePiMinusCher", "truePi0"]
 
 RING_EVENT_SCALAR_BRANCHES = [
     "numMRDTracks",
+    "NoVeto",
 ]
 
 MRD_TRACK_START_BRANCHES = [
@@ -140,6 +141,7 @@ def build_pion_labels(arrays, charged_only: bool) -> np.ndarray:
 
 def build_ring_event_features(
     arrays,
+    scalar_branches: Sequence[str] = RING_EVENT_SCALAR_BRANCHES,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -154,6 +156,8 @@ def build_ring_event_features(
     per-track vectors or event scalars; event scalars are repeated across the
     retained valid track slots so they can condition every track embedding.
     """
+    if "numMRDTracks" not in scalar_branches:
+        raise ValueError("Ring event features must include numMRDTracks")
     num_mrd_tracks = _to_numpy(arrays["numMRDTracks"])
     track_counts = []
     padded_track_values = {}
@@ -203,7 +207,20 @@ def build_ring_event_features(
     valid &= np.isclose(num_mrd_tracks, np.rint(num_mrd_tracks))
     for counts in track_counts:
         valid &= counts == np.rint(num_mrd_tracks)
-    event_features = num_mrd_tracks[:, None].astype(np.float32, copy=False)
+    scalar_values = []
+    for branch in scalar_branches:
+        values = _to_numpy(arrays[branch])
+        if values.ndim != 1:
+            raise ValueError(
+                f"Ring scalar branch {branch!r} must contain one value per event"
+            )
+        valid &= np.isfinite(values)
+        if branch in {"numMRDTracks", "NoVeto"}:
+            valid &= np.isclose(values, np.rint(values))
+        scalar_values.append(values)
+    event_features = np.column_stack(scalar_values).astype(
+        np.float32, copy=False
+    )
     track_starts = np.stack(
         [padded_track_values[branch] for branch in MRD_TRACK_START_BRANCHES],
         axis=-1,

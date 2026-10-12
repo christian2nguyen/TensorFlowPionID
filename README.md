@@ -301,6 +301,7 @@ requested when applying a saved model to detector data.
 | Image direction | `simpleRecoVtxX`, `simpleRecoVtxY`, `simpleRecoVtxZ` | Event scalars |
 | Default physics selection | `sel_nu_mu_cc` | Boolean or 0/1 event scalar |
 | MRD multiplicity | `numMRDTracks` | Event scalar |
+| Veto activity input | `NoVeto` | Integer event scalar; routed only to `numu_score` |
 | MRD track starts | `MRDTrackStartX`, `MRDTrackStartY`, `MRDTrackStartZ` | Per-event vectors; all three lengths must agree with `numMRDTracks` |
 | MRD track properties | `MRDEnergyLoss`, `MRDTrackLength`, `MRDTrackAngle` | Per-track vectors or event scalars |
 | Pion supervision | `truePiPlusCher`, `truePiMinusCher`, `truePi0` | Training-only event scalars |
@@ -417,8 +418,8 @@ Training now automatically runs an MRD permutation-ablation test on the held-out
 test events. For each repeat, it keeps the PMT images and truth labels fixed but
 shuffles all MRD inputs together between events: `numMRDTracks`, track-start
 positions, energy loss, track length, track angle, and the track mask. It then
-recalculates pion and FV ROC-AUC, average precision, Brier score, efficiency,
-and purity.
+recalculates pion, FV, and numu ROC-AUC, average precision, Brier score,
+efficiency, and purity. `NoVeto` remains fixed during this MRD-only test.
 
 The terminal prints the decreases in pion ROC-AUC, average precision, and
 efficiency × purity. A clearly positive decrease means the trained network is
@@ -484,7 +485,8 @@ python export_annie_ring_saved_model.py \
 ```
 
 The scalar feature order is saved in the JSON metadata and currently contains
-`numMRDTracks`. The exact MRD start positions are a separate
+`numMRDTracks`, followed by `NoVeto`. Fixed selectors route `numMRDTracks` to
+all heads and `NoVeto` only to `numu_score`. The exact MRD start positions are a separate
 `mrd_track_starts` tensor with shape `(batch, 4, 3)` in X/Y/Z order. A
 `mrd_track_properties` tensor with shape `(batch, 4, 3)` contains
 `MRDEnergyLoss`, `MRDTrackLength`, and `MRDTrackAngle` for those same tracks. A
@@ -549,10 +551,12 @@ event samples in the two lists.
 This command is **Model C**, a hybrid three-head classifier with head-specific
 image routing. `pion_score` uses both the full-event `hitPE` channel and the
 `hitPE_tankcluster` (or `hitPE_tankclusters`) channel in the angular and
-unfolded image views. `fv_score` and `numu_score` use dedicated image towers
-that receive only the tank-cluster channel; the full-event channel has no path
-into either auxiliary prediction. A scalar input contains `numMRDTracks`, while
-a second input preserves up to four exact start positions
+unfolded image views. `numu_score` also uses both image channels, while
+`fv_score` uses dedicated image towers that receive only the tank-cluster
+channel. The full-event channel therefore has no path into the FV prediction.
+The scalar tensor contains `numMRDTracks` and integer `NoVeto`; `NoVeto` is
+routed only to `numu_score` and is not used as an event-selection cut. A second
+input preserves up to four exact start positions
 from `MRDTrackStartX`, `MRDTrackStartY`, and `MRDTrackStartZ`. A third input
 provides the aligned per-track `MRDEnergyLoss`, `MRDTrackLength`, and
 `MRDTrackAngle` values. Starts and properties are normalized separately, then
@@ -568,11 +572,12 @@ through `numMRDTracks`, and the truncated-event count is saved in the model JSON
 metadata. `clusterChargeBalance_tankcluster_pmt_filtered` is neither a model
 input nor an event-selection cut.
 
-The MRD representation is available to all three heads. The pion head has its
-own full-event-plus-tank-cluster image representation, while the FV and numu
-heads share a separate tank-cluster-only image representation before their
-independent dense layers. `pion_score` is supervised by the pion truth label,
-while `fv_score` is supervised by `trueFV` and `numu_score` by
+The MRD representation is available to all three heads. The pion and numu heads
+receive the full-event-plus-tank-cluster image representation, while FV receives
+the separate tank-cluster-only image representation. The numu head additionally
+receives `NoVeto`. Each prediction then has an independent dense pathway.
+`pion_score` is supervised by the pion truth label, while `fv_score` is
+supervised by `trueFV` and `numu_score` by
 `mc_neutrino_is_numu`. The FV and numu truth branches are never supplied as
 model inputs. No
 correlation loss, score multiplication, or conditional gating is applied. The

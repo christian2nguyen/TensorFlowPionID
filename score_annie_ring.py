@@ -240,6 +240,7 @@ def main() -> None:
                 event_feature_names or has_mrd_track_set
             ),
             tankcluster_only=tankcluster_only,
+            ring_event_feature_names=event_feature_names,
         ):
             n_mrd_tracks_truncated += int(chunk["n_mrd_tracks_truncated"])
             images = chunk["images"]
