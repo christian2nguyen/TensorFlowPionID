@@ -330,7 +330,7 @@ python train_annie_ring.py simulation_*.root \
   --numu-threshold 0.50 \
   --numu-loss-weight 0.30 \
   --epochs 100 \
-  --batch-size 128 \
+  --batch-size 64 \
   --output artifacts/annie_ring_pion.keras
 
 python score_annie_ring.py artifacts/annie_ring_pion.keras sample.root \
@@ -344,12 +344,27 @@ python score_annie_ring.py artifacts/annie_ring_pion.keras sample.root \
 epochs without improvement in validation pion PR AUC. The learning rate is
 halved after five stagnant epochs. `--seed` controls the reproducible 70/15/15
 split and defaults to `20260620`. `--chunk-size` controls bounded ROOT reading,
-but the selected tensors are concatenated in memory before model fitting, so it
-does not cap total training memory.
+and now defaults to `50 MB`. The selected PMT images remain resident in memory,
+but they are stored as `float16`; TensorFlow still performs the network
+calculation in float32. Training, validation, and testing use indexed batches
+instead of making complete 70%, 15%, and 15% image copies. Image-normalization
+moments are also calculated in bounded batches.
+
+If a CPU-only worker remains short on memory, first try:
+
+```bash
+--batch-size 32 --chunk-size "25 MB"
+```
+
+Reducing `--batch-size` lowers TensorFlow activation memory, while reducing
+`--chunk-size` lowers the temporary ROOT-reading peak. Neither option changes
+the selected events. A CUDA `cuInit` error followed by CPU training is normally
+informational on a node without a usable GPU; a final bare `Killed` message is
+the sign that the operating system terminated the process for memory use.
 
 ### Independent pion, fiducial-volume, and numu predictions
 
-The three output heads share the image and MRD feature extractor but have
+The three output heads use enforced head-specific image/scalar routing and have
 separate dense layers, binary-cross-entropy losses, truth labels, metrics, and
 decision thresholds:
 

@@ -9,7 +9,7 @@ import csv
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
@@ -174,12 +174,16 @@ def parse_args() -> argparse.Namespace:
             "--no-bdt-cuts is retained as a compatibility alias"
         ),
     )
-    parser.add_argument("--chunk-size", default="100 MB")
+    parser.add_argument(
+        "--chunk-size",
+        default="50 MB",
+        help="Uproot read chunk size (default: 50 MB)",
+    )
     parser.add_argument(
         "--output", type=Path, default=Path("artifacts/annie_ring_pion.keras")
     )
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument(
         "--mrd-ablation-repeats",
         type=int,
@@ -364,8 +368,12 @@ def load_data(
             include_numu_truth=True,
             ring_event_feature_names=RING_EVENT_FEATURE_NAMES,
         ):
-            image_chunks.append(chunk["images"])
-            detector_chunks.append(chunk["detector_images"])
+            image_chunks.append(
+                chunk["images"].astype(np.float16, copy=False)
+            )
+            detector_chunks.append(
+                chunk["detector_images"].astype(np.float16, copy=False)
+            )
             event_feature_chunks.append(chunk["event_features"])
             mrd_track_start_chunks.append(chunk["mrd_track_starts"])
             mrd_track_property_chunks.append(chunk["mrd_track_properties"])
@@ -401,9 +409,13 @@ def load_data(
     print()
     if not image_chunks or n_selected == 0:
         raise ValueError("No events passed ring-image construction and selection")
+    images = np.concatenate(image_chunks)
+    image_chunks.clear()
+    detector_images = np.concatenate(detector_chunks)
+    detector_chunks.clear()
     return (
-        np.concatenate(image_chunks),
-        np.concatenate(detector_chunks),
+        images,
+        detector_images,
         np.concatenate(event_feature_chunks),
         np.concatenate(mrd_track_start_chunks),
         np.concatenate(mrd_track_property_chunks),
@@ -655,11 +667,116 @@ def _image_tower(inputs, normalizer, prefix: str):
     return tf.keras.layers.GlobalAveragePooling2D(name=f"{prefix}_features")(x)
 
 
+def _channel_moments(
+    values: np.ndarray,
+    indices: np.ndarray,
+    batch_size: int = 512,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Calculate per-channel moments without copying an entire split."""
+    channel_count = values.shape[-1]
+    sums = np.zeros(channel_count, dtype=np.float64)
+    squared_sums = np.zeros(channel_count, dtype=np.float64)
+    value_count = 0
+    for start in range(0, len(indices), batch_size):
+        batch = values[indices[start : start + batch_size]]
+        flattened = batch.reshape(-1, channel_count)
+        sums += np.sum(flattened, axis=0, dtype=np.float64)
+        squared_sums += np.sum(
+            np.square(flattened, dtype=np.float32),
+            axis=0,
+            dtype=np.float64,
+        )
+        value_count += len(flattened)
+    if value_count == 0:
+        raise ValueError("Cannot normalize an empty training image split")
+    means = sums / value_count
+    variances = np.maximum(squared_sums / value_count - means * means, 1e-7)
+    return means.astype(np.float32), variances.astype(np.float32)
+
+
+class RingBatchSequence(tf.keras.utils.Sequence):
+    """Index the shared arrays one batch at a time to bound training RAM."""
+
+    def __init__(
+        self,
+        images: np.ndarray,
+        detector_images: np.ndarray,
+        event_features: np.ndarray,
+        mrd_track_starts: np.ndarray,
+        mrd_track_properties: np.ndarray,
+        mrd_track_mask: np.ndarray,
+        pion_labels: np.ndarray,
+        fv_labels: np.ndarray,
+        numu_labels: np.ndarray,
+        indices: np.ndarray,
+        batch_size: int,
+        shuffle: bool,
+        seed: int,
+        class_weights: Optional[Dict[str, Dict[int, float]]] = None,
+    ):
+        super().__init__()
+        self.images = images
+        self.detector_images = detector_images
+        self.event_features = event_features
+        self.mrd_track_starts = mrd_track_starts
+        self.mrd_track_properties = mrd_track_properties
+        self.mrd_track_mask = mrd_track_mask
+        self.pion_labels = pion_labels
+        self.fv_labels = fv_labels
+        self.numu_labels = numu_labels
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.class_weights = class_weights
+        self.order = np.arange(len(self.indices), dtype=np.int64)
+        self.rng = np.random.default_rng(seed)
+        if self.shuffle:
+            self.rng.shuffle(self.order)
+
+    def __len__(self) -> int:
+        return int(np.ceil(len(self.indices) / self.batch_size))
+
+    def __getitem__(self, batch_index: int):
+        offset = batch_index * self.batch_size
+        order = self.order[offset : offset + self.batch_size]
+        event_indices = self.indices[order]
+        inputs = {
+            "pmt_angular_image": self.images[event_indices],
+            "pmt_unfolded_image": self.detector_images[event_indices],
+            "event_features": self.event_features[event_indices],
+            "mrd_track_starts": self.mrd_track_starts[event_indices],
+            "mrd_track_properties": self.mrd_track_properties[event_indices],
+            "mrd_track_mask": self.mrd_track_mask[event_indices],
+        }
+        targets = {
+            "pion_score": self.pion_labels[event_indices],
+            "fv_score": self.fv_labels[event_indices],
+            "numu_score": self.numu_labels[event_indices],
+        }
+        if self.class_weights is None:
+            return inputs, targets
+        sample_weights = {
+            output_name: np.where(
+                targets[output_name] == 0,
+                weights[0],
+                weights[1],
+            ).astype(np.float32)
+            for output_name, weights in self.class_weights.items()
+        }
+        return inputs, targets, sample_weights
+
+    def on_epoch_end(self) -> None:
+        if self.shuffle:
+            self.rng.shuffle(self.order)
+
+
 def build_model(
     angular_shape: Tuple[int, ...],
     detector_shape: Tuple[int, ...],
-    angular_train: np.ndarray,
-    detector_train: np.ndarray,
+    angular_mean: np.ndarray,
+    angular_variance: np.ndarray,
+    detector_mean: np.ndarray,
+    detector_variance: np.ndarray,
     event_features_train: np.ndarray,
     mrd_track_starts_train: np.ndarray,
     mrd_track_properties_train: np.ndarray,
@@ -680,16 +797,28 @@ def build_model(
     if event_features_train.shape[1] != 2:
         raise ValueError("Model C requires numMRDTracks and NoVeto inputs")
     angular_normalizer = tf.keras.layers.Normalization(
-        axis=-1, name="angular_channel_normalization"
+        axis=-1,
+        mean=angular_mean,
+        variance=angular_variance,
+        name="angular_channel_normalization",
     )
     detector_normalizer = tf.keras.layers.Normalization(
-        axis=-1, name="detector_channel_normalization"
+        axis=-1,
+        mean=detector_mean,
+        variance=detector_variance,
+        name="detector_channel_normalization",
     )
     angular_tank_normalizer = tf.keras.layers.Normalization(
-        axis=-1, name="angular_tankcluster_normalization"
+        axis=-1,
+        mean=angular_mean[1:2],
+        variance=angular_variance[1:2],
+        name="angular_tankcluster_normalization",
     )
     detector_tank_normalizer = tf.keras.layers.Normalization(
-        axis=-1, name="detector_tankcluster_normalization"
+        axis=-1,
+        mean=detector_mean[1:2],
+        variance=detector_variance[1:2],
+        name="detector_tankcluster_normalization",
     )
     mrd_count_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="num_mrd_tracks_normalization"
@@ -703,10 +832,6 @@ def build_model(
     mrd_property_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="mrd_track_property_normalization"
     )
-    angular_normalizer.adapt(angular_train)
-    detector_normalizer.adapt(detector_train)
-    angular_tank_normalizer.adapt(angular_train[..., 1:2])
-    detector_tank_normalizer.adapt(detector_train[..., 1:2])
     mrd_count_normalizer.adapt(event_features_train[:, 0:1])
     no_veto_normalizer.adapt(event_features_train[:, 1:2])
     valid_track_starts = mrd_track_starts_train[
@@ -3122,13 +3247,10 @@ def main() -> None:
             f"events. Encoded joint counts: {joint_count_summary}"
         ) from error
     y_train = labels[train_indices]
-    y_val = labels[val_indices]
     y_test = labels[test_indices]
     fv_train = fv_labels[train_indices]
-    fv_val = fv_labels[val_indices]
     fv_test = fv_labels[test_indices]
     numu_train = numu_labels[train_indices]
-    numu_val = numu_labels[val_indices]
     numu_test = numu_labels[test_indices]
     train_counts = np.bincount(y_train.astype(np.int64), minlength=2)
     pion_class_weight = {
@@ -3145,28 +3267,25 @@ def main() -> None:
         0: len(numu_train) / (2.0 * numu_train_counts[0]),
         1: len(numu_train) / (2.0 * numu_train_counts[1]),
     }
-    training_sample_weights = {
-        "pion_score": np.array(
-            [pion_class_weight[int(label)] for label in y_train],
-            dtype=np.float32,
-        ),
-        "fv_score": np.array(
-            [fv_class_weight[int(label)] for label in fv_train],
-            dtype=np.float32,
-        ),
-        "numu_score": np.array(
-            [numu_class_weight[int(label)] for label in numu_train],
-            dtype=np.float32,
-        ),
+    training_class_weights = {
+        "pion_score": pion_class_weight,
+        "fv_score": fv_class_weight,
+        "numu_score": numu_class_weight,
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     history_path = args.output.with_suffix(".history.csv")
+    angular_mean, angular_variance = _channel_moments(images, train_indices)
+    detector_mean, detector_variance = _channel_moments(
+        detector_images, train_indices
+    )
     model = build_model(
         tuple(images.shape[1:]),
         tuple(detector_images.shape[1:]),
-        images[train_indices],
-        detector_images[train_indices],
+        angular_mean,
+        angular_variance,
+        detector_mean,
+        detector_variance,
         event_features[train_indices],
         mrd_track_starts[train_indices],
         mrd_track_properties[train_indices],
@@ -3174,38 +3293,48 @@ def main() -> None:
         args.fv_loss_weight,
         args.numu_loss_weight,
     )
+    sequence_arguments = (
+        images,
+        detector_images,
+        event_features,
+        mrd_track_starts,
+        mrd_track_properties,
+        mrd_track_mask,
+        labels,
+        fv_labels,
+        numu_labels,
+    )
+    train_sequence = RingBatchSequence(
+        *sequence_arguments,
+        train_indices,
+        args.batch_size,
+        True,
+        args.seed,
+        training_class_weights,
+    )
+    validation_sequence = RingBatchSequence(
+        *sequence_arguments,
+        val_indices,
+        args.batch_size,
+        False,
+        args.seed,
+    )
+    test_sequence = RingBatchSequence(
+        *sequence_arguments,
+        test_indices,
+        args.batch_size,
+        False,
+        args.seed,
+    )
+    image_storage_gib = (images.nbytes + detector_images.nbytes) / (1024**3)
+    print(
+        f"Stored PMT images as {images.dtype} using "
+        f"{image_storage_gib:.2f} GiB; training batches are loaded on demand."
+    )
     model.fit(
-        {
-            "pmt_angular_image": images[train_indices],
-            "pmt_unfolded_image": detector_images[train_indices],
-            "event_features": event_features[train_indices],
-            "mrd_track_starts": mrd_track_starts[train_indices],
-            "mrd_track_properties": mrd_track_properties[train_indices],
-            "mrd_track_mask": mrd_track_mask[train_indices],
-        },
-        {
-            "pion_score": y_train,
-            "fv_score": fv_train,
-            "numu_score": numu_train,
-        },
-        sample_weight=training_sample_weights,
-        validation_data=(
-            {
-                "pmt_angular_image": images[val_indices],
-                "pmt_unfolded_image": detector_images[val_indices],
-                "event_features": event_features[val_indices],
-                "mrd_track_starts": mrd_track_starts[val_indices],
-                "mrd_track_properties": mrd_track_properties[val_indices],
-                "mrd_track_mask": mrd_track_mask[val_indices],
-            },
-            {
-                "pion_score": y_val,
-                "fv_score": fv_val,
-                "numu_score": numu_val,
-            },
-        ),
+        train_sequence,
+        validation_data=validation_sequence,
         epochs=args.epochs,
-        batch_size=args.batch_size,
         callbacks=[
             tf.keras.callbacks.EarlyStopping(
                 monitor="val_pion_score_pr_auc",
@@ -3226,19 +3355,7 @@ def main() -> None:
         verbose=2,
     )
     metrics = model.evaluate(
-        {
-            "pmt_angular_image": images[test_indices],
-            "pmt_unfolded_image": detector_images[test_indices],
-            "event_features": event_features[test_indices],
-            "mrd_track_starts": mrd_track_starts[test_indices],
-            "mrd_track_properties": mrd_track_properties[test_indices],
-            "mrd_track_mask": mrd_track_mask[test_indices],
-        },
-        {
-            "pion_score": y_test,
-            "fv_score": fv_test,
-            "numu_score": numu_test,
-        },
+        test_sequence,
         return_dict=True,
         verbose=0,
     )
@@ -3322,6 +3439,10 @@ def main() -> None:
         "image_width": args.image_width,
         "detector_height": args.detector_height,
         "detector_width": args.detector_width,
+        "image_storage_dtype": str(images.dtype),
+        "training_data_feeding": "indexed_batches_without_split_copies",
+        "batch_size": args.batch_size,
+        "root_chunk_size": args.chunk_size,
         "image_channel_source": "head_specific_full_and_tankcluster",
         "image_channel_count": 2,
         "head_image_channels": {
@@ -3375,10 +3496,11 @@ def main() -> None:
         "mrd_track_overflow_policy": "first_four_in_stored_branch_order",
         "mrd_track_overflow_events": n_mrd_tracks_truncated,
         "event_feature_preprocessing": (
-            "numMRDTracks_scalar_plus_zero_padded_mrd_xyz_and_energy_loss_length_"
-            "angle_track_set_and_mask;_separate_normalization_adapted_on_valid_"
-            "training_tracks_only;_shared_dense_encoder_plus_masked_"
-            "permutation_invariant_max_pooling"
+            "numMRDTracks_and_NoVeto_scalars_plus_zero_padded_mrd_xyz_and_"
+            "energy_loss_length_angle_track_set_and_mask;_separate_"
+            "normalization_adapted_on_training_values_and_valid_tracks_only;_"
+            "fixed_head_specific_scalar_routing_plus_masked_permutation_"
+            "invariant_max_pooling"
         ),
         "label": "charged_pion_present" if args.charged_only else "any_pion_present",
         "output_heads": ["pion_score", "fv_score", "numu_score"],
