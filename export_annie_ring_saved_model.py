@@ -23,7 +23,7 @@ def _serving_outputs(predictions):
     if isinstance(predictions, dict):
         return {
             name: predictions[name]
-            for name in ("pion_score", "fv_score")
+            for name in ("pion_score", "fv_score", "numu_score")
             if name in predictions
         }
     return {"pion_score": predictions}

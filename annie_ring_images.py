@@ -1,4 +1,4 @@
-"""Build two-channel angular PMT images from ANNIE ROOT events."""
+"""Build angular and unfolded PMT images from ANNIE ROOT events."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ DEFAULT_DETECTOR_WIDTH = 32
 BEAM_SPLIT_Z = 1.681
 VERTEX_BRANCHES = ["simpleRecoVtxX", "simpleRecoVtxY", "simpleRecoVtxZ"]
 TRUE_FV_BRANCH = "trueFV"
+TRUE_NUMU_BRANCH = "mc_neutrino_is_numu"
 
 # Synchronized with PMTPositionInfo::ShutoffRecords and UsePMTForTankBDT in
 # stv-analysis-Joint. PMT 358 is intentionally retained by the BDT workflow.
@@ -190,6 +191,7 @@ def _accumulate_channel(
     maximum_pe: Optional[float],
     response: Optional[PMTResponse] = None,
     entry_numbers: Optional[np.ndarray] = None,
+    response_branch_kind: Optional[int] = None,
 ) -> np.ndarray:
     pe_counts = _numpy(ak.num(pe_vectors, axis=1), np.int64)
     id_counts = _numpy(ak.num(id_vectors, axis=1), np.int64)
@@ -210,7 +212,9 @@ def _accumulate_channel(
         response.apply(
             raw_pe,
             flat_ids,
-            branch_kind=channel,
+            branch_kind=(
+                channel if response_branch_kind is None else response_branch_kind
+            ),
             entries=flat_entries,
             hit_indices=hit_indices,
         )
@@ -270,23 +274,30 @@ def build_ring_images(
     width: int,
     response: Optional[PMTResponse] = None,
     entry_numbers: Optional[np.ndarray] = None,
+    tankcluster_only: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     vertices = np.column_stack([_numpy(arrays[name]) for name in VERTEX_BRANCHES])
-    images = np.zeros((len(arrays), height, width, 2), dtype=np.float32)
-    full_aligned = _accumulate_channel(
-        images,
-        0,
-        arrays[hitpe_branch],
-        arrays[hitid_branch],
-        vertices,
-        geometry,
-        None,
-        response,
-        entry_numbers,
-    )
+    channel_count = 1 if tankcluster_only else 2
+    images = np.zeros((len(arrays), height, width, channel_count), dtype=np.float32)
+    if tankcluster_only:
+        full_aligned = np.ones(len(arrays), dtype=bool)
+        tank_output_channel = 0
+    else:
+        full_aligned = _accumulate_channel(
+            images,
+            0,
+            arrays[hitpe_branch],
+            arrays[hitid_branch],
+            vertices,
+            geometry,
+            None,
+            response,
+            entry_numbers,
+        )
+        tank_output_channel = 1
     tank_aligned = _accumulate_channel(
         images,
-        1,
+        tank_output_channel,
         arrays[tankcluster_branch],
         arrays[tankcluster_id_branch],
         vertices,
@@ -294,6 +305,7 @@ def build_ring_images(
         350.0,
         response,
         entry_numbers,
+        response_branch_kind=1,
     )
     valid = full_aligned & tank_aligned & np.isfinite(vertices).all(axis=1)
     images = np.log1p(images)
@@ -314,6 +326,7 @@ def _accumulate_unfolded_channel(
     maximum_pe: Optional[float],
     response: Optional[PMTResponse] = None,
     entry_numbers: Optional[np.ndarray] = None,
+    response_branch_kind: Optional[int] = None,
 ) -> np.ndarray:
     pe_counts = _numpy(ak.num(pe_vectors, axis=1), np.int64)
     id_counts = _numpy(ak.num(id_vectors, axis=1), np.int64)
@@ -332,7 +345,9 @@ def _accumulate_unfolded_channel(
         response.apply(
             raw_pe,
             flat_ids,
-            branch_kind=channel,
+            branch_kind=(
+                channel if response_branch_kind is None else response_branch_kind
+            ),
             entries=flat_entries,
             hit_indices=hit_indices,
         )
@@ -384,25 +399,32 @@ def build_unfolded_detector_images(
     width: int = DEFAULT_DETECTOR_WIDTH,
     response: Optional[PMTResponse] = None,
     entry_numbers: Optional[np.ndarray] = None,
+    tankcluster_only: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build annotation-free PE rasters matching the C++ unfolded detector layout."""
-    images = np.zeros((len(arrays), height, width, 2), dtype=np.float32)
+    channel_count = 1 if tankcluster_only else 2
+    images = np.zeros((len(arrays), height, width, channel_count), dtype=np.float32)
     y_bins, x_bins = geometry.unfolded_bins(height, width)
-    full_aligned = _accumulate_unfolded_channel(
-        images,
-        0,
-        arrays[hitpe_branch],
-        arrays[hitid_branch],
-        geometry,
-        y_bins,
-        x_bins,
-        None,
-        response,
-        entry_numbers,
-    )
+    if tankcluster_only:
+        full_aligned = np.ones(len(arrays), dtype=bool)
+        tank_output_channel = 0
+    else:
+        full_aligned = _accumulate_unfolded_channel(
+            images,
+            0,
+            arrays[hitpe_branch],
+            arrays[hitid_branch],
+            geometry,
+            y_bins,
+            x_bins,
+            None,
+            response,
+            entry_numbers,
+        )
+        tank_output_channel = 1
     tank_aligned = _accumulate_unfolded_channel(
         images,
-        1,
+        tank_output_channel,
         arrays[tankcluster_branch],
         arrays[tankcluster_id_branch],
         geometry,
@@ -411,6 +433,7 @@ def build_unfolded_detector_images(
         350.0,
         response,
         entry_numbers,
+        response_branch_kind=1,
     )
     return np.log1p(images), full_aligned & tank_aligned
 
@@ -434,6 +457,8 @@ def iterate_ring_images(
     chunk_size: str,
     include_ring_event_features: bool = False,
     include_fv_truth: bool = False,
+    include_numu_truth: bool = False,
+    tankcluster_only: bool = False,
 ) -> Iterator[Dict[str, object]]:
     if isinstance(event_selection, bool):
         selection_mode = "fit_individual_pmt" if event_selection else "none"
@@ -454,13 +479,9 @@ def iterate_ring_images(
             tree = root_file[tree_name]
             available = set(tree.keys())
             tank_branch = resolve_tankcluster_branch(tree, tankcluster_branch)
-            requested = [
-                hitpe_branch,
-                hitid_branch,
-                tank_branch,
-                tankcluster_id_branch,
-                *VERTEX_BRANCHES,
-            ]
+            requested = [tank_branch, tankcluster_id_branch, *VERTEX_BRANCHES]
+            if not tankcluster_only:
+                requested[0:0] = [hitpe_branch, hitid_branch]
             if selection_mode == "nu_mu_cc":
                 requested.extend(NU_MU_CC_CUT_BRANCHES)
             elif selection_mode == "fit_individual_pmt":
@@ -471,6 +492,8 @@ def iterate_ring_images(
                 requested.extend(TRUTH_BRANCHES)
             if include_fv_truth:
                 requested.append(TRUE_FV_BRANCH)
+            if include_numu_truth:
+                requested.append(TRUE_NUMU_BRANCH)
             if include_ring_event_features:
                 requested.extend(RING_EVENT_REQUIRED_BRANCHES)
             missing = [name for name in requested if name not in available]
@@ -497,6 +520,7 @@ def iterate_ring_images(
                     width,
                     response,
                     tune_entry_numbers,
+                    tankcluster_only=tankcluster_only,
                 )
                 detector_images, detector_aligned = build_unfolded_detector_images(
                     arrays,
@@ -509,6 +533,7 @@ def iterate_ring_images(
                     detector_width,
                     response,
                     tune_entry_numbers,
+                    tankcluster_only=tankcluster_only,
                 )
                 aligned &= detector_aligned
                 selected = aligned.copy()
@@ -566,6 +591,10 @@ def iterate_ring_images(
                 if include_fv_truth:
                     result["fv_labels"] = (
                         _numpy(arrays[TRUE_FV_BRANCH], np.float32) != 0
+                    ).astype(np.float32)[selected]
+                if include_numu_truth:
+                    result["numu_labels"] = (
+                        _numpy(arrays[TRUE_NUMU_BRANCH], np.float32) != 0
                     ).astype(np.float32)[selected]
                 yield result
                 entry_offset += n_entries

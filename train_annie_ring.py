@@ -218,6 +218,18 @@ def parse_args() -> argparse.Namespace:
         default=0.3,
         help="Relative weight of the independent FV loss (default: 0.3)",
     )
+    parser.add_argument(
+        "--numu-threshold",
+        type=float,
+        default=0.5,
+        help="Independent true-numu prediction threshold (default: 0.5)",
+    )
+    parser.add_argument(
+        "--numu-loss-weight",
+        type=float,
+        default=0.3,
+        help="Relative weight of the independent numu loss (default: 0.3)",
+    )
     parser.add_argument("--seed", type=int, default=20260620)
     args = parser.parse_args()
     if args.file_list is not None:
@@ -259,6 +271,7 @@ def parse_args() -> argparse.Namespace:
 def load_data(
     args: argparse.Namespace,
 ) -> Tuple[
+    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -316,6 +329,7 @@ def load_data(
     mrd_track_mask_chunks: List[np.ndarray] = []
     label_chunks: List[np.ndarray] = []
     fv_label_chunks: List[np.ndarray] = []
+    numu_label_chunks: List[np.ndarray] = []
     truth_pion_chunks: List[np.ndarray] = []
     source_path_chunks: List[np.ndarray] = []
     entry_chunks: List[np.ndarray] = []
@@ -347,6 +361,7 @@ def load_data(
             args.chunk_size,
             include_ring_event_features=True,
             include_fv_truth=True,
+            include_numu_truth=True,
         ):
             image_chunks.append(chunk["images"])
             detector_chunks.append(chunk["detector_images"])
@@ -356,6 +371,7 @@ def load_data(
             mrd_track_mask_chunks.append(chunk["mrd_track_mask"])
             label_chunks.append(chunk["labels"])
             fv_label_chunks.append(chunk["fv_labels"])
+            numu_label_chunks.append(chunk["numu_labels"])
             truth_pion_chunks.append(chunk["truth_pion_counts"])
             entries = chunk["entries"]
             entry_chunks.append(entries)
@@ -393,6 +409,7 @@ def load_data(
         np.concatenate(mrd_track_mask_chunks),
         np.concatenate(label_chunks),
         np.concatenate(fv_label_chunks),
+        np.concatenate(numu_label_chunks),
         np.concatenate(source_path_chunks),
         np.concatenate(entry_chunks),
         np.concatenate(truth_pion_chunks),
@@ -647,12 +664,24 @@ def build_model(
     mrd_track_properties_train: np.ndarray,
     mrd_track_mask_train: np.ndarray,
     fv_loss_weight: float,
+    numu_loss_weight: float,
 ) -> tf.keras.Model:
+    if angular_shape[-1] != 2 or detector_shape[-1] != 2:
+        raise ValueError(
+            "Head-specific image routing requires channel 0 = hitPE and "
+            "channel 1 = hitPE_tankcluster"
+        )
     angular_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="angular_channel_normalization"
     )
     detector_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="detector_channel_normalization"
+    )
+    angular_tank_normalizer = tf.keras.layers.Normalization(
+        axis=-1, name="angular_tankcluster_normalization"
+    )
+    detector_tank_normalizer = tf.keras.layers.Normalization(
+        axis=-1, name="detector_tankcluster_normalization"
     )
     event_feature_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="event_feature_normalization"
@@ -665,6 +694,8 @@ def build_model(
     )
     angular_normalizer.adapt(angular_train)
     detector_normalizer.adapt(detector_train)
+    angular_tank_normalizer.adapt(angular_train[..., 1:2])
+    detector_tank_normalizer.adapt(detector_train[..., 1:2])
     event_feature_normalizer.adapt(event_features_train)
     valid_track_starts = mrd_track_starts_train[
         mrd_track_mask_train.astype(bool)
@@ -690,8 +721,32 @@ def build_model(
     mrd_track_mask_inputs = tf.keras.Input(
         shape=(MAX_MRD_TRACKS,), name="mrd_track_mask"
     )
+    tank_selector_kernel = np.zeros((1, 1, 2, 1), dtype=np.float32)
+    tank_selector_kernel[0, 0, 1, 0] = 1.0
+    angular_tank_inputs = tf.keras.layers.Conv2D(
+        1,
+        1,
+        use_bias=False,
+        trainable=False,
+        kernel_initializer=tf.keras.initializers.Constant(tank_selector_kernel),
+        name="angular_tankcluster_channel",
+    )(angular_inputs)
+    detector_tank_inputs = tf.keras.layers.Conv2D(
+        1,
+        1,
+        use_bias=False,
+        trainable=False,
+        kernel_initializer=tf.keras.initializers.Constant(tank_selector_kernel),
+        name="detector_tankcluster_channel",
+    )(detector_inputs)
     angular_features = _image_tower(angular_inputs, angular_normalizer, "angular")
     detector_features = _image_tower(detector_inputs, detector_normalizer, "detector")
+    angular_tank_features = _image_tower(
+        angular_tank_inputs, angular_tank_normalizer, "angular_tankcluster"
+    )
+    detector_tank_features = _image_tower(
+        detector_tank_inputs, detector_tank_normalizer, "detector_tankcluster"
+    )
     event_features = event_feature_normalizer(event_feature_inputs)
     event_features = tf.keras.layers.Dense(
         8, activation="relu", name="event_feature_embedding"
@@ -715,7 +770,9 @@ def build_model(
     mrd_track_features = tf.keras.layers.GlobalMaxPooling1D(
         name="mrd_track_set_features"
     )(mrd_track_features)
-    x = tf.keras.layers.Concatenate(name="combined_views_and_event_features")(
+    pion_inputs = tf.keras.layers.Concatenate(
+        name="pion_full_and_tankcluster_inputs"
+    )(
         [
             angular_features,
             detector_features,
@@ -723,24 +780,46 @@ def build_model(
             mrd_track_features,
         ]
     )
-    shared_features = tf.keras.layers.Dense(
-        32, activation="relu", name="shared_event_embedding"
-    )(x)
-    shared_features = tf.keras.layers.Dropout(
-        0.30, name="shared_event_dropout"
-    )(shared_features)
+    fv_numu_inputs = tf.keras.layers.Concatenate(
+        name="fv_numu_tankcluster_inputs"
+    )(
+        [
+            angular_tank_features,
+            detector_tank_features,
+            event_features,
+            mrd_track_features,
+        ]
+    )
+    pion_shared_features = tf.keras.layers.Dense(
+        32, activation="relu", name="pion_event_embedding"
+    )(pion_inputs)
+    pion_shared_features = tf.keras.layers.Dropout(
+        0.30, name="pion_event_dropout"
+    )(pion_shared_features)
+    fv_numu_shared_features = tf.keras.layers.Dense(
+        32, activation="relu", name="fv_numu_event_embedding"
+    )(fv_numu_inputs)
+    fv_numu_shared_features = tf.keras.layers.Dropout(
+        0.30, name="fv_numu_event_dropout"
+    )(fv_numu_shared_features)
     pion_features = tf.keras.layers.Dense(
         16, activation="relu", name="pion_head_embedding"
-    )(shared_features)
+    )(pion_shared_features)
     fv_features = tf.keras.layers.Dense(
         16, activation="relu", name="fv_head_embedding"
-    )(shared_features)
+    )(fv_numu_shared_features)
+    numu_features = tf.keras.layers.Dense(
+        16, activation="relu", name="numu_head_embedding"
+    )(fv_numu_shared_features)
     pion_output = tf.keras.layers.Dense(
         1, activation="sigmoid", name="pion_score"
     )(pion_features)
     fv_output = tf.keras.layers.Dense(
         1, activation="sigmoid", name="fv_score"
     )(fv_features)
+    numu_output = tf.keras.layers.Dense(
+        1, activation="sigmoid", name="numu_score"
+    )(numu_features)
     model = tf.keras.Model(
         [
             angular_inputs,
@@ -750,15 +829,24 @@ def build_model(
             mrd_track_property_inputs,
             mrd_track_mask_inputs,
         ],
-        {"pion_score": pion_output, "fv_score": fv_output},
+        {
+            "pion_score": pion_output,
+            "fv_score": fv_output,
+            "numu_score": numu_output,
+        },
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
         loss={
             "pion_score": "binary_crossentropy",
             "fv_score": "binary_crossentropy",
+            "numu_score": "binary_crossentropy",
         },
-        loss_weights={"pion_score": 1.0, "fv_score": fv_loss_weight},
+        loss_weights={
+            "pion_score": 1.0,
+            "fv_score": fv_loss_weight,
+            "numu_score": numu_loss_weight,
+        },
         metrics={
             "pion_score": [
                 tf.keras.metrics.AUC(name="roc_auc"),
@@ -767,6 +855,12 @@ def build_model(
                 tf.keras.metrics.Recall(name="recall"),
             ],
             "fv_score": [
+                tf.keras.metrics.AUC(name="roc_auc"),
+                tf.keras.metrics.AUC(curve="PR", name="pr_auc"),
+                tf.keras.metrics.Precision(name="precision"),
+                tf.keras.metrics.Recall(name="recall"),
+            ],
+            "numu_score": [
                 tf.keras.metrics.AUC(name="roc_auc"),
                 tf.keras.metrics.AUC(curve="PR", name="pr_auc"),
                 tf.keras.metrics.Precision(name="precision"),
@@ -956,6 +1050,113 @@ def plot_fv_diagnostics(
     }
 
 
+def plot_numu_diagnostics(
+    numu_labels: np.ndarray,
+    numu_scores: np.ndarray,
+    output: Path,
+    threshold: float,
+) -> Dict[str, object]:
+    """Write independent muon-neutrino classifier diagnostics."""
+    fig, axis = plt.subplots(figsize=(7, 5))
+    bins = np.linspace(0.0, 1.0, 41)
+    axis.hist(
+        numu_scores[numu_labels == 0],
+        bins=bins,
+        alpha=0.6,
+        density=True,
+        label="Not numu (truth)",
+        color="C0",
+    )
+    axis.hist(
+        numu_scores[numu_labels == 1],
+        bins=bins,
+        alpha=0.6,
+        density=True,
+        label="Numu (truth)",
+        color="C1",
+    )
+    axis.axvline(
+        threshold,
+        color="black",
+        linestyle="--",
+        label=f"numu cut = {threshold:.2f}",
+    )
+    axis.set_xlim(0.0, 1.0)
+    axis.set_xlabel("Model numu_score")
+    axis.set_ylabel("Normalized event density")
+    axis.set_title("Test-set numu signal separation")
+    axis.legend()
+    fig.tight_layout()
+    separation_path = output.with_suffix(".numu_score_distribution.png")
+    fig.savefig(separation_path, dpi=160)
+    plt.close(fig)
+
+    fpr, tpr, _ = roc_curve(numu_labels, numu_scores)
+    roc_auc_value = float(auc(fpr, tpr))
+    fig, axis = plt.subplots(figsize=(6, 6))
+    axis.plot(fpr, tpr, label=f"numu ROC (AUC = {roc_auc_value:.4f})")
+    axis.plot([0, 1], [0, 1], color="gray", linestyle="--", label="Chance")
+    axis.set_xlabel("False positive rate (non-numu classified as numu)")
+    axis.set_ylabel("True positive rate (numu efficiency)")
+    axis.set_title("Independent numu prediction ROC curve")
+    axis.legend(loc="lower right")
+    fig.tight_layout()
+    roc_path = output.with_suffix(".numu_roc_curve.png")
+    fig.savefig(roc_path, dpi=160)
+    plt.close(fig)
+
+    precision, recall, _ = precision_recall_curve(numu_labels, numu_scores)
+    average_precision = float(average_precision_score(numu_labels, numu_scores))
+    fig, axis = plt.subplots(figsize=(6, 6))
+    axis.plot(
+        recall,
+        precision,
+        color="C2",
+        label=f"numu PR (AP = {average_precision:.4f})",
+    )
+    axis.set_xlabel("Recall (numu efficiency)")
+    axis.set_ylabel("Precision (numu purity)")
+    axis.set_title("Independent numu prediction precision-recall curve")
+    axis.legend(loc="lower left")
+    fig.tight_layout()
+    pr_path = output.with_suffix(".numu_precision_recall_curve.png")
+    fig.savefig(pr_path, dpi=160)
+    plt.close(fig)
+
+    return {
+        "numu_score_distribution": separation_path.name,
+        "numu_roc_curve": roc_path.name,
+        "numu_roc_auc": roc_auc_value,
+        "numu_precision_recall_curve": pr_path.name,
+        "numu_average_precision": average_precision,
+        "numu_brier_score": float(brier_score_loss(numu_labels, numu_scores)),
+        "numu_operating_point": pion_operating_point(
+            numu_labels, numu_scores, threshold
+        ),
+        "numu_confusion_matrix": plot_confusion_matrix(
+            numu_labels,
+            numu_scores,
+            threshold,
+            output,
+            filename_suffix=".numu_confusion_matrix.png",
+            negative_label="not numu",
+            positive_label="numu",
+            score_name="numu_score",
+        ),
+        "numu_confusion_matrix_normalized": plot_confusion_matrix(
+            numu_labels,
+            numu_scores,
+            threshold,
+            output,
+            normalize=True,
+            filename_suffix=".numu_confusion_matrix_normalized.png",
+            negative_label="not numu",
+            positive_label="numu",
+            score_name="numu_score",
+        ),
+    }
+
+
 def plot_efficiency_rejection_vs_threshold(
     fpr: np.ndarray, tpr: np.ndarray, thresholds: np.ndarray, output: Path
 ) -> str:
@@ -1043,12 +1244,17 @@ def _ablation_metrics(
     fv_labels: np.ndarray,
     fv_scores: np.ndarray,
     fv_threshold: float,
+    numu_labels: np.ndarray,
+    numu_scores: np.ndarray,
+    numu_threshold: float,
 ) -> Dict[str, float]:
-    """Summarize both output heads for an MRD permutation trial."""
+    """Summarize all output heads for an MRD permutation trial."""
     pion_fpr, pion_tpr, _ = roc_curve(pion_labels, pion_scores)
     fv_fpr, fv_tpr, _ = roc_curve(fv_labels, fv_scores)
+    numu_fpr, numu_tpr, _ = roc_curve(numu_labels, numu_scores)
     pion_point = pion_operating_point(pion_labels, pion_scores, pion_threshold)
     fv_point = pion_operating_point(fv_labels, fv_scores, fv_threshold)
+    numu_point = pion_operating_point(numu_labels, numu_scores, numu_threshold)
     return {
         "pion_roc_auc": float(auc(pion_fpr, pion_tpr)),
         "pion_average_precision": float(
@@ -1067,6 +1273,15 @@ def _ablation_metrics(
         "fv_brier_score": float(brier_score_loss(fv_labels, fv_scores)),
         "fv_efficiency": float(fv_point["efficiency"]),
         "fv_purity": float(fv_point["purity"]),
+        "numu_roc_auc": float(auc(numu_fpr, numu_tpr)),
+        "numu_average_precision": float(
+            average_precision_score(numu_labels, numu_scores)
+        ),
+        "numu_brier_score": float(
+            brier_score_loss(numu_labels, numu_scores)
+        ),
+        "numu_efficiency": float(numu_point["efficiency"]),
+        "numu_purity": float(numu_point["purity"]),
     }
 
 
@@ -1080,10 +1295,13 @@ def evaluate_mrd_permutation_importance(
     mrd_track_mask_test: np.ndarray,
     pion_labels: np.ndarray,
     fv_labels: np.ndarray,
+    numu_labels: np.ndarray,
     full_pion_scores: np.ndarray,
     full_fv_scores: np.ndarray,
+    full_numu_scores: np.ndarray,
     pion_threshold: float,
     fv_threshold: float,
+    numu_threshold: float,
     output: Path,
     seed: int,
     repeats: int,
@@ -1096,6 +1314,9 @@ def evaluate_mrd_permutation_importance(
         fv_labels,
         full_fv_scores,
         fv_threshold,
+        numu_labels,
+        full_numu_scores,
+        numu_threshold,
     )
     rng = np.random.default_rng(seed + 104729)
     trial_rows = []
@@ -1119,6 +1340,9 @@ def evaluate_mrd_permutation_importance(
             fv_labels,
             np.asarray(outputs["fv_score"]).reshape(-1),
             fv_threshold,
+            numu_labels,
+            np.asarray(outputs["numu_score"]).reshape(-1),
+            numu_threshold,
         )
         trial_rows.append(
             {"mode": "mrd_permuted", "repeat": repeat + 1, **trial_metrics}
@@ -1157,6 +1381,8 @@ def evaluate_mrd_permutation_importance(
         "pion_efficiency_x_purity",
         "fv_roc_auc",
         "fv_average_precision",
+        "numu_roc_auc",
+        "numu_average_precision",
     ]
     plotted_labels = [
         "Pion ROC AUC",
@@ -1164,6 +1390,8 @@ def evaluate_mrd_permutation_importance(
         "Pion efficiency × purity",
         "FV ROC AUC",
         "FV average precision",
+        "numu ROC AUC",
+        "numu average precision",
     ]
     positions = np.arange(len(plotted_metrics))
     width = 0.36
@@ -1760,6 +1988,8 @@ def plot_training_curves(history_path: Path, output: Path) -> str:
         ("pion_score_pr_auc", "val_pion_score_pr_auc"),
         ("fv_score_roc_auc", "val_fv_score_roc_auc"),
         ("fv_score_pr_auc", "val_fv_score_pr_auc"),
+        ("numu_score_roc_auc", "val_numu_score_roc_auc"),
+        ("numu_score_pr_auc", "val_numu_score_pr_auc"),
     ]
     pairs = [pair for pair in pairs if pair[0] in rows[0] and pair[1] in rows[0]]
     if not pairs:
@@ -2397,6 +2627,7 @@ def evaluate_and_plot(
     mrd_track_mask_test: np.ndarray,
     y_test: np.ndarray,
     fv_labels_test: np.ndarray,
+    numu_labels_test: np.ndarray,
     source_paths_test: np.ndarray,
     entries_test: np.ndarray,
     truth_pion_counts_test: np.ndarray,
@@ -2404,6 +2635,7 @@ def evaluate_and_plot(
     output: Path,
     threshold: float,
     fv_threshold: float,
+    numu_threshold: float,
     tree_name: str,
     opening_angle_degree_branch: str = "",
     seed: int = 0,
@@ -2423,6 +2655,7 @@ def evaluate_and_plot(
     )
     test_scores = np.asarray(prediction_outputs["pion_score"]).reshape(-1)
     fv_scores = np.asarray(prediction_outputs["fv_score"]).reshape(-1)
+    numu_scores = np.asarray(prediction_outputs["numu_score"]).reshape(-1)
     mrd_ablation = evaluate_mrd_permutation_importance(
         model,
         images_test,
@@ -2433,10 +2666,13 @@ def evaluate_and_plot(
         mrd_track_mask_test,
         y_test,
         fv_labels_test,
+        numu_labels_test,
         test_scores,
         fv_scores,
+        numu_scores,
         threshold,
         fv_threshold,
+        numu_threshold,
         output,
         seed,
         mrd_ablation_repeats,
@@ -2502,6 +2738,7 @@ def evaluate_and_plot(
                 "tree_entry",
                 "true_label",
                 "trueFV",
+                "mc_neutrino_is_numu",
                 "truePiPlusCher",
                 "truePiMinusCher",
                 "truePi0",
@@ -2516,6 +2753,9 @@ def evaluate_and_plot(
                 "fv_score",
                 "fv_threshold",
                 "fv_prediction",
+                "numu_score",
+                "numu_threshold",
+                "numu_prediction",
             ]
         )
         for event_index in range(len(y_test)):
@@ -2538,6 +2778,7 @@ def evaluate_and_plot(
                     int(entries_test[event_index]),
                     int(y_test[event_index]),
                     int(fv_labels_test[event_index]),
+                    int(numu_labels_test[event_index]),
                     *truth_pion_counts_test[event_index].astype(int),
                     float(truth_muon_pion_angles[event_index]),
                     float(truth_muon_kinetic_energy[event_index]),
@@ -2550,6 +2791,9 @@ def evaluate_and_plot(
                     float(fv_scores[event_index]),
                     float(fv_threshold),
                     int(fv_scores[event_index] >= fv_threshold),
+                    float(numu_scores[event_index]),
+                    float(numu_threshold),
+                    int(numu_scores[event_index] >= numu_threshold),
                 ]
             )
 
@@ -2705,6 +2949,12 @@ def evaluate_and_plot(
             output,
             fv_threshold,
         ),
+        **plot_numu_diagnostics(
+            numu_labels_test,
+            numu_scores,
+            output,
+            numu_threshold,
+        ),
         **mrd_ablation,
         **mrd_branch_importance,
     }
@@ -2716,8 +2966,12 @@ def main() -> None:
         raise ValueError("--threshold must be between 0 and 1")
     if not 0.0 <= args.fv_threshold <= 1.0:
         raise ValueError("--fv-threshold must be between 0 and 1")
+    if not 0.0 <= args.numu_threshold <= 1.0:
+        raise ValueError("--numu-threshold must be between 0 and 1")
     if args.fv_loss_weight <= 0.0:
         raise ValueError("--fv-loss-weight must be positive")
+    if args.numu_loss_weight <= 0.0:
+        raise ValueError("--numu-loss-weight must be positive")
     if args.mrd_ablation_repeats < 1:
         raise ValueError("--mrd-ablation-repeats must be at least 1")
     if args.mrd_branch_importance_repeats < 1:
@@ -2739,6 +2993,7 @@ def main() -> None:
         mrd_track_mask,
         labels,
         fv_labels,
+        numu_labels,
         source_paths,
         entries,
         truth_pion_counts,
@@ -2772,28 +3027,51 @@ def main() -> None:
         raise ValueError(
             f"Both trueFV classes are required; class counts are {fv_counts.tolist()}"
         )
+    numu_counts = np.bincount(numu_labels.astype(np.int64), minlength=2)
+    if np.any(numu_counts == 0):
+        raise ValueError(
+            "Both mc_neutrino_is_numu classes are required; class counts are "
+            f"{numu_counts.tolist()}"
+        )
     indices = np.arange(len(labels))
     joint_strata = (
-        2 * labels.astype(np.int64) + fv_labels.astype(np.int64)
+        4 * labels.astype(np.int64)
+        + 2 * fv_labels.astype(np.int64)
+        + numu_labels.astype(np.int64)
     )
-    train_indices, temp_indices = train_test_split(
-        indices,
-        test_size=VALIDATION_FRACTION + TEST_FRACTION,
-        random_state=args.seed,
-        stratify=joint_strata,
-    )
-    val_indices, test_indices = train_test_split(
-        temp_indices,
-        test_size=TEST_FRACTION / (VALIDATION_FRACTION + TEST_FRACTION),
-        random_state=args.seed,
-        stratify=joint_strata[temp_indices],
-    )
+    joint_values, joint_counts = np.unique(joint_strata, return_counts=True)
+    joint_count_summary = {
+        str(int(value)): int(count)
+        for value, count in zip(joint_values, joint_counts)
+    }
+    try:
+        train_indices, temp_indices = train_test_split(
+            indices,
+            test_size=VALIDATION_FRACTION + TEST_FRACTION,
+            random_state=args.seed,
+            stratify=joint_strata,
+        )
+        val_indices, test_indices = train_test_split(
+            temp_indices,
+            test_size=TEST_FRACTION / (VALIDATION_FRACTION + TEST_FRACTION),
+            random_state=args.seed,
+            stratify=joint_strata[temp_indices],
+        )
+    except ValueError as error:
+        raise ValueError(
+            "Could not create the 70/15/15 split stratified by the joint "
+            "pion/FV/numu label. Some observed combinations have too few "
+            f"events. Encoded joint counts: {joint_count_summary}"
+        ) from error
     y_train = labels[train_indices]
     y_val = labels[val_indices]
     y_test = labels[test_indices]
     fv_train = fv_labels[train_indices]
     fv_val = fv_labels[val_indices]
     fv_test = fv_labels[test_indices]
+    numu_train = numu_labels[train_indices]
+    numu_val = numu_labels[val_indices]
+    numu_test = numu_labels[test_indices]
     train_counts = np.bincount(y_train.astype(np.int64), minlength=2)
     pion_class_weight = {
         0: len(y_train) / (2.0 * train_counts[0]),
@@ -2804,6 +3082,11 @@ def main() -> None:
         0: len(fv_train) / (2.0 * fv_train_counts[0]),
         1: len(fv_train) / (2.0 * fv_train_counts[1]),
     }
+    numu_train_counts = np.bincount(numu_train.astype(np.int64), minlength=2)
+    numu_class_weight = {
+        0: len(numu_train) / (2.0 * numu_train_counts[0]),
+        1: len(numu_train) / (2.0 * numu_train_counts[1]),
+    }
     training_sample_weights = {
         "pion_score": np.array(
             [pion_class_weight[int(label)] for label in y_train],
@@ -2811,6 +3094,10 @@ def main() -> None:
         ),
         "fv_score": np.array(
             [fv_class_weight[int(label)] for label in fv_train],
+            dtype=np.float32,
+        ),
+        "numu_score": np.array(
+            [numu_class_weight[int(label)] for label in numu_train],
             dtype=np.float32,
         ),
     }
@@ -2827,6 +3114,7 @@ def main() -> None:
         mrd_track_properties[train_indices],
         mrd_track_mask[train_indices],
         args.fv_loss_weight,
+        args.numu_loss_weight,
     )
     model.fit(
         {
@@ -2837,7 +3125,11 @@ def main() -> None:
             "mrd_track_properties": mrd_track_properties[train_indices],
             "mrd_track_mask": mrd_track_mask[train_indices],
         },
-        {"pion_score": y_train, "fv_score": fv_train},
+        {
+            "pion_score": y_train,
+            "fv_score": fv_train,
+            "numu_score": numu_train,
+        },
         sample_weight=training_sample_weights,
         validation_data=(
             {
@@ -2848,7 +3140,11 @@ def main() -> None:
                 "mrd_track_properties": mrd_track_properties[val_indices],
                 "mrd_track_mask": mrd_track_mask[val_indices],
             },
-            {"pion_score": y_val, "fv_score": fv_val},
+            {
+                "pion_score": y_val,
+                "fv_score": fv_val,
+                "numu_score": numu_val,
+            },
         ),
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -2880,7 +3176,11 @@ def main() -> None:
             "mrd_track_properties": mrd_track_properties[test_indices],
             "mrd_track_mask": mrd_track_mask[test_indices],
         },
-        {"pion_score": y_test, "fv_score": fv_test},
+        {
+            "pion_score": y_test,
+            "fv_score": fv_test,
+            "numu_score": numu_test,
+        },
         return_dict=True,
         verbose=0,
     )
@@ -2899,6 +3199,7 @@ def main() -> None:
         mrd_track_mask[test_indices],
         y_test,
         fv_test,
+        numu_test,
         source_paths[test_indices],
         entries[test_indices],
         truth_pion_counts[test_indices],
@@ -2906,6 +3207,7 @@ def main() -> None:
         args.output,
         args.threshold,
         args.fv_threshold,
+        args.numu_threshold,
         args.tree,
         args.muon_pion_opening_angle_deg_branch or "",
         args.seed,
@@ -2922,9 +3224,14 @@ def main() -> None:
         f"{evaluation_files['fv_roc_auc']:.5f}; "
         f"average precision: {evaluation_files['fv_average_precision']:.5f}"
     )
+    print(
+        "numu ROC AUC cross-check: "
+        f"{evaluation_files['numu_roc_auc']:.5f}; "
+        f"average precision: {evaluation_files['numu_average_precision']:.5f}"
+    )
     metadata = {
         "model_type": "annie_pion_ring_cnn",
-        "model_variant": "C_independent_pion_and_fv_heads",
+        "model_variant": "C_head_specific_image_routing_pion_fv_numu",
         "tensorflow_version": tf.__version__,
         "training_sources": training_sources,
         "training_source_groups": response_info["groups"],
@@ -2957,6 +3264,13 @@ def main() -> None:
         "image_width": args.image_width,
         "detector_height": args.detector_height,
         "detector_width": args.detector_width,
+        "image_channel_source": "head_specific_full_and_tankcluster",
+        "image_channel_count": 2,
+        "head_image_channels": {
+            "pion_score": [args.hitpe_branch, tank_branch],
+            "fv_score": [tank_branch],
+            "numu_score": [tank_branch],
+        },
         "channels": [
             (
                 "log1p_mixed_raw_and_tuned_hitPE"
@@ -3004,10 +3318,13 @@ def main() -> None:
             "permutation_invariant_max_pooling"
         ),
         "label": "charged_pion_present" if args.charged_only else "any_pion_present",
-        "output_heads": ["pion_score", "fv_score"],
+        "output_heads": ["pion_score", "fv_score", "numu_score"],
         "fv_label": "trueFV",
         "fv_truth_used_as_input": False,
         "fv_loss_weight": args.fv_loss_weight,
+        "numu_label": "mc_neutrino_is_numu",
+        "numu_truth_used_as_input": False,
+        "numu_loss_weight": args.numu_loss_weight,
         "truth_branches": ["truePiPlusCher", "truePiMinusCher", "truePi0"],
         "truth_muon_pion_opening_angle_annotation_only": True,
         "truth_muon_pion_kinetic_energy_annotation_only": True,
@@ -3029,6 +3346,7 @@ def main() -> None:
         "bdt_preselection": False,
         "threshold": args.threshold,
         "fv_threshold": args.fv_threshold,
+        "numu_threshold": args.numu_threshold,
         "data_split": {
             "training_fraction": TRAIN_FRACTION,
             "validation_fraction": VALIDATION_FRACTION,
@@ -3036,13 +3354,19 @@ def main() -> None:
             "training_events": int(len(train_indices)),
             "validation_events": int(len(val_indices)),
             "testing_events": int(len(test_indices)),
-            "stratified_by_joint_pion_and_trueFV_label": True,
+            "stratified_by_joint_pion_trueFV_and_numu_label": True,
+            "joint_label_encoding": "4*pion + 2*trueFV + mc_neutrino_is_numu",
+            "joint_label_counts": joint_count_summary,
             "random_seed": args.seed,
         },
         "class_counts": {"no_pion": int(counts[0]), "pion": int(counts[1])},
         "fv_class_counts": {
             "outside_fv": int(fv_counts[0]),
             "inside_fv": int(fv_counts[1]),
+        },
+        "numu_class_counts": {
+            "not_numu": int(numu_counts[0]),
+            "numu": int(numu_counts[1]),
         },
         "misaligned_events_rejected": n_misaligned,
         "test_metrics": {name: float(value) for name, value in metrics.items()},
@@ -3091,6 +3415,14 @@ def main() -> None:
         f"specificity={fv_point['specificity']:.5f}, "
         f"balanced_accuracy={fv_point['balanced_accuracy']:.5f}"
     )
+    numu_point = evaluation_files["numu_operating_point"]
+    print(
+        f"numu operating point at threshold={numu_point['threshold']:.2f}: "
+        f"efficiency={numu_point['efficiency']:.5f}, "
+        f"purity={numu_point['purity']:.5f}, "
+        f"specificity={numu_point['specificity']:.5f}, "
+        f"balanced_accuracy={numu_point['balanced_accuracy']:.5f}"
+    )
     mrd_report = evaluation_files["mrd_permutation_importance"]
     mrd_drop = mrd_report["performance_drop"]
     print(
@@ -3099,7 +3431,8 @@ def main() -> None:
         f"pion average-precision drop="
         f"{mrd_drop['pion_average_precision']:.5f}, "
         f"pion efficiency*purity drop="
-        f"{mrd_drop['pion_efficiency_x_purity']:.5f}"
+        f"{mrd_drop['pion_efficiency_x_purity']:.5f}, "
+        f"numu ROC-AUC drop={mrd_drop['numu_roc_auc']:.5f}"
     )
     print("MRD branch ranking by mean absolute pion-score impact:")
     for rank, branch_result in enumerate(

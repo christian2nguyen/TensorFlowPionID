@@ -39,6 +39,11 @@ def main() -> None:
         help="Override the independent FV cut stored in the model metadata",
     )
     parser.add_argument(
+        "--numu-threshold",
+        type=float,
+        help="Override the independent numu cut stored in the model metadata",
+    )
+    parser.add_argument(
         "--pmt-response",
         choices=PMT_RESPONSE_CHOICES,
         default="raw",
@@ -58,6 +63,7 @@ def main() -> None:
     for option, value in (
         ("--pion-threshold", args.pion_threshold),
         ("--fv-threshold", args.fv_threshold),
+        ("--numu-threshold", args.numu_threshold),
     ):
         if value is not None and not 0.0 <= value <= 1.0:
             parser.error(f"{option} must be between 0 and 1")
@@ -72,6 +78,15 @@ def main() -> None:
         args.pmt_response,
         args.pmt_response_calibration,
         tune_variant,
+    )
+    tankcluster_only = (
+        metadata.get("image_channel_source") == "hitPE_tankcluster_only"
+        or metadata.get("channels")
+        in (
+            ["log1p_hitPE_tankcluster"],
+            ["log1p_tuned_hitPE_tankcluster"],
+            ["log1p_mixed_raw_and_tuned_hitPE_tankcluster"],
+        )
     )
     print(response.describe())
     training_response = metadata.get("training_pmt_response", "raw")
@@ -128,9 +143,15 @@ def main() -> None:
             metadata.get("mrd_track_property_input_name")
         )
         has_fv_output = "fv_score" in getattr(model, "output_names", [])
+        has_numu_output = "numu_score" in getattr(model, "output_names", [])
         if args.fv_threshold is not None and not has_fv_output:
             raise ValueError(
                 "--fv-threshold was supplied, but this model has no fv_score output"
+            )
+        if args.numu_threshold is not None and not has_numu_output:
+            raise ValueError(
+                "--numu-threshold was supplied, but this model has no "
+                "numu_score output"
             )
         threshold = float(
             metadata["threshold"]
@@ -142,9 +163,16 @@ def main() -> None:
             if args.fv_threshold is None
             else args.fv_threshold
         )
+        numu_threshold = float(
+            metadata.get("numu_threshold", 0.5)
+            if args.numu_threshold is None
+            else args.numu_threshold
+        )
         print(f"Pion decision: pion_score >= {threshold:.3f}")
         if has_fv_output:
             print(f"FV decision: fv_score >= {fv_threshold:.3f}")
+        if has_numu_output:
+            print(f"numu decision: numu_score >= {numu_threshold:.3f}")
         max_mrd_tracks = int(metadata.get("max_mrd_tracks", 0))
         track_column_names = [
             name
@@ -183,6 +211,11 @@ def main() -> None:
                     if has_fv_output
                     else []
                 ),
+                *(
+                    ["numu_score", "numu_threshold", "numu_prediction"]
+                    if has_numu_output
+                    else []
+                ),
             ],
         )
         writer.writeheader()
@@ -206,6 +239,7 @@ def main() -> None:
             include_ring_event_features=bool(
                 event_feature_names or has_mrd_track_set
             ),
+            tankcluster_only=tankcluster_only,
         ):
             n_mrd_tracks_truncated += int(chunk["n_mrd_tracks_truncated"])
             images = chunk["images"]
@@ -232,9 +266,15 @@ def main() -> None:
                     if has_fv_output
                     else None
                 )
+                numu_scores = (
+                    prediction_outputs["numu_score"].reshape(-1)
+                    if has_numu_output
+                    else None
+                )
             else:
                 scores = prediction_outputs.reshape(-1)
                 fv_scores = None
+                numu_scores = None
             feature_rows = chunk.get("event_features")
             for row_index, (entry, score) in enumerate(zip(chunk["entries"], scores)):
                 output_row = {
@@ -254,6 +294,17 @@ def main() -> None:
                             "fv_score": fv_score,
                             "fv_threshold": fv_threshold,
                             "fv_prediction": int(fv_score >= fv_threshold),
+                        }
+                    )
+                if numu_scores is not None:
+                    numu_score = float(numu_scores[row_index])
+                    output_row.update(
+                        {
+                            "numu_score": numu_score,
+                            "numu_threshold": numu_threshold,
+                            "numu_prediction": int(
+                                numu_score >= numu_threshold
+                            ),
                         }
                     )
                 if feature_rows is not None:

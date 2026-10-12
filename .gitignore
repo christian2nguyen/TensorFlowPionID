@@ -7,3 +7,8 @@ annie_pion_scores.csv
 annie_ring_event.png
 annie_ring_scores.csv
 model_a_images/
+.DS_Store
+.codex-finalizer/
+.codex-slide-build/
+assets/
+output/
