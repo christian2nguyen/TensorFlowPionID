@@ -32,6 +32,12 @@ MRD_TRACK_START_BRANCHES = [
     "MRDTrackStartZ",
 ]
 
+MRD_TRACK_STOP_BRANCHES = [
+    "MRDTrackStopX",
+    "MRDTrackStopY",
+    "MRDTrackStopZ",
+]
+
 MRD_TRACK_PROPERTY_BRANCHES = [
     "MRDEnergyLoss",
     "MRDTrackLength",

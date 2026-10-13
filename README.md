@@ -816,11 +816,70 @@ The stored `sel_nu_mu_cc` decision is not recomputed after tuning, so this
 replay changes the CNN images but does not model migration across that
 preselection boundary.
 
-This is an event-level, weakly supervised, multi-task classifier: one truth
-label says whether a pion is present and the other says whether the event is in
-the fiducial volume, but neither provides a ring center or radius. Localizing or
+The pion model is an event-level, weakly supervised, multi-task classifier:
+separate truth labels identify pion presence, fiducial-volume membership, and
+the numu CC category, but none provides a ring center or radius. Localizing or
 counting individual rings requires corresponding per-ring truth targets (for
 example particle direction and vertex) or manually labeled images.
+
+## CC-inclusive tank-cluster model
+
+`train_annie_CCinclusive.py` is a separate single-output trainer. It leaves the
+pion model unchanged and learns
+
+```text
+ccinclusive_signal = (trueCC == 1) && (trueFSLPdg == 13)
+```
+
+The two truth branches provide supervision only. They are not inference inputs.
+The only PMT image input is the unfolded detector map built from the
+tank-cluster PE channel. The CC-inclusive trainer does not request reconstructed
+vertex-coordinate branches and does not build the vertex-centered angular
+image. It therefore cannot learn from event-vertex coordinates through its
+inputs. The reconstructed FV flag is used only as the requested event-selection
+cut.
+
+The model also receives a padded set of up to four MRD tracks. Each track has
+`MRDTrackStartX/Y/Z`, `MRDTrackStopX/Y/Z`, `MRDEnergyLoss`, `MRDTrackLength`,
+and `MRDTrackAngle`; `mrd_track_mask` distinguishes real tracks from padding.
+It also receives these scalar features:
+
+- `trigword == 5`
+- `HasTank == 1`
+- `HasMRD == 1`
+- `TankMRDCoinc == 1`
+- `NoVeto == 1`
+- `simpleRecoFlag == 1`
+- `promptMuonTotalPE_filtered`
+- `numMRDTracks`
+
+The six Boolean expressions are inputs, not hard cuts. The only default physics
+cut in this trainer is the reconstructed fiducial-volume requirement. It
+auto-detects `simpleRecoFV`, `recoFV`, or `sel_vertex_in_FV` in that order and
+requires the resolved value to be nonzero. Select a branch explicitly with
+`--fv-branch`, or disable the cut with `--no-fv-cut`. Using a reconstructed FV
+branch keeps the same requirement available when applying the model to data.
+
+Train from an MC file list with:
+
+```bash
+python train_annie_CCinclusive.py \
+  --file-list ccinclusive_mc_files.txt \
+  --pmt-response tuned \
+  --pmt-response-calibration fitted_calibration.root \
+  --pmt-tune-variant final \
+  --threshold 0.50 \
+  --batch-size 64 \
+  --output artifacts/annie_CCinclusive.keras
+```
+
+The ROOT branch name for the filtered prompt charge defaults to
+`promptMuonTotalPE_filtered`. Use `--prompt-pe-branch BRANCH_NAME` if a file
+uses a different spelling. Training produces the model and JSON metadata plus
+ROC, precision-recall, score-distribution, confusion-matrix,
+efficiency/purity, training-history, and held-out prediction files. The saved
+model can also be passed to `export_annie_ring_saved_model.py`; its exported
+output is named `ccinclusive_score`.
 
 ## Moving the project
 

@@ -14,6 +14,7 @@ import uproot
 from annie_features import (
     MRD_TRACK_PROPERTY_BRANCHES,
     MRD_TRACK_START_BRANCHES,
+    MRD_TRACK_STOP_BRANCHES,
     RING_EVENT_SCALAR_BRANCHES,
 )
 
@@ -21,6 +22,7 @@ from annie_features import (
 BRANCHES = [
     *RING_EVENT_SCALAR_BRANCHES,
     *MRD_TRACK_START_BRANCHES,
+    *MRD_TRACK_STOP_BRANCHES,
     *MRD_TRACK_PROPERTY_BRANCHES,
 ]
 

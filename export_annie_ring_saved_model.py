@@ -23,7 +23,12 @@ def _serving_outputs(predictions):
     if isinstance(predictions, dict):
         return {
             name: predictions[name]
-            for name in ("pion_score", "fv_score", "numu_score")
+            for name in (
+                "pion_score",
+                "fv_score",
+                "numu_score",
+                "ccinclusive_score",
+            )
             if name in predictions
         }
     return {"pion_score": predictions}
@@ -38,23 +43,89 @@ def main() -> None:
     model = tf.keras.models.load_model(args.keras_model, compile=False)
     shapes = _input_shapes(model)
     image_names = {"pmt_angular_image", "pmt_unfolded_image"}
+    present_image_names = image_names & set(shapes)
     auxiliary_names = {
         name
         for name in (
             "event_features",
             "mrd_track_starts",
+            "mrd_track_stops",
             "mrd_track_properties",
             "mrd_track_mask",
         )
         if name in shapes
     }
-    expected_names = image_names | auxiliary_names
-    if set(shapes) != expected_names:
+    expected_names = present_image_names | auxiliary_names
+    if not present_image_names or set(shapes) != expected_names:
         raise ValueError(
-            f"Unexpected model inputs {sorted(shapes)}; expected {sorted(expected_names)}"
+            f"Unexpected model inputs {sorted(shapes)}; supported image names are "
+            f"{sorted(image_names)}"
         )
 
-    if auxiliary_names == {
+    if present_image_names == {"pmt_unfolded_image"} and auxiliary_names == {
+        "event_features",
+        "mrd_track_starts",
+        "mrd_track_stops",
+        "mrd_track_properties",
+        "mrd_track_mask",
+    }:
+
+        @tf.function(
+            input_signature=[
+                tf.TensorSpec(
+                    [None, *shapes["pmt_unfolded_image"]],
+                    tf.float32,
+                    name="pmt_unfolded_image",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["event_features"]],
+                    tf.float32,
+                    name="event_features",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["mrd_track_starts"]],
+                    tf.float32,
+                    name="mrd_track_starts",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["mrd_track_stops"]],
+                    tf.float32,
+                    name="mrd_track_stops",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["mrd_track_properties"]],
+                    tf.float32,
+                    name="mrd_track_properties",
+                ),
+                tf.TensorSpec(
+                    [None, *shapes["mrd_track_mask"]],
+                    tf.float32,
+                    name="mrd_track_mask",
+                ),
+            ]
+        )
+        def serve(
+            pmt_unfolded_image,
+            event_features,
+            mrd_track_starts,
+            mrd_track_stops,
+            mrd_track_properties,
+            mrd_track_mask,
+        ):
+            score = model(
+                {
+                    "pmt_unfolded_image": pmt_unfolded_image,
+                    "event_features": event_features,
+                    "mrd_track_starts": mrd_track_starts,
+                    "mrd_track_stops": mrd_track_stops,
+                    "mrd_track_properties": mrd_track_properties,
+                    "mrd_track_mask": mrd_track_mask,
+                },
+                training=False,
+            )
+            return _serving_outputs(score)
+
+    elif present_image_names == image_names and auxiliary_names == {
         "event_features",
         "mrd_track_starts",
         "mrd_track_properties",
@@ -116,7 +187,7 @@ def main() -> None:
             )
             return _serving_outputs(score)
 
-    elif auxiliary_names == {
+    elif present_image_names == image_names and auxiliary_names == {
         "event_features",
         "mrd_track_starts",
         "mrd_track_mask",
@@ -170,7 +241,7 @@ def main() -> None:
             )
             return _serving_outputs(score)
 
-    elif auxiliary_names == {"event_features"}:
+    elif present_image_names == image_names and auxiliary_names == {"event_features"}:
 
         @tf.function(
             input_signature=[
@@ -202,7 +273,7 @@ def main() -> None:
             )
             return _serving_outputs(score)
 
-    elif not auxiliary_names:
+    elif present_image_names == image_names and not auxiliary_names:
 
         @tf.function(
             input_signature=[
