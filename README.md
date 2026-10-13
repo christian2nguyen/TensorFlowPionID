@@ -839,11 +839,14 @@ decision threshold; `--fv-threshold` independently sets the FV threshold.
 `--fv-loss-weight` controls the FV head's contribution to the total training
 loss and defaults to 1.0.
 
-The only PMT image input is the unfolded detector map built from the
-tank-cluster PE channel. The CC-inclusive trainer does not request reconstructed
-vertex-coordinate branches and does not build the vertex-centered angular
-image. It therefore cannot learn from event-vertex coordinates through its
-inputs. No reconstructed FV flag, including `sel_vertex_in_FV`, is read or
+The PMT input is a two-channel unfolded detector map. Channel 1 is built from
+full-event `hitPE`, and channel 2 is built from `hitPE_tankcluster` (or
+`hitPE_tankclusters`). The channels are routed separately: `ccinclusive_score`
+uses only the tank-cluster channel, while `fv_score` uses both the full-event
+and tank-cluster channels in its own CNN tower. The trainer does not request
+reconstructed vertex-coordinate branches and does not build the vertex-centered
+angular image. It therefore cannot learn from event-vertex coordinates through
+its inputs. No reconstructed FV flag, including `sel_vertex_in_FV`, is read or
 applied by default.
 
 The model also receives a padded set of up to four MRD tracks. Each track has
@@ -898,8 +901,8 @@ produces these held-out diagnostic outputs:
 
 - `annie_CCinclusive.gradcam_examples.png` shows a representative true
   positive, true negative, false positive, and false negative when each
-  category is available. The heat map is calculated from `detector_conv3` for
-  the `ccinclusive_score` output.
+  category is available. It shows separate heat maps from the CC tank-cluster
+  tower and the FV two-channel tower.
 - `annie_CCinclusive.misclassified_gallery.png` summarizes up to six of the
   most confident mistakes, with source entry, scalar inputs, and MRD tracks.
 - `annie_CCinclusive.misclassified_events.pdf` contains up to 20 annotated

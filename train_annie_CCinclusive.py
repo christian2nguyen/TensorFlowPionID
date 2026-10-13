@@ -349,6 +349,8 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                     fv_branches.add(fv_branch)
                 tank_branches.add(tank_branch)
                 requested = [
+                    args.hitpe_branch,
+                    args.hitid_branch,
                     tank_branch,
                     args.tankcluster_id_branch,
                     *(branch for _, branch, _ in SELECTION_INPUT_SPECS),
@@ -389,7 +391,7 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                         args.detector_width,
                         response,
                         tuning_entries,
-                        tankcluster_only=True,
+                        tankcluster_only=False,
                     )
                     (
                         mrd_count_features,
@@ -605,11 +607,22 @@ def build_model(
     properties = arrays["track_properties"]
     mask = arrays["track_mask"]
     detector_mean, detector_variance = _channel_moments(detector, train_indices)
-    detector_normalizer = tf.keras.layers.Normalization(
+    if detector.shape[-1] != 2:
+        raise ValueError(
+            "CC-inclusive training expects unfolded image channels in "
+            "[hitPE, hitPE_tankcluster] order"
+        )
+    fv_detector_normalizer = tf.keras.layers.Normalization(
         axis=-1,
         mean=detector_mean,
         variance=detector_variance,
-        name="detector_tankcluster_normalization",
+        name="fv_detector_both_channel_normalization",
+    )
+    cc_detector_normalizer = tf.keras.layers.Normalization(
+        axis=-1,
+        mean=detector_mean[1:2],
+        variance=detector_variance[1:2],
+        name="cc_detector_tankcluster_normalization",
     )
     scalar_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="event_feature_normalization"
@@ -650,8 +663,12 @@ def build_model(
     )
     mask_input = tf.keras.Input(shape=(MAX_MRD_TRACKS,), name="mrd_track_mask")
 
-    detector_features = _image_tower(
-        detector_input, detector_normalizer, "detector"
+    cc_detector_input = detector_input[..., 1:2]
+    cc_detector_features = _image_tower(
+        cc_detector_input, cc_detector_normalizer, "cc_detector"
+    )
+    fv_detector_features = _image_tower(
+        detector_input, fv_detector_normalizer, "fv_detector"
     )
     scalar_features = scalar_normalizer(scalar_input)
     scalar_features = tf.keras.layers.Dense(
@@ -672,16 +689,27 @@ def build_model(
     track_features = tf.keras.layers.GlobalMaxPooling1D(
         name="mrd_track_set_features"
     )(track_features)
-    combined = tf.keras.layers.Concatenate(name="combined_ccinclusive_inputs")(
-        [detector_features, scalar_features, track_features]
+    cc_combined = tf.keras.layers.Concatenate(name="combined_ccinclusive_inputs")(
+        [cc_detector_features, scalar_features, track_features]
     )
-    combined = tf.keras.layers.Dense(64, activation="relu")(combined)
-    combined = tf.keras.layers.Dropout(0.30)(combined)
+    cc_combined = tf.keras.layers.Dense(
+        64, activation="relu", name="ccinclusive_dense"
+    )(cc_combined)
+    cc_combined = tf.keras.layers.Dropout(
+        0.30, name="ccinclusive_dropout"
+    )(cc_combined)
     cc_features = tf.keras.layers.Dense(
         32, activation="relu", name="ccinclusive_features"
-    )(combined)
+    )(cc_combined)
+    fv_combined = tf.keras.layers.Concatenate(name="combined_fv_inputs")(
+        [fv_detector_features, scalar_features, track_features]
+    )
+    fv_combined = tf.keras.layers.Dense(64, activation="relu", name="fv_dense")(
+        fv_combined
+    )
+    fv_combined = tf.keras.layers.Dropout(0.30, name="fv_dropout")(fv_combined)
     fv_features = tf.keras.layers.Dense(32, activation="relu", name="fv_features")(
-        combined
+        fv_combined
     )
     cc_output = tf.keras.layers.Dense(
         1, activation="sigmoid", name="ccinclusive_score"
@@ -851,7 +879,7 @@ def plot_misclassified_events(
         )
         for row, (category, local_index) in enumerate(gallery_selected):
             event_index = int(test_indices[local_index])
-            image = arrays["detector_images"][event_index, :, :, 0]
+            image = arrays["detector_images"][event_index, :, :, 1]
             axes[row, 0].imshow(image, origin="lower", aspect="equal", cmap="magma")
             axes[row, 0].set_title(
                 f"{category}: truth={int(labels[local_index])}, "
@@ -904,14 +932,22 @@ def plot_misclassified_events(
             event_index = int(test_indices[local_index])
             source = Path(str(arrays["source_paths"][event_index])).name
             fig = plt.figure(figsize=(11, 8.5))
-            image_axis = fig.add_axes([0.18, 0.32, 0.64, 0.58])
-            image_axis.imshow(
+            full_axis = fig.add_axes([0.05, 0.32, 0.42, 0.58])
+            full_axis.imshow(
                 arrays["detector_images"][event_index, :, :, 0],
                 origin="lower",
                 aspect="equal",
                 cmap="magma",
             )
-            image_axis.set_title("Tank-cluster unfolded detector image")
+            full_axis.set_title("Full-event hitPE")
+            tank_axis = fig.add_axes([0.53, 0.32, 0.42, 0.58])
+            tank_axis.imshow(
+                arrays["detector_images"][event_index, :, :, 1],
+                origin="lower",
+                aspect="equal",
+                cmap="magma",
+            )
+            tank_axis.set_title("Tank-cluster hitPE")
             text_axis = fig.add_axes([0.06, 0.04, 0.88, 0.23])
             text_axis.axis("off")
             text_axis.text(
@@ -943,14 +979,16 @@ def plot_misclassified_events(
 
 def _grad_cam_heatmaps(
     model: tf.keras.Model,
+    conv_layer_name: str,
+    output_layer_name: str,
     inputs: Dict[str, np.ndarray],
     target_shape: Tuple[int, int],
 ) -> np.ndarray:
     grad_model = tf.keras.Model(
         model.inputs,
         [
-            model.get_layer("detector_conv3").output,
-            model.get_layer("ccinclusive_score").output,
+            model.get_layer(conv_layer_name).output,
+            model.get_layer(output_layer_name).output,
         ],
     )
     tensors = {name: tf.convert_to_tensor(value) for name, value in inputs.items()}
@@ -996,17 +1034,29 @@ def plot_gradcam_examples(
     )
     inputs = _model_inputs(arrays, selected_indices)
     detector_batch = inputs["pmt_unfolded_image"]
-    heatmaps = _grad_cam_heatmaps(
+    cc_heatmaps = _grad_cam_heatmaps(
         model,
+        "cc_detector_conv3",
+        "ccinclusive_score",
+        inputs,
+        (detector_batch.shape[1], detector_batch.shape[2]),
+    )
+    fv_heatmaps = _grad_cam_heatmaps(
+        model,
+        "fv_detector_conv3",
+        "fv_score",
         inputs,
         (detector_batch.shape[1], detector_batch.shape[2]),
     )
     fig, axes = plt.subplots(
-        len(selected), 2, figsize=(10, 3.6 * len(selected)), squeeze=False
+        len(selected), 4, figsize=(17, 3.6 * len(selected)), squeeze=False
     )
     for row, (title, local_index) in enumerate(selected):
-        visible = detector_batch[row, :, :, 0]
-        axes[row, 0].imshow(visible, origin="lower", aspect="equal", cmap="magma")
+        full_visible = detector_batch[row, :, :, 0]
+        tank_visible = detector_batch[row, :, :, 1]
+        axes[row, 0].imshow(
+            full_visible, origin="lower", aspect="equal", cmap="magma"
+        )
         axes[row, 0].set_title(
             f"{title}: truth={int(labels[local_index])}, "
             f"CC score={scores[local_index]:.3f}, "
@@ -1014,14 +1064,38 @@ def plot_gradcam_examples(
             f"FV score={fv_scores[local_index]:.3f}",
             fontsize=9,
         )
-        axes[row, 1].imshow(visible, origin="lower", aspect="equal", cmap="gray")
         axes[row, 1].imshow(
-            heatmaps[row], origin="lower", aspect="equal", cmap="jet", alpha=0.55
+            tank_visible, origin="lower", aspect="equal", cmap="magma"
         )
-        axes[row, 1].set_title("Detector Grad-CAM (red = strongest influence)", fontsize=9)
+        axes[row, 1].set_title("Tank-cluster channel", fontsize=9)
+        axes[row, 2].imshow(
+            tank_visible, origin="lower", aspect="equal", cmap="gray"
+        )
+        axes[row, 2].imshow(
+            cc_heatmaps[row],
+            origin="lower",
+            aspect="equal",
+            cmap="jet",
+            alpha=0.55,
+        )
+        axes[row, 2].set_title("CC Grad-CAM (tank-cluster tower)", fontsize=9)
+        axes[row, 3].imshow(
+            full_visible, origin="lower", aspect="equal", cmap="gray"
+        )
+        axes[row, 3].imshow(
+            fv_heatmaps[row],
+            origin="lower",
+            aspect="equal",
+            cmap="jet",
+            alpha=0.55,
+        )
+        axes[row, 3].set_title("FV Grad-CAM (two-channel tower)", fontsize=9)
         for axis in axes[row]:
             axis.set_axis_off()
-    fig.suptitle("CC-inclusive detector-image Grad-CAM", fontsize=12)
+    fig.suptitle(
+        "CC-inclusive and FV detector-image Grad-CAM (red = strongest influence)",
+        fontsize=12,
+    )
     fig.tight_layout()
     path = output.with_suffix(".gradcam_examples.png")
     fig.savefig(path, dpi=180)
@@ -1712,7 +1786,7 @@ def main() -> None:
     training_response = response_modes[0] if len(response_modes) == 1 else "mixed"
     metadata_response = responses.get("tuned", responses.get("raw"))
     metadata = {
-        "model_type": "annie_ccinclusive_fv_detector_tankcluster_cnn",
+        "model_type": "annie_ccinclusive_fv_detector_dual_channel_cnn",
         "tensorflow_version": tf.__version__,
         "tree": args.tree,
         "training_sources": [
@@ -1745,9 +1819,15 @@ def main() -> None:
             if args.apply_reco_fv_cut
             else "none"
         ),
+        "hitpe_branch": args.hitpe_branch,
+        "hitid_branch": args.hitid_branch,
         "tankcluster_branches": arrays["tank_branches"],
         "tankcluster_id_branch": args.tankcluster_id_branch,
-        "image_channels": ["log1p_hitPE_tankcluster"],
+        "image_channels": ["log1p_hitPE", "log1p_hitPE_tankcluster"],
+        "image_channel_routing": {
+            "ccinclusive_score": ["log1p_hitPE_tankcluster"],
+            "fv_score": ["log1p_hitPE", "log1p_hitPE_tankcluster"],
+        },
         "image_projections": [
             "annotation_free_unfolded_barrel_top_bottom",
         ],
