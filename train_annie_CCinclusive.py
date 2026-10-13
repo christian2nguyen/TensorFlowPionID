@@ -1250,6 +1250,11 @@ def evaluate_input_importance(
     batch_size: int,
 ) -> Dict[str, object]:
     """Rank every inference input for both outputs using held-out permutations."""
+    array_name_by_model_input = {
+        "mrd_track_starts": "track_starts",
+        "mrd_track_stops": "track_stops",
+        "mrd_track_properties": "track_properties",
+    }
     scalar_names = list(arrays["scalar_feature_names"])
     branch_specs = [
         ("image: hitPE", "pmt_unfolded_image", 0),
@@ -1302,7 +1307,8 @@ def evaluate_input_importance(
                 changed_values = original_values[rng.permutation(len(original_values))]
                 predict_kwargs["override_values"] = changed_values
             else:
-                original_values = arrays[input_name][test_indices, :, column]
+                array_name = array_name_by_model_input[input_name]
+                original_values = arrays[array_name][test_indices, :, column]
                 changed_values = _permute_valid_track_values(
                     original_values, mask, rng
                 )
@@ -1341,8 +1347,9 @@ def evaluate_input_importance(
                 test_indices, column
             ].astype(np.float64)
         else:
+            array_name = array_name_by_model_input[input_name]
             display_values = _masked_event_mean(
-                arrays[input_name][test_indices, :, column], mask
+                arrays[array_name][test_indices, :, column], mask
             )
         values_by_branch[branch_name] = display_values
         results.append(
