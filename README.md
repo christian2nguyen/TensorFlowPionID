@@ -824,14 +824,21 @@ example particle direction and vertex) or manually labeled images.
 
 ## CC-inclusive tank-cluster model
 
-`train_annie_CCinclusive.py` is a separate single-output trainer. It leaves the
+`train_annie_CCinclusive.py` is a separate two-output trainer. It leaves the
 pion model unchanged and learns
 
 ```text
-ccinclusive_signal = (trueCC == 1) && (trueFSLPdg == 13)
+ccinclusive_score target = (trueCC == 1) && (trueFSLPdg == 13)
+fv_score target          = trueFV
 ```
 
-The two truth branches provide supervision only. They are not inference inputs.
+The three truth branches provide supervision only. They are not inference
+inputs. Both outputs share the same image, scalar, and MRD feature extractor,
+then use separate dense output branches. `--threshold` sets the CC-inclusive
+decision threshold; `--fv-threshold` independently sets the FV threshold.
+`--fv-loss-weight` controls the FV head's contribution to the total training
+loss and defaults to 1.0.
+
 The only PMT image input is the unfolded detector map built from the
 tank-cluster PE channel. The CC-inclusive trainer does not request reconstructed
 vertex-coordinate branches and does not build the vertex-centered angular
@@ -869,6 +876,7 @@ python train_annie_CCinclusive.py \
   --pmt-response-calibration fitted_calibration.root \
   --pmt-tune-variant final \
   --threshold 0.50 \
+  --fv-threshold 0.50 \
   --batch-size 64 \
   --output artifacts/annie_CCinclusive.keras
 ```
@@ -877,9 +885,35 @@ The ROOT branch name for the filtered prompt charge defaults to
 `promptMuonTotalPE_filtered`. Use `--prompt-pe-branch BRANCH_NAME` if a file
 uses a different spelling. Training produces the model and JSON metadata plus
 ROC, precision-recall, score-distribution, confusion-matrix,
-efficiency/purity, training-history, and held-out prediction files. The saved
-model can also be passed to `export_annie_ring_saved_model.py`; its exported
-output is named `ccinclusive_score`.
+efficiency/purity, training-history, and held-out prediction files. It also
+produces these held-out diagnostic outputs:
+
+- `annie_CCinclusive.fv_roc_curve.png`,
+  `annie_CCinclusive.fv_precision_recall_curve.png`, and
+  `annie_CCinclusive.fv_score_distribution.png` measure FV separation.
+- `annie_CCinclusive.fv_confusion_matrix.png` and its normalized counterpart
+  apply `--fv-threshold`; `annie_CCinclusive.fv_efficiency_purity.png` and CSV
+  scan the FV operating threshold.
+
+- `annie_CCinclusive.gradcam_examples.png` shows a representative true
+  positive, true negative, false positive, and false negative when each
+  category is available. The heat map is calculated from `detector_conv3` for
+  the `ccinclusive_score` output.
+- `annie_CCinclusive.misclassified_gallery.png` summarizes up to six of the
+  most confident mistakes, with source entry, scalar inputs, and MRD tracks.
+- `annie_CCinclusive.misclassified_events.pdf` contains up to 20 annotated
+  false-positive and false-negative detector images in one PDF.
+- `annie_CCinclusive.mrd_branch_importance_beeswarm.png` ranks
+  `numMRDTracks`, MRD start and stop coordinates, energy loss, length, and
+  angle using held-out one-branch-at-a-time permutation impacts.
+- `annie_CCinclusive.mrd_branch_importance.csv` records the score impact and
+  the ROC-AUC and average-precision decreases for each MRD branch.
+
+Use `--mrd-branch-importance-repeats N` to change the number of permutations
+per MRD branch; the default is 3. More repeats reduce random variation but add
+inference time after training. The saved model can also be passed to
+`export_annie_ring_saved_model.py`; its exported output is named
+`ccinclusive_score` alongside `fv_score`.
 
 ## Moving the project
 

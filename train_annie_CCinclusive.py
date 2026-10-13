@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train an ANNIE CC-inclusive classifier from detector PMT images and MRD inputs."""
+"""Train ANNIE CC-inclusive and FV classifiers from detector and MRD inputs."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 import awkward as ak
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 from sklearn.metrics import (
     auc,
@@ -52,7 +53,7 @@ from annie_ring_images import (
 TRAIN_FRACTION = 0.70
 VALIDATION_FRACTION = 0.15
 TEST_FRACTION = 0.15
-TRUTH_BRANCHES = ("trueCC", "trueFSLPdg")
+TRUTH_BRANCHES = ("trueCC", "trueFSLPdg", "trueFV")
 FV_BRANCH_ALIASES = ("simpleRecoFV", "recoFV", "sel_vertex_in_FV")
 SELECTION_INPUT_SPECS = (
     ("sel_trigword", "trigword", 5),
@@ -134,7 +135,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", default="50 MB")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--mrd-branch-importance-repeats",
+        type=int,
+        default=3,
+        help=(
+            "number of held-out permutations per MRD branch for the "
+            "feature-impact ranking (default: 3)"
+        ),
+    )
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--fv-threshold",
+        type=float,
+        default=0.5,
+        help="decision threshold for the true-FV output (default: 0.5)",
+    )
+    parser.add_argument(
+        "--fv-loss-weight",
+        type=float,
+        default=1.0,
+        help="relative training-loss weight for fv_score (default: 1.0)",
+    )
     parser.add_argument("--seed", type=int, default=20261012)
     parser.add_argument(
         "--output",
@@ -166,8 +188,14 @@ def parse_args() -> argparse.Namespace:
         )
     if not 0.0 <= args.threshold <= 1.0:
         parser.error("--threshold must be between 0 and 1")
+    if not 0.0 <= args.fv_threshold <= 1.0:
+        parser.error("--fv-threshold must be between 0 and 1")
+    if args.fv_loss_weight <= 0.0:
+        parser.error("--fv-loss-weight must be positive")
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
+    if args.mrd_branch_importance_repeats < 1:
+        parser.error("--mrd-branch-importance-repeats must be positive")
     return args
 
 
@@ -276,6 +304,7 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
     property_chunks = []
     mask_chunks = []
     label_chunks = []
+    fv_label_chunks = []
     source_chunks = []
     entry_chunks = []
     fv_branches = set()
@@ -373,11 +402,17 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                         selected &= inside_fv
                     true_cc = _to_numpy(arrays["trueCC"])
                     true_fs_lepton = _to_numpy(arrays["trueFSLPdg"])
-                    valid_truth = np.isfinite(true_cc) & np.isfinite(true_fs_lepton)
+                    true_fv = _to_numpy(arrays["trueFV"])
+                    valid_truth = (
+                        np.isfinite(true_cc)
+                        & np.isfinite(true_fs_lepton)
+                        & np.isfinite(true_fv)
+                    )
                     selected &= valid_truth
                     labels = ((true_cc == 1) & (true_fs_lepton == 13)).astype(
                         np.float32
                     )
+                    fv_labels = (true_fv != 0).astype(np.float32)
 
                     detector_chunks.append(
                         detector[selected].astype(np.float16, copy=False)
@@ -388,6 +423,7 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                     property_chunks.append(track_properties[selected])
                     mask_chunks.append(track_mask[selected])
                     label_chunks.append(labels[selected])
+                    fv_label_chunks.append(fv_labels[selected])
                     entry_chunks.append(entries[selected])
                     source_chunks.append(
                         np.full(int(selected.sum()), str(path), dtype=object)
@@ -432,6 +468,7 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
         "track_properties": np.concatenate(property_chunks),
         "track_mask": np.concatenate(mask_chunks),
         "labels": np.concatenate(label_chunks),
+        "fv_labels": np.concatenate(fv_label_chunks),
         "scalar_feature_names": [
             *(name for name, _, _ in SELECTION_INPUT_SPECS),
             args.prompt_pe_branch,
@@ -480,7 +517,7 @@ class CCInclusiveSequence(tf.keras.utils.Sequence):
         batch_size: int,
         shuffle: bool,
         seed: int,
-        class_weights: Optional[Dict[int, float]] = None,
+        class_weights: Optional[Dict[str, Dict[int, float]]] = None,
     ):
         super().__init__()
         self.arrays = arrays
@@ -508,15 +545,19 @@ class CCInclusiveSequence(tf.keras.utils.Sequence):
             "mrd_track_properties": self.arrays["track_properties"][indices],
             "mrd_track_mask": self.arrays["track_mask"][indices],
         }
-        targets = {"ccinclusive_score": self.arrays["labels"][indices]}
+        targets = {
+            "ccinclusive_score": self.arrays["labels"][indices],
+            "fv_score": self.arrays["fv_labels"][indices],
+        }
         if self.class_weights is None:
             return inputs, targets
-        weights = np.where(
-            targets["ccinclusive_score"] == 0,
-            self.class_weights[0],
-            self.class_weights[1],
-        ).astype(np.float32)
-        return inputs, targets, {"ccinclusive_score": weights}
+        sample_weights = {}
+        for output_name, output_targets in targets.items():
+            weights = self.class_weights[output_name]
+            sample_weights[output_name] = np.where(
+                output_targets == 0, weights[0], weights[1]
+            ).astype(np.float32)
+        return inputs, targets, sample_weights
 
     def on_epoch_end(self) -> None:
         if self.shuffle:
@@ -540,7 +581,9 @@ def _image_tower(inputs, normalizer, prefix: str):
 
 
 def build_model(
-    arrays: Dict[str, np.ndarray], train_indices: np.ndarray
+    arrays: Dict[str, np.ndarray],
+    train_indices: np.ndarray,
+    fv_loss_weight: float,
 ) -> tf.keras.Model:
     detector = arrays["detector_images"]
     scalars = arrays["scalar_features"]
@@ -621,10 +664,18 @@ def build_model(
     )
     combined = tf.keras.layers.Dense(64, activation="relu")(combined)
     combined = tf.keras.layers.Dropout(0.30)(combined)
-    combined = tf.keras.layers.Dense(32, activation="relu")(combined)
-    output = tf.keras.layers.Dense(
-        1, activation="sigmoid", name="ccinclusive_score"
+    cc_features = tf.keras.layers.Dense(
+        32, activation="relu", name="ccinclusive_features"
     )(combined)
+    fv_features = tf.keras.layers.Dense(32, activation="relu", name="fv_features")(
+        combined
+    )
+    cc_output = tf.keras.layers.Dense(
+        1, activation="sigmoid", name="ccinclusive_score"
+    )(cc_features)
+    fv_output = tf.keras.layers.Dense(1, activation="sigmoid", name="fv_score")(
+        fv_features
+    )
     model = tf.keras.Model(
         [
             detector_input,
@@ -634,18 +685,28 @@ def build_model(
             property_input,
             mask_input,
         ],
-        {"ccinclusive_score": output},
+        {"ccinclusive_score": cc_output, "fv_score": fv_output},
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss={"ccinclusive_score": "binary_crossentropy"},
+        loss={
+            "ccinclusive_score": "binary_crossentropy",
+            "fv_score": "binary_crossentropy",
+        },
+        loss_weights={"ccinclusive_score": 1.0, "fv_score": fv_loss_weight},
         metrics={
             "ccinclusive_score": [
                 tf.keras.metrics.AUC(name="roc_auc"),
                 tf.keras.metrics.AUC(name="pr_auc", curve="PR"),
                 tf.keras.metrics.Precision(name="precision"),
                 tf.keras.metrics.Recall(name="recall"),
-            ]
+            ],
+            "fv_score": [
+                tf.keras.metrics.AUC(name="roc_auc"),
+                tf.keras.metrics.AUC(name="pr_auc", curve="PR"),
+                tf.keras.metrics.Precision(name="precision"),
+                tf.keras.metrics.Recall(name="recall"),
+            ],
         },
     )
     return model
@@ -671,6 +732,612 @@ def _operating_point(labels, scores, threshold: float) -> Dict[str, float]:
     }
 
 
+def _model_inputs(
+    arrays: Dict[str, np.ndarray], indices: np.ndarray
+) -> Dict[str, np.ndarray]:
+    return {
+        "pmt_unfolded_image": arrays["detector_images"][indices],
+        "event_features": arrays["scalar_features"][indices],
+        "mrd_track_starts": arrays["track_starts"][indices],
+        "mrd_track_stops": arrays["track_stops"][indices],
+        "mrd_track_properties": arrays["track_properties"][indices],
+        "mrd_track_mask": arrays["track_mask"][indices],
+    }
+
+
+def _format_event_details(arrays: Dict[str, np.ndarray], event_index: int) -> str:
+    scalar_values = arrays["scalar_features"][event_index]
+    scalar_parts = [
+        f"{name}={float(value):.4g}"
+        for name, value in zip(arrays["scalar_feature_names"], scalar_values)
+    ]
+    mask = arrays["track_mask"][event_index].astype(bool)
+    starts = arrays["track_starts"][event_index][mask]
+    stops = arrays["track_stops"][event_index][mask]
+    properties = arrays["track_properties"][event_index][mask]
+    track_lines = []
+    for track_index, (start, stop, props) in enumerate(
+        zip(starts, stops, properties)
+    ):
+        track_lines.append(
+            f"track {track_index}: start=({start[0]:.3g}, {start[1]:.3g}, "
+            f"{start[2]:.3g}), stop=({stop[0]:.3g}, {stop[1]:.3g}, "
+            f"{stop[2]:.3g}), dE={props[0]:.3g}, L={props[1]:.3g}, "
+            f"angle={props[2]:.3g}"
+        )
+    if not track_lines:
+        track_lines.append("MRD tracks: none")
+    return "Scalar inputs: " + ", ".join(scalar_parts) + "\n" + "\n".join(
+        track_lines
+    )
+
+
+def _misclassified_examples(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    threshold: float,
+    maximum: int,
+) -> List[Tuple[str, int]]:
+    false_positives = np.flatnonzero((labels == 0) & (scores >= threshold))
+    false_negatives = np.flatnonzero((labels == 1) & (scores < threshold))
+    false_positives = false_positives[np.argsort(scores[false_positives])[::-1]]
+    false_negatives = false_negatives[np.argsort(scores[false_negatives])]
+    per_class = maximum // 2
+    selected = [
+        ("False positive", int(index)) for index in false_positives[:per_class]
+    ]
+    selected.extend(
+        ("False negative", int(index))
+        for index in false_negatives[:per_class]
+    )
+    remaining = [
+        ("False positive", int(index))
+        for index in false_positives[per_class:]
+    ]
+    remaining.extend(
+        ("False negative", int(index))
+        for index in false_negatives[per_class:]
+    )
+    remaining.sort(key=lambda item: abs(float(scores[item[1]]) - threshold), reverse=True)
+    selected.extend(remaining[: maximum - len(selected)])
+    return selected
+
+
+def plot_misclassified_events(
+    arrays: Dict[str, np.ndarray],
+    test_indices: np.ndarray,
+    labels: np.ndarray,
+    scores: np.ndarray,
+    fv_labels: np.ndarray,
+    fv_scores: np.ndarray,
+    output: Path,
+    threshold: float,
+    fv_threshold: float,
+) -> Dict[str, object]:
+    """Write a compact gallery and a PDF containing up to 20 mistakes."""
+    selected = _misclassified_examples(labels, scores, threshold, 20)
+    gallery_selected = _misclassified_examples(labels, scores, threshold, 6)
+    gallery_path = output.with_suffix(".misclassified_gallery.png")
+    if not gallery_selected:
+        fig, axis = plt.subplots(figsize=(8, 4))
+        axis.axis("off")
+        axis.text(
+            0.5,
+            0.5,
+            f"No test events were misclassified at threshold {threshold:.3f}.",
+            ha="center",
+            va="center",
+        )
+    else:
+        fig, axes = plt.subplots(
+            len(gallery_selected),
+            2,
+            figsize=(12, 3.4 * len(gallery_selected)),
+            squeeze=False,
+            gridspec_kw={"width_ratios": [1.1, 1.9]},
+        )
+        for row, (category, local_index) in enumerate(gallery_selected):
+            event_index = int(test_indices[local_index])
+            image = arrays["detector_images"][event_index, :, :, 0]
+            axes[row, 0].imshow(image, origin="lower", aspect="equal", cmap="magma")
+            axes[row, 0].set_title(
+                f"{category}: truth={int(labels[local_index])}, "
+                f"CC score={scores[local_index]:.3f}, "
+                f"trueFV={int(fv_labels[local_index])}, "
+                f"FV score={fv_scores[local_index]:.3f}",
+                fontsize=9,
+            )
+            axes[row, 0].set_axis_off()
+            axes[row, 1].axis("off")
+            source = Path(str(arrays["source_paths"][event_index])).name
+            details = _format_event_details(arrays, event_index)
+            axes[row, 1].text(
+                0.0,
+                1.0,
+                f"{source}\nentry={int(arrays['entries'][event_index])}\n{details}",
+                ha="left",
+                va="top",
+                fontsize=8,
+                wrap=True,
+            )
+    fig.suptitle("CC-inclusive held-out misclassifications", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(gallery_path, dpi=160)
+    plt.close(fig)
+
+    pdf_path = output.with_suffix(".misclassified_events.pdf")
+    with PdfPages(
+        pdf_path,
+        metadata={
+            "Title": "ANNIE CC-inclusive misclassified events",
+            "Subject": "Held-out false-positive and false-negative events",
+            "Author": "train_annie_CCinclusive.py",
+        },
+    ) as pdf:
+        if not selected:
+            fig, axis = plt.subplots(figsize=(11, 6))
+            axis.axis("off")
+            axis.text(
+                0.5,
+                0.5,
+                f"No test events were misclassified at threshold {threshold:.3f}.",
+                ha="center",
+                va="center",
+                fontsize=14,
+            )
+            pdf.savefig(fig)
+            plt.close(fig)
+        for category, local_index in selected:
+            event_index = int(test_indices[local_index])
+            source = Path(str(arrays["source_paths"][event_index])).name
+            fig = plt.figure(figsize=(11, 8.5))
+            image_axis = fig.add_axes([0.18, 0.32, 0.64, 0.58])
+            image_axis.imshow(
+                arrays["detector_images"][event_index, :, :, 0],
+                origin="lower",
+                aspect="equal",
+                cmap="magma",
+            )
+            image_axis.set_title("Tank-cluster unfolded detector image")
+            text_axis = fig.add_axes([0.06, 0.04, 0.88, 0.23])
+            text_axis.axis("off")
+            text_axis.text(
+                0.0,
+                1.0,
+                (
+                    f"{category} | truth={int(labels[local_index])} | "
+                    f"CC score={scores[local_index]:.5f} | CC threshold={threshold:.3f}\n"
+                    f"FV score={fv_scores[local_index]:.5f} | "
+                    f"FV threshold={fv_threshold:.3f} | "
+                    f"trueFV={int(fv_labels[local_index])}\n"
+                    f"{source} | entry={int(arrays['entries'][event_index])}\n"
+                    f"{_format_event_details(arrays, event_index)}"
+                ),
+                ha="left",
+                va="top",
+                fontsize=9,
+                wrap=True,
+            )
+            fig.suptitle("ANNIE CC-inclusive misclassification review", fontsize=14)
+            pdf.savefig(fig)
+            plt.close(fig)
+    return {
+        "misclassified_gallery": gallery_path.name,
+        "misclassified_events_pdf": pdf_path.name,
+        "misclassified_events_shown": int(len(selected)),
+    }
+
+
+def _grad_cam_heatmaps(
+    model: tf.keras.Model,
+    inputs: Dict[str, np.ndarray],
+    target_shape: Tuple[int, int],
+) -> np.ndarray:
+    grad_model = tf.keras.Model(
+        model.inputs,
+        [
+            model.get_layer("detector_conv3").output,
+            model.get_layer("ccinclusive_score").output,
+        ],
+    )
+    tensors = {name: tf.convert_to_tensor(value) for name, value in inputs.items()}
+    with tf.GradientTape() as tape:
+        conv_output, predictions = grad_model(tensors, training=False)
+        target = predictions[:, 0]
+    gradients = tape.gradient(target, conv_output)
+    pooled_gradients = tf.reduce_mean(gradients, axis=(1, 2))
+    heatmaps = tf.nn.relu(tf.einsum("bhwc,bc->bhw", conv_output, pooled_gradients))
+    heatmaps = tf.image.resize(heatmaps[..., tf.newaxis], target_shape)[..., 0]
+    heatmaps = heatmaps.numpy()
+    peaks = heatmaps.reshape(len(heatmaps), -1).max(axis=1)
+    peaks[peaks == 0.0] = 1.0
+    return heatmaps / peaks[:, None, None]
+
+
+def plot_gradcam_examples(
+    model: tf.keras.Model,
+    arrays: Dict[str, np.ndarray],
+    test_indices: np.ndarray,
+    labels: np.ndarray,
+    scores: np.ndarray,
+    fv_labels: np.ndarray,
+    fv_scores: np.ndarray,
+    output: Path,
+    threshold: float,
+) -> str:
+    predictions = (scores >= threshold).astype(np.int64)
+    categories = (
+        ("True positive", (labels == 1) & (predictions == 1)),
+        ("True negative", (labels == 0) & (predictions == 0)),
+        ("False positive", (labels == 0) & (predictions == 1)),
+        ("False negative", (labels == 1) & (predictions == 0)),
+    )
+    selected = []
+    for title, category_mask in categories:
+        candidates = np.flatnonzero(category_mask)
+        if len(candidates):
+            confidence = np.abs(scores[candidates] - threshold)
+            selected.append((title, int(candidates[np.argmax(confidence)])))
+    selected_indices = np.asarray(
+        [test_indices[local_index] for _, local_index in selected], dtype=np.int64
+    )
+    inputs = _model_inputs(arrays, selected_indices)
+    detector_batch = inputs["pmt_unfolded_image"]
+    heatmaps = _grad_cam_heatmaps(
+        model,
+        inputs,
+        (detector_batch.shape[1], detector_batch.shape[2]),
+    )
+    fig, axes = plt.subplots(
+        len(selected), 2, figsize=(10, 3.6 * len(selected)), squeeze=False
+    )
+    for row, (title, local_index) in enumerate(selected):
+        visible = detector_batch[row, :, :, 0]
+        axes[row, 0].imshow(visible, origin="lower", aspect="equal", cmap="magma")
+        axes[row, 0].set_title(
+            f"{title}: truth={int(labels[local_index])}, "
+            f"CC score={scores[local_index]:.3f}, "
+            f"trueFV={int(fv_labels[local_index])}, "
+            f"FV score={fv_scores[local_index]:.3f}",
+            fontsize=9,
+        )
+        axes[row, 1].imshow(visible, origin="lower", aspect="equal", cmap="gray")
+        axes[row, 1].imshow(
+            heatmaps[row], origin="lower", aspect="equal", cmap="jet", alpha=0.55
+        )
+        axes[row, 1].set_title("Detector Grad-CAM (red = strongest influence)", fontsize=9)
+        for axis in axes[row]:
+            axis.set_axis_off()
+    fig.suptitle("CC-inclusive detector-image Grad-CAM", fontsize=12)
+    fig.tight_layout()
+    path = output.with_suffix(".gradcam_examples.png")
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path.name
+
+
+def _masked_event_mean(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    valid = mask.astype(bool) & np.isfinite(values)
+    counts = valid.sum(axis=1)
+    sums = np.sum(np.where(valid, values, 0.0), axis=1)
+    return np.divide(
+        sums,
+        counts,
+        out=np.full(len(values), np.nan, dtype=np.float64),
+        where=counts > 0,
+    )
+
+
+def _permute_valid_track_values(
+    values: np.ndarray, mask: np.ndarray, rng: np.random.Generator
+) -> np.ndarray:
+    shuffled = np.array(values, copy=True)
+    for track_index in range(values.shape[1]):
+        valid_indices = np.flatnonzero(mask[:, track_index] != 0)
+        if len(valid_indices) > 1:
+            shuffled[valid_indices, track_index] = values[
+                rng.permutation(valid_indices), track_index
+            ]
+    return shuffled
+
+
+def evaluate_mrd_branch_importance(
+    model: tf.keras.Model,
+    arrays: Dict[str, np.ndarray],
+    test_indices: np.ndarray,
+    labels: np.ndarray,
+    full_scores: np.ndarray,
+    output: Path,
+    seed: int,
+    repeats: int,
+) -> Dict[str, object]:
+    """Rank individual MRD branches using held-out permutation impacts."""
+    inputs = _model_inputs(arrays, test_indices)
+    scalar_names = list(arrays["scalar_feature_names"])
+    branch_specs = [
+        ("numMRDTracks", "event_features", scalar_names.index("numMRDTracks")),
+        *[(name, "mrd_track_starts", column) for column, name in enumerate(MRD_TRACK_START_BRANCHES)],
+        *[(name, "mrd_track_stops", column) for column, name in enumerate(MRD_TRACK_STOP_BRANCHES)],
+        *[(name, "mrd_track_properties", column) for column, name in enumerate(MRD_TRACK_PROPERTY_BRANCHES)],
+    ]
+    full_fpr, full_tpr, _ = roc_curve(labels, full_scores)
+    full_roc_auc = float(auc(full_fpr, full_tpr))
+    full_average_precision = float(average_precision_score(labels, full_scores))
+    rng = np.random.default_rng(seed + 130363)
+    results = []
+    impacts_by_branch = {}
+    values_by_branch = {}
+    mask = inputs["mrd_track_mask"]
+    for branch_name, input_name, column in branch_specs:
+        repeat_impacts = []
+        repeat_roc_auc = []
+        repeat_average_precision = []
+        for _ in range(repeats):
+            permuted_inputs = dict(inputs)
+            changed = np.array(inputs[input_name], copy=True)
+            if input_name == "event_features":
+                changed[:, column] = changed[rng.permutation(len(changed)), column]
+            else:
+                changed[:, :, column] = _permute_valid_track_values(
+                    inputs[input_name][:, :, column], mask, rng
+                )
+            permuted_inputs[input_name] = changed
+            outputs = model.predict(permuted_inputs, batch_size=64, verbose=0)
+            permuted_scores = np.asarray(outputs["ccinclusive_score"]).reshape(-1)
+            repeat_impacts.append(full_scores - permuted_scores)
+            fpr, tpr, _ = roc_curve(labels, permuted_scores)
+            repeat_roc_auc.append(float(auc(fpr, tpr)))
+            repeat_average_precision.append(
+                float(average_precision_score(labels, permuted_scores))
+            )
+        event_impacts = np.mean(np.stack(repeat_impacts), axis=0)
+        impacts_by_branch[branch_name] = event_impacts
+        if input_name == "event_features":
+            display_values = inputs[input_name][:, column].astype(np.float64)
+        else:
+            display_values = _masked_event_mean(inputs[input_name][:, :, column], mask)
+        values_by_branch[branch_name] = display_values
+        results.append(
+            {
+                "branch": branch_name,
+                "mean_abs_score_impact": float(np.mean(np.abs(event_impacts))),
+                "mean_signed_score_impact": float(np.mean(event_impacts)),
+                "roc_auc_drop": full_roc_auc - float(np.mean(repeat_roc_auc)),
+                "roc_auc_drop_std": float(np.std(repeat_roc_auc)),
+                "average_precision_drop": full_average_precision
+                - float(np.mean(repeat_average_precision)),
+                "average_precision_drop_std": float(np.std(repeat_average_precision)),
+            }
+        )
+    ranking = [
+        {"rank": rank, **row}
+        for rank, row in enumerate(
+            sorted(results, key=lambda row: row["mean_abs_score_impact"], reverse=True),
+            start=1,
+        )
+    ]
+    csv_path = output.with_suffix(".mrd_branch_importance.csv")
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(ranking[0]))
+        writer.writeheader()
+        writer.writerows(ranking)
+
+    plot_rng = np.random.default_rng(seed + 155921)
+    fig, (impact_axis, rank_axis) = plt.subplots(
+        1,
+        2,
+        figsize=(15, 7),
+        gridspec_kw={"width_ratios": [2.3, 1.0]},
+        sharey=True,
+    )
+    y_positions = np.arange(len(ranking))
+    for y_position, row in zip(y_positions, ranking):
+        branch = str(row["branch"])
+        impacts = impacts_by_branch[branch]
+        values = values_by_branch[branch]
+        chosen = np.arange(len(impacts))
+        if len(chosen) > 2000:
+            chosen = plot_rng.choice(chosen, size=2000, replace=False)
+        plot_values = values[chosen]
+        finite = plot_values[np.isfinite(plot_values)]
+        if len(finite):
+            low, high = np.nanpercentile(finite, [5.0, 95.0])
+            scale = high - low
+            colors = (
+                np.clip((plot_values - low) / scale, 0.0, 1.0)
+                if scale > 0.0
+                else np.full(len(plot_values), 0.5)
+            )
+            colors = np.where(np.isfinite(colors), colors, 0.5)
+        else:
+            colors = np.full(len(plot_values), 0.5)
+        impact_axis.scatter(
+            impacts[chosen],
+            y_position + plot_rng.normal(0.0, 0.10, len(chosen)),
+            c=colors,
+            cmap="coolwarm",
+            vmin=0.0,
+            vmax=1.0,
+            s=10,
+            alpha=0.55,
+            linewidths=0,
+        )
+    impact_axis.axvline(0.0, color="black", linewidth=1)
+    impact_axis.set_yticks(y_positions, [str(row["branch"]) for row in ranking])
+    impact_axis.invert_yaxis()
+    impact_axis.set_xlabel("Original CC-inclusive score − score after permutation")
+    impact_axis.set_title("Held-out event impacts")
+    rank_axis.barh(
+        y_positions,
+        [row["mean_abs_score_impact"] for row in ranking],
+        color="tab:blue",
+        alpha=0.8,
+    )
+    rank_axis.set_xlabel("Mean |score impact|")
+    rank_axis.set_title("Global ranking")
+    color_scale = plt.cm.ScalarMappable(cmap="coolwarm")
+    color_scale.set_array([])
+    colorbar = fig.colorbar(color_scale, ax=impact_axis, pad=0.01)
+    colorbar.set_ticks([0.0, 1.0], labels=["low", "high"])
+    colorbar.set_label("Event branch value (within-branch scale)")
+    fig.suptitle(
+        "CC-inclusive MRD permutation-impact beeswarm\n"
+        "Vector colors show the mean across valid tracks",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    plot_path = output.with_suffix(".mrd_branch_importance_beeswarm.png")
+    fig.savefig(plot_path, dpi=180)
+    plt.close(fig)
+    return {
+        "mrd_branch_importance_csv": csv_path.name,
+        "mrd_branch_importance_beeswarm": plot_path.name,
+        "mrd_branch_importance": {
+            "method": (
+                "One MRD branch at a time was permuted across held-out events; "
+                "the per-event impact is the original CC-inclusive score minus "
+                "the score after permutation. This is SHAP-style permutation "
+                "impact, not an exact SHAP value."
+            ),
+            "repeats": int(repeats),
+            "ranking_metric": "mean_abs_score_impact",
+            "ranking": ranking,
+        },
+    }
+
+
+def evaluate_fv_prediction(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    output: Path,
+    threshold: float,
+) -> Dict[str, object]:
+    """Create the held-out performance suite for the true-FV output."""
+    fpr, tpr, _ = roc_curve(labels, scores)
+    roc_auc = float(auc(fpr, tpr))
+    precision, recall, _ = precision_recall_curve(labels, scores)
+    average_precision = float(average_precision_score(labels, scores))
+    brier = float(brier_score_loss(labels, scores))
+    operating_point = _operating_point(labels, scores, threshold)
+
+    fig, axis = plt.subplots(figsize=(6, 5))
+    axis.plot(fpr, tpr, label=f"ROC AUC = {roc_auc:.4f}")
+    axis.plot([0, 1], [0, 1], "--", color="gray")
+    axis.set(xlabel="Outside-FV false-positive rate", ylabel="Inside-FV efficiency")
+    axis.legend()
+    fig.tight_layout()
+    roc_path = output.with_suffix(".fv_roc_curve.png")
+    fig.savefig(roc_path, dpi=160)
+    plt.close(fig)
+
+    fig, axis = plt.subplots(figsize=(6, 5))
+    axis.plot(recall, precision, label=f"Average precision = {average_precision:.4f}")
+    axis.set(xlabel="Inside-FV efficiency", ylabel="Inside-FV purity")
+    axis.legend()
+    fig.tight_layout()
+    pr_path = output.with_suffix(".fv_precision_recall_curve.png")
+    fig.savefig(pr_path, dpi=160)
+    plt.close(fig)
+
+    fig, axis = plt.subplots(figsize=(7, 5))
+    bins = np.linspace(0.0, 1.0, 41)
+    axis.hist(
+        scores[labels == 0],
+        bins=bins,
+        density=True,
+        histtype="step",
+        label="trueFV = 0",
+    )
+    axis.hist(
+        scores[labels == 1],
+        bins=bins,
+        density=True,
+        histtype="step",
+        label="trueFV = 1",
+    )
+    axis.axvline(threshold, linestyle="--", color="black", label=f"cut = {threshold:.2f}")
+    axis.set(xlabel="FV score", ylabel="Normalized events")
+    axis.legend()
+    fig.tight_layout()
+    score_path = output.with_suffix(".fv_score_distribution.png")
+    fig.savefig(score_path, dpi=160)
+    plt.close(fig)
+
+    matrix = confusion_matrix(labels, scores >= threshold, labels=[0, 1])
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    normalized = np.divide(
+        matrix,
+        row_sums,
+        out=np.zeros_like(matrix, dtype=float),
+        where=row_sums != 0,
+    )
+    matrix_paths = []
+    for values, suffix, value_format in (
+        (matrix, ".fv_confusion_matrix.png", "d"),
+        (normalized, ".fv_confusion_matrix_normalized.png", ".3f"),
+    ):
+        fig, axis = plt.subplots(figsize=(5.5, 5))
+        image = axis.imshow(values, cmap="Greens", vmin=0)
+        fig.colorbar(image, ax=axis)
+        for row in range(2):
+            for column in range(2):
+                axis.text(
+                    column,
+                    row,
+                    format(values[row, column], value_format),
+                    ha="center",
+                    va="center",
+                )
+        axis.set_xticks([0, 1], ["outside FV", "inside FV"])
+        axis.set_yticks([0, 1], ["outside FV", "inside FV"])
+        axis.set(xlabel="Predicted", ylabel="Truth")
+        fig.tight_layout()
+        path = output.with_suffix(suffix)
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        matrix_paths.append(path.name)
+
+    scan_rows = [
+        _operating_point(labels, scores, float(scan_threshold))
+        for scan_threshold in np.linspace(0.0, 1.0, 201)
+    ]
+    scan_path = output.with_suffix(".fv_efficiency_purity.csv")
+    with scan_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(scan_rows[0]))
+        writer.writeheader()
+        writer.writerows(scan_rows)
+    fig, axis = plt.subplots(figsize=(7, 5))
+    thresholds = [row["threshold"] for row in scan_rows]
+    axis.plot(thresholds, [row["efficiency"] for row in scan_rows], label="efficiency")
+    axis.plot(thresholds, [row["purity"] for row in scan_rows], label="purity")
+    axis.plot(
+        thresholds,
+        [row["efficiency_x_purity"] for row in scan_rows],
+        label="efficiency × purity",
+    )
+    axis.axvline(threshold, linestyle="--", color="black")
+    axis.set(xlabel="FV threshold", ylabel="Metric", ylim=(0, 1.05))
+    axis.legend()
+    fig.tight_layout()
+    scan_plot_path = output.with_suffix(".fv_efficiency_purity.png")
+    fig.savefig(scan_plot_path, dpi=160)
+    plt.close(fig)
+    return {
+        "target": "trueFV != 0",
+        "roc_auc": roc_auc,
+        "average_precision": average_precision,
+        "brier_score": brier,
+        "operating_point": operating_point,
+        "roc_curve": roc_path.name,
+        "precision_recall_curve": pr_path.name,
+        "score_distribution": score_path.name,
+        "confusion_matrix": matrix_paths[0],
+        "confusion_matrix_normalized": matrix_paths[1],
+        "efficiency_purity_csv": scan_path.name,
+        "efficiency_purity_plot": scan_plot_path.name,
+    }
+
+
 def evaluate_and_plot(
     model: tf.keras.Model,
     arrays: Dict[str, np.ndarray],
@@ -678,24 +1345,25 @@ def evaluate_and_plot(
     history_path: Path,
     output: Path,
     threshold: float,
+    fv_threshold: float,
+    seed: int,
+    mrd_branch_importance_repeats: int,
 ) -> Dict[str, object]:
-    inputs = {
-        "pmt_unfolded_image": arrays["detector_images"][test_indices],
-        "event_features": arrays["scalar_features"][test_indices],
-        "mrd_track_starts": arrays["track_starts"][test_indices],
-        "mrd_track_stops": arrays["track_stops"][test_indices],
-        "mrd_track_properties": arrays["track_properties"][test_indices],
-        "mrd_track_mask": arrays["track_mask"][test_indices],
-    }
+    inputs = _model_inputs(arrays, test_indices)
     labels = arrays["labels"][test_indices].astype(np.int64)
     outputs = model.predict(inputs, batch_size=64, verbose=0)
     scores = np.asarray(outputs["ccinclusive_score"]).reshape(-1)
+    fv_labels = arrays["fv_labels"][test_indices].astype(np.int64)
+    fv_scores = np.asarray(outputs["fv_score"]).reshape(-1)
     fpr, tpr, _ = roc_curve(labels, scores)
     roc_auc = float(auc(fpr, tpr))
     precision, recall, _ = precision_recall_curve(labels, scores)
     average_precision = float(average_precision_score(labels, scores))
     brier = float(brier_score_loss(labels, scores))
     operating_point = _operating_point(labels, scores, threshold)
+    fv_evaluation = evaluate_fv_prediction(
+        fv_labels, fv_scores, output, fv_threshold
+    )
 
     fig, axis = plt.subplots(figsize=(6, 5))
     axis.plot(fpr, tpr, label=f"ROC AUC = {roc_auc:.4f}")
@@ -795,10 +1463,14 @@ def evaluate_and_plot(
                 "source_file",
                 "tree_entry",
                 "true_ccinclusive",
+                "true_fv",
                 *arrays["scalar_feature_names"],
                 "ccinclusive_score",
-                "threshold",
-                "prediction",
+                "ccinclusive_threshold",
+                "ccinclusive_prediction",
+                "fv_score",
+                "fv_threshold",
+                "fv_prediction",
             ]
         )
         scalar_values = arrays["scalar_features"][test_indices]
@@ -808,10 +1480,14 @@ def evaluate_and_plot(
                     arrays["source_paths"][event_index],
                     int(arrays["entries"][event_index]),
                     int(labels[row]),
+                    int(fv_labels[row]),
                     *scalar_values[row].astype(float),
                     float(scores[row]),
                     float(threshold),
                     int(scores[row] >= threshold),
+                    float(fv_scores[row]),
+                    float(fv_threshold),
+                    int(fv_scores[row] >= fv_threshold),
                 ]
             )
 
@@ -820,7 +1496,7 @@ def evaluate_and_plot(
         with history_path.open(newline="", encoding="utf-8") as handle:
             history_rows = list(csv.DictReader(handle))
         if history_rows:
-            fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+            fig, axes = plt.subplots(1, 3, figsize=(16, 4))
             epochs = np.arange(1, len(history_rows) + 1)
             axes[0].plot(epochs, [float(row["loss"]) for row in history_rows], label="train")
             axes[0].plot(epochs, [float(row["val_loss"]) for row in history_rows], label="validation")
@@ -835,11 +1511,58 @@ def evaluate_and_plot(
             axes[1].plot(epochs, [float(row[validation_key]) for row in history_rows], label="validation")
             axes[1].set(xlabel="Epoch", ylabel="PR AUC")
             axes[1].legend()
+            fv_metric_key = "fv_score_pr_auc"
+            fv_validation_key = f"val_{fv_metric_key}"
+            axes[2].plot(
+                epochs,
+                [float(row[fv_metric_key]) for row in history_rows],
+                label="train",
+            )
+            axes[2].plot(
+                epochs,
+                [float(row[fv_validation_key]) for row in history_rows],
+                label="validation",
+            )
+            axes[2].set(xlabel="Epoch", ylabel="FV PR AUC")
+            axes[2].legend()
             fig.tight_layout()
             history_plot_path = output.with_suffix(".training_curves.png")
             fig.savefig(history_plot_path, dpi=160)
             plt.close(fig)
             history_plot = history_plot_path.name
+
+    misclassified = plot_misclassified_events(
+        arrays,
+        test_indices,
+        labels,
+        scores,
+        fv_labels,
+        fv_scores,
+        output,
+        threshold,
+        fv_threshold,
+    )
+    gradcam_path = plot_gradcam_examples(
+        model,
+        arrays,
+        test_indices,
+        labels,
+        scores,
+        fv_labels,
+        fv_scores,
+        output,
+        threshold,
+    )
+    mrd_importance = evaluate_mrd_branch_importance(
+        model,
+        arrays,
+        test_indices,
+        labels,
+        scores,
+        output,
+        seed,
+        mrd_branch_importance_repeats,
+    )
 
     return {
         "roc_auc": roc_auc,
@@ -855,6 +1578,10 @@ def evaluate_and_plot(
         "efficiency_purity_plot": scan_plot_path.name,
         "test_predictions": predictions_path.name,
         "training_curves": history_plot,
+        "fv_prediction": fv_evaluation,
+        "gradcam_examples": gradcam_path,
+        **misclassified,
+        **mrd_importance,
     }
 
 
@@ -867,31 +1594,50 @@ def main() -> None:
     tf.random.set_seed(args.seed)
     arrays = load_data(args)
     labels = arrays["labels"]
+    fv_labels = arrays["fv_labels"]
     class_counts = np.bincount(labels.astype(np.int64), minlength=2)
+    fv_class_counts = np.bincount(fv_labels.astype(np.int64), minlength=2)
     if np.any(class_counts == 0):
         raise ValueError(
             "Both CC-inclusive target classes are required after the FV cut; "
             f"counts are {class_counts.tolist()}"
         )
+    if np.any(fv_class_counts == 0):
+        raise ValueError(
+            "Both true-FV target classes are required after the reconstructed "
+            "FV selection; counts are "
+            f"{fv_class_counts.tolist()}. Consider --no-fv-cut if the selection "
+            "removes all outside-true-FV events."
+        )
     indices = np.arange(len(labels))
+    joint_targets = labels.astype(np.int64) * 2 + fv_labels.astype(np.int64)
     train_indices, temporary_indices = train_test_split(
         indices,
         test_size=VALIDATION_FRACTION + TEST_FRACTION,
         random_state=args.seed,
-        stratify=labels,
+        stratify=joint_targets,
     )
     validation_indices, test_indices = train_test_split(
         temporary_indices,
         test_size=TEST_FRACTION / (VALIDATION_FRACTION + TEST_FRACTION),
         random_state=args.seed,
-        stratify=labels[temporary_indices],
+        stratify=joint_targets[temporary_indices],
     )
     train_counts = np.bincount(labels[train_indices].astype(np.int64), minlength=2)
+    fv_train_counts = np.bincount(
+        fv_labels[train_indices].astype(np.int64), minlength=2
+    )
     class_weights = {
-        0: len(train_indices) / (2.0 * train_counts[0]),
-        1: len(train_indices) / (2.0 * train_counts[1]),
+        "ccinclusive_score": {
+            0: len(train_indices) / (2.0 * train_counts[0]),
+            1: len(train_indices) / (2.0 * train_counts[1]),
+        },
+        "fv_score": {
+            0: len(train_indices) / (2.0 * fv_train_counts[0]),
+            1: len(train_indices) / (2.0 * fv_train_counts[1]),
+        },
     }
-    model = build_model(arrays, train_indices)
+    model = build_model(arrays, train_indices, args.fv_loss_weight)
     train_sequence = CCInclusiveSequence(
         arrays,
         train_indices,
@@ -914,13 +1660,13 @@ def main() -> None:
         epochs=args.epochs,
         callbacks=[
             tf.keras.callbacks.EarlyStopping(
-                monitor="val_pr_auc",
+                monitor="val_ccinclusive_score_pr_auc",
                 mode="max",
                 patience=12,
                 restore_best_weights=True,
             ),
             tf.keras.callbacks.ReduceLROnPlateau(
-                monitor="val_pr_auc",
+                monitor="val_ccinclusive_score_pr_auc",
                 mode="max",
                 factor=0.5,
                 patience=5,
@@ -937,7 +1683,15 @@ def main() -> None:
         print(f"  {name}: {value:.5f}")
     model.save(args.output)
     evaluation = evaluate_and_plot(
-        model, arrays, test_indices, history_path, args.output, args.threshold
+        model,
+        arrays,
+        test_indices,
+        history_path,
+        args.output,
+        args.threshold,
+        args.fv_threshold,
+        args.seed,
+        args.mrd_branch_importance_repeats,
     )
 
     responses = arrays["responses"]
@@ -945,18 +1699,32 @@ def main() -> None:
     training_response = response_modes[0] if len(response_modes) == 1 else "mixed"
     metadata_response = responses.get("tuned", responses.get("raw"))
     metadata = {
-        "model_type": "annie_ccinclusive_detector_tankcluster_cnn",
+        "model_type": "annie_ccinclusive_fv_detector_tankcluster_cnn",
         "tensorflow_version": tf.__version__,
         "tree": args.tree,
         "training_sources": [
             source for group in arrays["groups"] for source in group["sources"]
         ],
         "training_source_groups": arrays["groups"],
+        "outputs": {
+            "ccinclusive_score": {
+                "target": "trueCC == 1 && trueFSLPdg == 13",
+                "threshold": args.threshold,
+                "loss_weight": 1.0,
+            },
+            "fv_score": {
+                "target": "trueFV != 0",
+                "threshold": args.fv_threshold,
+                "loss_weight": args.fv_loss_weight,
+            },
+        },
         "target": "trueCC == 1 && trueFSLPdg == 13",
         "truth_branches": list(TRUTH_BRANCHES),
         "truth_used_as_input": False,
         "vertex_information_used_as_input": False,
         "threshold": args.threshold,
+        "fv_threshold": args.fv_threshold,
+        "fv_loss_weight": args.fv_loss_weight,
         "fv_cut_applied": not args.no_fv_cut,
         "fv_cut_branches": arrays["fv_branches"],
         "fv_cut_expression": (
@@ -1009,12 +1777,18 @@ def main() -> None:
             "training_events": int(len(train_indices)),
             "validation_events": int(len(validation_indices)),
             "testing_events": int(len(test_indices)),
-            "stratified_by_target": True,
+            "stratified_by_joint_ccinclusive_and_fv_targets": True,
             "random_seed": args.seed,
         },
         "class_counts": {
-            "background": int(class_counts[0]),
-            "ccinclusive_signal": int(class_counts[1]),
+            "ccinclusive_score": {
+                "background": int(class_counts[0]),
+                "signal": int(class_counts[1]),
+            },
+            "fv_score": {
+                "outside_fv": int(fv_class_counts[0]),
+                "inside_fv": int(fv_class_counts[1]),
+            },
         },
         "events_read": arrays["events_read"],
         "events_selected": arrays["events_selected"],
@@ -1030,8 +1804,13 @@ def main() -> None:
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(f"Saved {args.output} and {metadata_path}")
     print(
-        f"Held-out ROC AUC={evaluation['roc_auc']:.5f}; "
+        f"Held-out CC ROC AUC={evaluation['roc_auc']:.5f}; "
         f"average precision={evaluation['average_precision']:.5f}"
+    )
+    print(
+        f"Held-out FV ROC AUC={evaluation['fv_prediction']['roc_auc']:.5f}; "
+        "average precision="
+        f"{evaluation['fv_prediction']['average_precision']:.5f}"
     )
 
 
