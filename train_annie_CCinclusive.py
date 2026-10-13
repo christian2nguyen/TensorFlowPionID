@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import csv
+import gc
 import json
 import random
 from pathlib import Path
@@ -53,8 +54,19 @@ from annie_ring_images import (
 TRAIN_FRACTION = 0.70
 VALIDATION_FRACTION = 0.15
 TEST_FRACTION = 0.15
-TRUTH_BRANCHES = ("trueCC", "trueFSLPdg", "trueFV")
+CCINCLUSIVE_SIGNAL_BRANCH = "sel_nu_mu_cc"
+SUPERVISION_BRANCHES = (CCINCLUSIVE_SIGNAL_BRANCH, "trueFV")
 FV_BRANCH_ALIASES = ("simpleRecoFV", "recoFV", "sel_vertex_in_FV")
+TRAINING_SELECTION_SPECS = (
+    ("sel_clusterHist_tankcluster_branch", "==", 1),
+    ("match_found", "==", 1),
+    ("simpleRecoFlag", "==", 1),
+    ("trigword", "==", 5),
+)
+TRAINING_SELECTION_EXPRESSION = (
+    "sel_clusterHist_tankcluster_branch == true && match_found == true && "
+    "simpleRecoFlag == 1 && trigword == 5"
+)
 SELECTION_INPUT_SPECS = (
     ("sel_trigword", "trigword", 5),
     ("sel_HasTank", "HasTank", 1),
@@ -147,12 +159,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument(
-        "--mrd-branch-importance-repeats",
+        "--diagnostic-batch-size",
         type=int,
-        default=3,
+        default=32,
+        help="streaming batch size for post-training predictions (default: 32)",
+    )
+    parser.add_argument(
+        "--input-importance-repeats",
+        "--mrd-branch-importance-repeats",
+        dest="input_importance_repeats",
+        type=int,
+        default=1,
         help=(
-            "number of held-out permutations per MRD branch for the "
-            "feature-impact ranking (default: 3)"
+            "number of held-out permutations per input for the complete "
+            "CC/FV feature-impact ranking (default: 1)"
         ),
     )
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -205,8 +225,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--fv-loss-weight must be positive")
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
-    if args.mrd_branch_importance_repeats < 1:
-        parser.error("--mrd-branch-importance-repeats must be positive")
+    if args.diagnostic_batch_size < 1:
+        parser.error("--diagnostic-batch-size must be positive")
+    if args.input_importance_repeats < 1:
+        parser.error("--input-importance-repeats must be positive")
     if args.fv_branch and not args.apply_reco_fv_cut:
         parser.error("--fv-branch requires --apply-reco-fv-cut")
     return args
@@ -246,6 +268,24 @@ def _build_scalar_features(
     features = np.column_stack(columns).astype(np.float32, copy=False)
     valid &= np.isfinite(features).all(axis=1)
     return features, valid
+
+
+def _build_training_selection(arrays) -> Tuple[np.ndarray, Dict[str, int]]:
+    """Build the requested hard event-selection mask and failure counts."""
+    selected = np.ones(len(arrays), dtype=bool)
+    failed_counts = {}
+    for branch, operator, required_value in TRAINING_SELECTION_SPECS:
+        values = _to_numpy(arrays[branch])
+        if values.ndim != 1:
+            raise ValueError(f"Selection branch {branch!r} is not event-level")
+        finite = np.isfinite(values)
+        if operator == "==":
+            passed = finite & (values == required_value)
+        else:
+            passed = finite & (values != required_value)
+        failed_counts[branch] = int((~passed).sum())
+        selected &= passed
+    return selected, failed_counts
 
 
 def _build_track_stops(arrays) -> Tuple[np.ndarray, np.ndarray]:
@@ -327,6 +367,8 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
     total_selected = 0
     total_misaligned = 0
     total_invalid_features = 0
+    total_training_cut_rejected = 0
+    training_cut_failed_counts = Counter()
     total_outside_fv = 0
     total_mrd_overflow = 0
     chain_entry_offset = 0
@@ -353,13 +395,14 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                     args.hitid_branch,
                     tank_branch,
                     args.tankcluster_id_branch,
+                    *(branch for branch, _, _ in TRAINING_SELECTION_SPECS),
                     *(branch for _, branch, _ in SELECTION_INPUT_SPECS),
                     args.prompt_pe_branch,
                     "numMRDTracks",
                     *MRD_TRACK_START_BRANCHES,
                     *MRD_TRACK_STOP_BRANCHES,
                     *MRD_TRACK_PROPERTY_BRANCHES,
-                    *TRUTH_BRANCHES,
+                    *SUPERVISION_BRANCHES,
                 ]
                 if fv_branch:
                     requested.append(fv_branch)
@@ -405,9 +448,12 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                     scalar_features, valid_scalars = _build_scalar_features(
                         arrays, args.prompt_pe_branch, mrd_count_features
                     )
+                    training_selection, cut_failed_counts = (
+                        _build_training_selection(arrays)
+                    )
                     aligned = detector_aligned
                     valid_features = valid_mrd & valid_stops & valid_scalars
-                    selected = aligned & valid_features
+                    selected = aligned & valid_features & training_selection
                     outside_fv = np.zeros(n_entries, dtype=bool)
                     if fv_branch:
                         fv_values = _to_numpy(arrays[fv_branch])
@@ -415,18 +461,15 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                         inside_fv = valid_fv & (fv_values != 0)
                         outside_fv = valid_fv & ~inside_fv
                         selected &= inside_fv
-                    true_cc = _to_numpy(arrays["trueCC"])
-                    true_fs_lepton = _to_numpy(arrays["trueFSLPdg"])
+                    ccinclusive_signal = _to_numpy(
+                        arrays[CCINCLUSIVE_SIGNAL_BRANCH]
+                    )
                     true_fv = _to_numpy(arrays["trueFV"])
                     valid_truth = (
-                        np.isfinite(true_cc)
-                        & np.isfinite(true_fs_lepton)
-                        & np.isfinite(true_fv)
+                        np.isfinite(ccinclusive_signal) & np.isfinite(true_fv)
                     )
                     selected &= valid_truth
-                    labels = ((true_cc == 1) & (true_fs_lepton == 13)).astype(
-                        np.float32
-                    )
+                    labels = (ccinclusive_signal == 1).astype(np.float32)
                     fv_labels = (true_fv != 0).astype(np.float32)
 
                     detector_chunks.append(
@@ -451,6 +494,8 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                     group_selected += selected_count
                     total_misaligned += int((~aligned).sum())
                     total_invalid_features += int((~valid_features).sum())
+                    total_training_cut_rejected += int((~training_selection).sum())
+                    training_cut_failed_counts.update(cut_failed_counts)
                     total_outside_fv += int(outside_fv.sum())
                     total_mrd_overflow += int((selected & mrd_overflow).sum())
                     print(
@@ -470,8 +515,18 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
             }
         )
     print()
+    print(f"Training selection: {TRAINING_SELECTION_EXPRESSION}")
+    print(
+        f"Rejected by at least one training cut: "
+        f"{total_training_cut_rejected} / {total_read}"
+    )
+    for branch, failed_count in training_cut_failed_counts.items():
+        print(f"  failed {branch}: {failed_count}")
     if total_selected == 0:
-        raise ValueError("No events passed image, feature, and FV requirements")
+        raise ValueError(
+            "No events passed the requested event selection, image, feature, "
+            "supervision-label, and optional FV requirements"
+        )
 
     detector_images = np.concatenate(detector_chunks)
     detector_chunks.clear()
@@ -500,6 +555,8 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
         "events_selected": total_selected,
         "misaligned_events": total_misaligned,
         "invalid_feature_events": total_invalid_features,
+        "training_cut_rejected_events": total_training_cut_rejected,
+        "training_cut_failed_counts": dict(training_cut_failed_counts),
         "outside_fv_events": total_outside_fv,
         "mrd_overflow_events": total_mrd_overflow,
     }
@@ -786,6 +843,43 @@ def _model_inputs(
     }
 
 
+def _predict_scores_in_batches(
+    model: tf.keras.Model,
+    arrays: Dict[str, np.ndarray],
+    indices: np.ndarray,
+    batch_size: int,
+    override_input: Optional[str] = None,
+    override_column: Optional[int] = None,
+    override_values: Optional[np.ndarray] = None,
+    override_source_indices: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Predict without materializing the complete held-out image tensor."""
+    cc_scores = np.empty(len(indices), dtype=np.float32)
+    fv_scores = np.empty(len(indices), dtype=np.float32)
+    for start in range(0, len(indices), batch_size):
+        stop = min(start + batch_size, len(indices))
+        batch_indices = indices[start:stop]
+        inputs = _model_inputs(arrays, batch_indices)
+        if override_input is not None:
+            changed = np.array(inputs[override_input], copy=True)
+            if override_input == "pmt_unfolded_image":
+                source_indices = override_source_indices[start:stop]
+                changed[:, :, :, override_column] = arrays["detector_images"][
+                    source_indices, :, :, override_column
+                ]
+            elif override_input == "event_features":
+                changed[:, override_column] = override_values[start:stop]
+            else:
+                changed[:, :, override_column] = override_values[start:stop]
+            inputs[override_input] = changed
+        outputs = model(inputs, training=False)
+        cc_scores[start:stop] = np.asarray(
+            outputs["ccinclusive_score"]
+        ).reshape(-1)
+        fv_scores[start:stop] = np.asarray(outputs["fv_score"]).reshape(-1)
+    return cc_scores, fv_scores
+
+
 def _format_event_details(arrays: Dict[str, np.ndarray], event_index: int) -> str:
     scalar_values = arrays["scalar_features"][event_index]
     scalar_parts = [
@@ -882,7 +976,7 @@ def plot_misclassified_events(
             image = arrays["detector_images"][event_index, :, :, 1]
             axes[row, 0].imshow(image, origin="lower", aspect="equal", cmap="magma")
             axes[row, 0].set_title(
-                f"{category}: truth={int(labels[local_index])}, "
+                f"{category}: signal={int(labels[local_index])}, "
                 f"CC score={scores[local_index]:.3f}, "
                 f"trueFV={int(fv_labels[local_index])}, "
                 f"FV score={fv_scores[local_index]:.3f}",
@@ -954,7 +1048,7 @@ def plot_misclassified_events(
                 0.0,
                 1.0,
                 (
-                    f"{category} | truth={int(labels[local_index])} | "
+                    f"{category} | signal={int(labels[local_index])} | "
                     f"CC score={scores[local_index]:.5f} | CC threshold={threshold:.3f}\n"
                     f"FV score={fv_scores[local_index]:.5f} | "
                     f"FV threshold={fv_threshold:.3f} | "
@@ -1058,7 +1152,7 @@ def plot_gradcam_examples(
             full_visible, origin="lower", aspect="equal", cmap="magma"
         )
         axes[row, 0].set_title(
-            f"{title}: truth={int(labels[local_index])}, "
+            f"{title}: signal={int(labels[local_index])}, "
             f"CC score={scores[local_index]:.3f}, "
             f"trueFV={int(fv_labels[local_index])}, "
             f"FV score={fv_scores[local_index]:.3f}",
@@ -1128,167 +1222,274 @@ def _permute_valid_track_values(
     return shuffled
 
 
-def evaluate_mrd_branch_importance(
+def _image_channel_event_sums(
+    arrays: Dict[str, np.ndarray],
+    indices: np.ndarray,
+    channel: int,
+    batch_size: int,
+) -> np.ndarray:
+    sums = np.empty(len(indices), dtype=np.float64)
+    for start in range(0, len(indices), batch_size):
+        stop = min(start + batch_size, len(indices))
+        batch = arrays["detector_images"][indices[start:stop], :, :, channel]
+        sums[start:stop] = np.sum(batch, axis=(1, 2), dtype=np.float64)
+    return sums
+
+
+def evaluate_input_importance(
     model: tf.keras.Model,
     arrays: Dict[str, np.ndarray],
     test_indices: np.ndarray,
-    labels: np.ndarray,
-    full_scores: np.ndarray,
+    cc_labels: np.ndarray,
+    fv_labels: np.ndarray,
+    full_cc_scores: np.ndarray,
+    full_fv_scores: np.ndarray,
     output: Path,
     seed: int,
     repeats: int,
+    batch_size: int,
 ) -> Dict[str, object]:
-    """Rank individual MRD branches using held-out permutation impacts."""
-    inputs = _model_inputs(arrays, test_indices)
+    """Rank every inference input for both outputs using held-out permutations."""
     scalar_names = list(arrays["scalar_feature_names"])
     branch_specs = [
-        ("numMRDTracks", "event_features", scalar_names.index("numMRDTracks")),
-        *[(name, "mrd_track_starts", column) for column, name in enumerate(MRD_TRACK_START_BRANCHES)],
-        *[(name, "mrd_track_stops", column) for column, name in enumerate(MRD_TRACK_STOP_BRANCHES)],
-        *[(name, "mrd_track_properties", column) for column, name in enumerate(MRD_TRACK_PROPERTY_BRANCHES)],
+        ("image: hitPE", "pmt_unfolded_image", 0),
+        ("image: hitPE_tankcluster", "pmt_unfolded_image", 1),
+        *[
+            (name, "event_features", column)
+            for column, name in enumerate(scalar_names)
+        ],
+        *[
+            (name, "mrd_track_starts", column)
+            for column, name in enumerate(MRD_TRACK_START_BRANCHES)
+        ],
+        *[
+            (name, "mrd_track_stops", column)
+            for column, name in enumerate(MRD_TRACK_STOP_BRANCHES)
+        ],
+        *[
+            (name, "mrd_track_properties", column)
+            for column, name in enumerate(MRD_TRACK_PROPERTY_BRANCHES)
+        ],
     ]
-    full_fpr, full_tpr, _ = roc_curve(labels, full_scores)
-    full_roc_auc = float(auc(full_fpr, full_tpr))
-    full_average_precision = float(average_precision_score(labels, full_scores))
+    cc_fpr, cc_tpr, _ = roc_curve(cc_labels, full_cc_scores)
+    fv_fpr, fv_tpr, _ = roc_curve(fv_labels, full_fv_scores)
+    full_cc_roc_auc = float(auc(cc_fpr, cc_tpr))
+    full_fv_roc_auc = float(auc(fv_fpr, fv_tpr))
+    full_cc_ap = float(average_precision_score(cc_labels, full_cc_scores))
+    full_fv_ap = float(average_precision_score(fv_labels, full_fv_scores))
     rng = np.random.default_rng(seed + 130363)
     results = []
-    impacts_by_branch = {}
+    cc_impacts_by_branch = {}
+    fv_impacts_by_branch = {}
     values_by_branch = {}
-    mask = inputs["mrd_track_mask"]
+    mask = arrays["track_mask"][test_indices]
     for branch_name, input_name, column in branch_specs:
-        repeat_impacts = []
-        repeat_roc_auc = []
-        repeat_average_precision = []
+        cc_repeat_impacts = []
+        fv_repeat_impacts = []
+        cc_repeat_roc_auc = []
+        fv_repeat_roc_auc = []
+        cc_repeat_ap = []
+        fv_repeat_ap = []
         for _ in range(repeats):
-            permuted_inputs = dict(inputs)
-            changed = np.array(inputs[input_name], copy=True)
-            if input_name == "event_features":
-                changed[:, column] = changed[rng.permutation(len(changed)), column]
+            predict_kwargs = {}
+            if input_name == "pmt_unfolded_image":
+                source_positions = rng.permutation(len(test_indices))
+                predict_kwargs["override_source_indices"] = test_indices[
+                    source_positions
+                ]
+            elif input_name == "event_features":
+                original_values = arrays["scalar_features"][test_indices, column]
+                changed_values = original_values[rng.permutation(len(original_values))]
+                predict_kwargs["override_values"] = changed_values
             else:
-                changed[:, :, column] = _permute_valid_track_values(
-                    inputs[input_name][:, :, column], mask, rng
+                original_values = arrays[input_name][test_indices, :, column]
+                changed_values = _permute_valid_track_values(
+                    original_values, mask, rng
                 )
-            permuted_inputs[input_name] = changed
-            outputs = model.predict(permuted_inputs, batch_size=64, verbose=0)
-            permuted_scores = np.asarray(outputs["ccinclusive_score"]).reshape(-1)
-            repeat_impacts.append(full_scores - permuted_scores)
-            fpr, tpr, _ = roc_curve(labels, permuted_scores)
-            repeat_roc_auc.append(float(auc(fpr, tpr)))
-            repeat_average_precision.append(
-                float(average_precision_score(labels, permuted_scores))
+                predict_kwargs["override_values"] = changed_values
+            permuted_cc_scores, permuted_fv_scores = _predict_scores_in_batches(
+                model,
+                arrays,
+                test_indices,
+                batch_size,
+                override_input=input_name,
+                override_column=column,
+                **predict_kwargs,
             )
-        event_impacts = np.mean(np.stack(repeat_impacts), axis=0)
-        impacts_by_branch[branch_name] = event_impacts
-        if input_name == "event_features":
-            display_values = inputs[input_name][:, column].astype(np.float64)
+            cc_repeat_impacts.append(full_cc_scores - permuted_cc_scores)
+            fv_repeat_impacts.append(full_fv_scores - permuted_fv_scores)
+            cc_fpr, cc_tpr, _ = roc_curve(cc_labels, permuted_cc_scores)
+            fv_fpr, fv_tpr, _ = roc_curve(fv_labels, permuted_fv_scores)
+            cc_repeat_roc_auc.append(float(auc(cc_fpr, cc_tpr)))
+            fv_repeat_roc_auc.append(float(auc(fv_fpr, fv_tpr)))
+            cc_repeat_ap.append(
+                float(average_precision_score(cc_labels, permuted_cc_scores))
+            )
+            fv_repeat_ap.append(
+                float(average_precision_score(fv_labels, permuted_fv_scores))
+            )
+        cc_event_impacts = np.mean(np.stack(cc_repeat_impacts), axis=0)
+        fv_event_impacts = np.mean(np.stack(fv_repeat_impacts), axis=0)
+        cc_impacts_by_branch[branch_name] = cc_event_impacts
+        fv_impacts_by_branch[branch_name] = fv_event_impacts
+        if input_name == "pmt_unfolded_image":
+            display_values = _image_channel_event_sums(
+                arrays, test_indices, column, batch_size
+            )
+        elif input_name == "event_features":
+            display_values = arrays["scalar_features"][
+                test_indices, column
+            ].astype(np.float64)
         else:
-            display_values = _masked_event_mean(inputs[input_name][:, :, column], mask)
+            display_values = _masked_event_mean(
+                arrays[input_name][test_indices, :, column], mask
+            )
         values_by_branch[branch_name] = display_values
         results.append(
             {
                 "branch": branch_name,
-                "mean_abs_score_impact": float(np.mean(np.abs(event_impacts))),
-                "mean_signed_score_impact": float(np.mean(event_impacts)),
-                "roc_auc_drop": full_roc_auc - float(np.mean(repeat_roc_auc)),
-                "roc_auc_drop_std": float(np.std(repeat_roc_auc)),
-                "average_precision_drop": full_average_precision
-                - float(np.mean(repeat_average_precision)),
-                "average_precision_drop_std": float(np.std(repeat_average_precision)),
+                "input_group": input_name,
+                "cc_mean_abs_score_impact": float(
+                    np.mean(np.abs(cc_event_impacts))
+                ),
+                "cc_mean_signed_score_impact": float(np.mean(cc_event_impacts)),
+                "cc_roc_auc_drop": full_cc_roc_auc
+                - float(np.mean(cc_repeat_roc_auc)),
+                "cc_roc_auc_drop_std": float(np.std(cc_repeat_roc_auc)),
+                "cc_average_precision_drop": full_cc_ap
+                - float(np.mean(cc_repeat_ap)),
+                "cc_average_precision_drop_std": float(np.std(cc_repeat_ap)),
+                "fv_mean_abs_score_impact": float(
+                    np.mean(np.abs(fv_event_impacts))
+                ),
+                "fv_mean_signed_score_impact": float(np.mean(fv_event_impacts)),
+                "fv_roc_auc_drop": full_fv_roc_auc
+                - float(np.mean(fv_repeat_roc_auc)),
+                "fv_roc_auc_drop_std": float(np.std(fv_repeat_roc_auc)),
+                "fv_average_precision_drop": full_fv_ap
+                - float(np.mean(fv_repeat_ap)),
+                "fv_average_precision_drop_std": float(np.std(fv_repeat_ap)),
             }
         )
-    ranking = [
-        {"rank": rank, **row}
-        for rank, row in enumerate(
-            sorted(results, key=lambda row: row["mean_abs_score_impact"], reverse=True),
-            start=1,
-        )
-    ]
-    csv_path = output.with_suffix(".mrd_branch_importance.csv")
+    cc_order = sorted(
+        results, key=lambda row: row["cc_mean_abs_score_impact"], reverse=True
+    )
+    fv_order = sorted(
+        results, key=lambda row: row["fv_mean_abs_score_impact"], reverse=True
+    )
+    cc_ranks = {row["branch"]: rank for rank, row in enumerate(cc_order, start=1)}
+    fv_ranks = {row["branch"]: rank for rank, row in enumerate(fv_order, start=1)}
+    for row in results:
+        row["cc_rank"] = cc_ranks[row["branch"]]
+        row["fv_rank"] = fv_ranks[row["branch"]]
+    csv_rows = sorted(results, key=lambda row: row["cc_rank"])
+    csv_path = output.with_suffix(".input_importance.csv")
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(ranking[0]))
+        writer = csv.DictWriter(handle, fieldnames=list(csv_rows[0]))
         writer.writeheader()
-        writer.writerows(ranking)
+        writer.writerows(csv_rows)
 
     plot_rng = np.random.default_rng(seed + 155921)
-    fig, (impact_axis, rank_axis) = plt.subplots(
-        1,
+    fig, axes = plt.subplots(
         2,
-        figsize=(15, 7),
+        2,
+        figsize=(16, 16),
         gridspec_kw={"width_ratios": [2.3, 1.0]},
-        sharey=True,
+        sharey="row",
     )
-    y_positions = np.arange(len(ranking))
-    for y_position, row in zip(y_positions, ranking):
-        branch = str(row["branch"])
-        impacts = impacts_by_branch[branch]
-        values = values_by_branch[branch]
-        chosen = np.arange(len(impacts))
-        if len(chosen) > 2000:
-            chosen = plot_rng.choice(chosen, size=2000, replace=False)
-        plot_values = values[chosen]
-        finite = plot_values[np.isfinite(plot_values)]
-        if len(finite):
-            low, high = np.nanpercentile(finite, [5.0, 95.0])
-            scale = high - low
-            colors = (
-                np.clip((plot_values - low) / scale, 0.0, 1.0)
-                if scale > 0.0
-                else np.full(len(plot_values), 0.5)
+    head_specs = (
+        (
+            "CC-inclusive",
+            cc_order,
+            cc_impacts_by_branch,
+            "cc_mean_abs_score_impact",
+        ),
+        ("FV", fv_order, fv_impacts_by_branch, "fv_mean_abs_score_impact"),
+    )
+    for plot_row, (head_name, ranking, impact_map, metric_name) in enumerate(
+        head_specs
+    ):
+        impact_axis, rank_axis = axes[plot_row]
+        y_positions = np.arange(len(ranking))
+        for y_position, result in zip(y_positions, ranking):
+            branch = str(result["branch"])
+            impacts = impact_map[branch]
+            values = values_by_branch[branch]
+            chosen = np.arange(len(impacts))
+            if len(chosen) > 2000:
+                chosen = plot_rng.choice(chosen, size=2000, replace=False)
+            plot_values = values[chosen]
+            finite = plot_values[np.isfinite(plot_values)]
+            if len(finite):
+                low, high = np.nanpercentile(finite, [5.0, 95.0])
+                scale = high - low
+                colors = (
+                    np.clip((plot_values - low) / scale, 0.0, 1.0)
+                    if scale > 0.0
+                    else np.full(len(plot_values), 0.5)
+                )
+                colors = np.where(np.isfinite(colors), colors, 0.5)
+            else:
+                colors = np.full(len(plot_values), 0.5)
+            impact_axis.scatter(
+                impacts[chosen],
+                y_position + plot_rng.normal(0.0, 0.10, len(chosen)),
+                c=colors,
+                cmap="coolwarm",
+                vmin=0.0,
+                vmax=1.0,
+                s=9,
+                alpha=0.5,
+                linewidths=0,
             )
-            colors = np.where(np.isfinite(colors), colors, 0.5)
-        else:
-            colors = np.full(len(plot_values), 0.5)
-        impact_axis.scatter(
-            impacts[chosen],
-            y_position + plot_rng.normal(0.0, 0.10, len(chosen)),
-            c=colors,
-            cmap="coolwarm",
-            vmin=0.0,
-            vmax=1.0,
-            s=10,
-            alpha=0.55,
-            linewidths=0,
+        impact_axis.axvline(0.0, color="black", linewidth=1)
+        impact_axis.set_yticks(
+            y_positions, [str(result["branch"]) for result in ranking]
         )
-    impact_axis.axvline(0.0, color="black", linewidth=1)
-    impact_axis.set_yticks(y_positions, [str(row["branch"]) for row in ranking])
-    impact_axis.invert_yaxis()
-    impact_axis.set_xlabel("Original CC-inclusive score − score after permutation")
-    impact_axis.set_title("Held-out event impacts")
-    rank_axis.barh(
-        y_positions,
-        [row["mean_abs_score_impact"] for row in ranking],
-        color="tab:blue",
-        alpha=0.8,
-    )
-    rank_axis.set_xlabel("Mean |score impact|")
-    rank_axis.set_title("Global ranking")
-    color_scale = plt.cm.ScalarMappable(cmap="coolwarm")
-    color_scale.set_array([])
-    colorbar = fig.colorbar(color_scale, ax=impact_axis, pad=0.01)
-    colorbar.set_ticks([0.0, 1.0], labels=["low", "high"])
-    colorbar.set_label("Event branch value (within-branch scale)")
+        impact_axis.invert_yaxis()
+        impact_axis.set_xlabel(
+            f"Original {head_name} score − score after permutation"
+        )
+        impact_axis.set_title(f"{head_name}: held-out event impacts")
+        rank_axis.barh(
+            y_positions,
+            [result[metric_name] for result in ranking],
+            color="tab:blue" if plot_row == 0 else "tab:green",
+            alpha=0.8,
+        )
+        rank_axis.set_xlabel("Mean |score impact|")
+        rank_axis.set_title(f"{head_name}: global ranking")
+        color_scale = plt.cm.ScalarMappable(cmap="coolwarm")
+        color_scale.set_array([])
+        colorbar = fig.colorbar(color_scale, ax=impact_axis, pad=0.01)
+        colorbar.set_ticks([0.0, 1.0], labels=["low", "high"])
+        colorbar.set_label("Event input value (within-input scale)")
     fig.suptitle(
-        "CC-inclusive MRD permutation-impact beeswarm\n"
-        "Vector colors show the mean across valid tracks",
+        "Complete held-out permutation importance\n"
+        "Image colors use channel sum; vector colors use valid-track mean",
         fontsize=12,
     )
     fig.tight_layout()
-    plot_path = output.with_suffix(".mrd_branch_importance_beeswarm.png")
+    plot_path = output.with_suffix(".input_importance_beeswarm.png")
     fig.savefig(plot_path, dpi=180)
     plt.close(fig)
     return {
-        "mrd_branch_importance_csv": csv_path.name,
-        "mrd_branch_importance_beeswarm": plot_path.name,
-        "mrd_branch_importance": {
+        "input_importance_csv": csv_path.name,
+        "input_importance_beeswarm": plot_path.name,
+        "input_importance": {
             "method": (
-                "One MRD branch at a time was permuted across held-out events; "
-                "the per-event impact is the original CC-inclusive score minus "
-                "the score after permutation. This is SHAP-style permutation "
-                "impact, not an exact SHAP value."
+                "One inference input at a time was permuted across held-out "
+                "events. Image channels were permuted as complete detector "
+                "maps. Per-event impact is the original score minus the score "
+                "after permutation. This is SHAP-style permutation impact, "
+                "not an exact SHAP value."
             ),
             "repeats": int(repeats),
-            "ranking_metric": "mean_abs_score_impact",
-            "ranking": ranking,
+            "cc_ranking_metric": "cc_mean_abs_score_impact",
+            "fv_ranking_metric": "fv_mean_abs_score_impact",
+            "cc_ranking": [row["branch"] for row in cc_order],
+            "fv_ranking": [row["branch"] for row in fv_order],
+            "rows": csv_rows,
         },
     }
 
@@ -1434,14 +1635,14 @@ def evaluate_and_plot(
     threshold: float,
     fv_threshold: float,
     seed: int,
-    mrd_branch_importance_repeats: int,
+    input_importance_repeats: int,
+    batch_size: int,
 ) -> Dict[str, object]:
-    inputs = _model_inputs(arrays, test_indices)
     labels = arrays["labels"][test_indices].astype(np.int64)
-    outputs = model.predict(inputs, batch_size=64, verbose=0)
-    scores = np.asarray(outputs["ccinclusive_score"]).reshape(-1)
+    scores, fv_scores = _predict_scores_in_batches(
+        model, arrays, test_indices, batch_size
+    )
     fv_labels = arrays["fv_labels"][test_indices].astype(np.int64)
-    fv_scores = np.asarray(outputs["fv_score"]).reshape(-1)
     fpr, tpr, _ = roc_curve(labels, scores)
     roc_auc = float(auc(fpr, tpr))
     precision, recall, _ = precision_recall_curve(labels, scores)
@@ -1549,7 +1750,7 @@ def evaluate_and_plot(
             [
                 "source_file",
                 "tree_entry",
-                "true_ccinclusive",
+                "ccinclusive_signal",
                 "true_fv",
                 *arrays["scalar_feature_names"],
                 "ccinclusive_score",
@@ -1640,15 +1841,18 @@ def evaluate_and_plot(
         output,
         threshold,
     )
-    mrd_importance = evaluate_mrd_branch_importance(
+    input_importance = evaluate_input_importance(
         model,
         arrays,
         test_indices,
         labels,
+        fv_labels,
         scores,
+        fv_scores,
         output,
         seed,
-        mrd_branch_importance_repeats,
+        input_importance_repeats,
+        batch_size,
     )
 
     return {
@@ -1668,7 +1872,7 @@ def evaluate_and_plot(
         "fv_prediction": fv_evaluation,
         "gradcam_examples": gradcam_path,
         **misclassified,
-        **mrd_importance,
+        **input_importance,
     }
 
 
@@ -1686,7 +1890,7 @@ def main() -> None:
     fv_class_counts = np.bincount(fv_labels.astype(np.int64), minlength=2)
     if np.any(class_counts == 0):
         raise ValueError(
-            "Both CC-inclusive target classes are required after the FV cut; "
+            "Both sel_nu_mu_cc target classes are required after selection; "
             f"counts are {class_counts.tolist()}"
         )
     if np.any(fv_class_counts == 0):
@@ -1769,6 +1973,8 @@ def main() -> None:
     for name, value in test_metrics.items():
         print(f"  {name}: {value:.5f}")
     model.save(args.output)
+    del train_sequence, validation_sequence, test_sequence
+    gc.collect()
     evaluation = evaluate_and_plot(
         model,
         arrays,
@@ -1778,7 +1984,8 @@ def main() -> None:
         args.threshold,
         args.fv_threshold,
         args.seed,
-        args.mrd_branch_importance_repeats,
+        args.input_importance_repeats,
+        args.diagnostic_batch_size,
     )
 
     responses = arrays["responses"]
@@ -1795,7 +2002,7 @@ def main() -> None:
         "training_source_groups": arrays["groups"],
         "outputs": {
             "ccinclusive_score": {
-                "target": "trueCC == 1 && trueFSLPdg == 13",
+                "target": "sel_nu_mu_cc == true",
                 "threshold": args.threshold,
                 "loss_weight": 1.0,
             },
@@ -1805,8 +2012,11 @@ def main() -> None:
                 "loss_weight": args.fv_loss_weight,
             },
         },
-        "target": "trueCC == 1 && trueFSLPdg == 13",
-        "truth_branches": list(TRUTH_BRANCHES),
+        "target": "sel_nu_mu_cc == true",
+        "ccinclusive_signal_branch": CCINCLUSIVE_SIGNAL_BRANCH,
+        "supervision_branches": list(SUPERVISION_BRANCHES),
+        "truth_branches": ["trueFV"],
+        "supervision_used_as_input": False,
         "truth_used_as_input": False,
         "vertex_information_used_as_input": False,
         "threshold": args.threshold,
@@ -1845,7 +2055,16 @@ def main() -> None:
             for name, branch, required_value in SELECTION_INPUT_SPECS
         },
         "prompt_pe_branch": args.prompt_pe_branch,
-        "selection_flags_are_inputs_not_cuts": True,
+        "training_selection_expression": TRAINING_SELECTION_EXPRESSION,
+        "training_selection_branches": [
+            branch for branch, _, _ in TRAINING_SELECTION_SPECS
+        ],
+        "selection_flags_are_inputs_not_cuts": False,
+        "selection_input_notes": {
+            "sel_trigword": "also a hard cut; constant 1 after selection",
+            "sel_simpleRecoFlag": "also a hard cut; constant 1 after selection",
+            "other_selection_flags": "model inputs, not hard cuts",
+        },
         "mrd_track_start_branches": MRD_TRACK_START_BRANCHES,
         "mrd_track_stop_branches": list(MRD_TRACK_STOP_BRANCHES),
         "mrd_track_property_branches": MRD_TRACK_PROPERTY_BRANCHES,
@@ -1862,6 +2081,7 @@ def main() -> None:
         "pmt_response_payload_format": metadata_response.payload_format,
         "pmt_tune_variant": metadata_response.tune_variant,
         "batch_size": args.batch_size,
+        "diagnostic_batch_size": args.diagnostic_batch_size,
         "root_chunk_size": args.chunk_size,
         "data_split": {
             "training_fraction": TRAIN_FRACTION,
@@ -1888,6 +2108,10 @@ def main() -> None:
         "outside_fv_events_rejected": arrays["outside_fv_events"],
         "misaligned_events_rejected": arrays["misaligned_events"],
         "invalid_feature_events_rejected": arrays["invalid_feature_events"],
+        "training_cut_events_rejected": arrays[
+            "training_cut_rejected_events"
+        ],
+        "training_cut_failed_counts": arrays["training_cut_failed_counts"],
         "mrd_track_overflow_events": arrays["mrd_overflow_events"],
         "test_metrics": {name: float(value) for name, value in test_metrics.items()},
         "evaluation": evaluation,

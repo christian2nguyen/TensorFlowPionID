@@ -828,16 +828,16 @@ example particle direction and vertex) or manually labeled images.
 pion model unchanged and learns
 
 ```text
-ccinclusive_score target = (trueCC == 1) && (trueFSLPdg == 13)
+ccinclusive_score target = sel_nu_mu_cc == true
 fv_score target          = trueFV
 ```
 
-The three truth branches provide supervision only. They are not inference
-inputs. Both outputs share the same image, scalar, and MRD feature extractor,
-then use separate dense output branches. `--threshold` sets the CC-inclusive
-decision threshold; `--fv-threshold` independently sets the FV threshold.
-`--fv-loss-weight` controls the FV head's contribution to the total training
-loss and defaults to 1.0.
+`sel_nu_mu_cc` and `trueFV` provide supervision only; neither is an inference
+input. The outputs use separate image towers and separate dense output branches,
+while both also receive the scalar and MRD inputs. `--threshold` sets the
+CC-inclusive decision threshold; `--fv-threshold` independently sets the FV
+threshold. `--fv-loss-weight` controls the FV head's contribution to the total
+training loss and defaults to 1.0.
 
 The PMT input is a two-channel unfolded detector map. Channel 1 is built from
 full-event `hitPE`, and channel 2 is built from `hitPE_tankcluster` (or
@@ -854,18 +854,31 @@ The model also receives a padded set of up to four MRD tracks. Each track has
 and `MRDTrackAngle`; `mrd_track_mask` distinguishes real tracks from padding.
 It also receives these scalar features:
 
-- `trigword == 5`
+- `trigword == 5` (also required by the hard training selection)
 - `HasTank == 1`
 - `HasMRD == 1`
 - `TankMRDCoinc == 1`
 - `NoVeto == 1`
-- `simpleRecoFlag == 1`
+- `simpleRecoFlag == 1` (also required by the hard training selection)
 - `promptMuonTotalPE_filtered`
 - `numMRDTracks`
 
-The six Boolean expressions are inputs, not hard cuts. The trainer intentionally
-uses the full valid event sample so `fv_score` can learn from both `trueFV = 0`
-and `trueFV = 1`. If a restricted study is needed later,
+The trainer applies this hard event selection before splitting the sample:
+
+```text
+sel_clusterHist_tankcluster_branch == true
+&& match_found == true
+&& simpleRecoFlag == 1
+&& trigword == 5
+```
+
+Consequently, the `sel_trigword` and `sel_simpleRecoFlag` scalar inputs are
+constant at 1 in the selected sample; they are retained for input-schema
+compatibility. The other four Boolean scalar expressions are model inputs, not
+hard cuts. `sel_nu_mu_cc` is the CC-inclusive target and is deliberately not a
+cut, so both signal and background remain available. The trainer also retains
+both `trueFV = 0` and `trueFV = 1` events for the FV head. If a restricted study
+is needed later,
 `--apply-reco-fv-cut` enables a reconstructed-FV selection and auto-detects
 `simpleRecoFV`, `recoFV`, or `sel_vertex_in_FV` in that order. Combine it with
 `--fv-branch BRANCH_NAME` to select a specific reconstructed flag. This opt-in
@@ -907,15 +920,22 @@ produces these held-out diagnostic outputs:
   most confident mistakes, with source entry, scalar inputs, and MRD tracks.
 - `annie_CCinclusive.misclassified_events.pdf` contains up to 20 annotated
   false-positive and false-negative detector images in one PDF.
-- `annie_CCinclusive.mrd_branch_importance_beeswarm.png` ranks
-  `numMRDTracks`, MRD start and stop coordinates, energy loss, length, and
-  angle using held-out one-branch-at-a-time permutation impacts.
-- `annie_CCinclusive.mrd_branch_importance.csv` records the score impact and
-  the ROC-AUC and average-precision decreases for each MRD branch.
+- `annie_CCinclusive.input_importance_beeswarm.png` gives separate CC and FV
+  rankings for every model input: both image channels, all selection-flag
+  inputs, filtered prompt PE, `numMRDTracks`, MRD start and stop coordinates,
+  energy loss, length, and angle.
+- `annie_CCinclusive.input_importance.csv` records separate CC and FV ranks,
+  score impacts, ROC-AUC decreases, and average-precision decreases for every
+  input.
 
-Use `--mrd-branch-importance-repeats N` to change the number of permutations
-per MRD branch; the default is 3. More repeats reduce random variation but add
-inference time after training. The saved model can also be passed to
+Use `--input-importance-repeats N` to change the number of permutations per
+input; the default is 1 because a complete pass covers 19 inputs for both
+outputs. The older `--mrd-branch-importance-repeats` spelling remains an alias.
+More repeats reduce random variation but add inference time after training.
+Test prediction and permutation diagnostics are streamed in batches rather than
+copying the full test-image tensor. The default diagnostic batch size is 32;
+lower it with `--diagnostic-batch-size 16` on a memory-constrained node. The
+saved model can also be passed to
 `export_annie_ring_saved_model.py`; its exported output is named
 `ccinclusive_score` alongside `fv_score`.
 
