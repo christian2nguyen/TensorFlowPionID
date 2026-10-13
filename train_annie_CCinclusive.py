@@ -112,15 +112,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fv-branch",
         help=(
-            "reconstructed FV branch; by default auto-detect simpleRecoFV, "
-            "recoFV, or sel_vertex_in_FV"
+            "reconstructed FV branch used only with --apply-reco-fv-cut; "
+            "otherwise no reconstructed FV branch is read"
         ),
     )
-    parser.add_argument(
-        "--no-fv-cut",
+    fv_cut_group = parser.add_mutually_exclusive_group()
+    fv_cut_group.add_argument(
+        "--apply-reco-fv-cut",
         action="store_true",
-        help="disable the default reconstructed fiducial-volume requirement",
+        help=(
+            "optionally require a nonzero reconstructed FV flag; disabled by "
+            "default so the FV head sees both target classes"
+        ),
     )
+    fv_cut_group.add_argument(
+        "--no-fv-cut",
+        dest="apply_reco_fv_cut",
+        action="store_false",
+        help="explicit compatibility spelling for the default no-FV-cut behavior",
+    )
+    parser.set_defaults(apply_reco_fv_cut=False)
     parser.add_argument("--detector-height", type=int, default=DEFAULT_DETECTOR_HEIGHT)
     parser.add_argument("--detector-width", type=int, default=DEFAULT_DETECTOR_WIDTH)
     parser.add_argument(
@@ -196,6 +207,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be positive")
     if args.mrd_branch_importance_repeats < 1:
         parser.error("--mrd-branch-importance-repeats must be positive")
+    if args.fv_branch and not args.apply_reco_fv_cut:
+        parser.error("--fv-branch requires --apply-reco-fv-cut")
     return args
 
 
@@ -331,7 +344,7 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                     tree, args.tankcluster_branch
                 )
                 fv_branch = ""
-                if not args.no_fv_cut:
+                if args.apply_reco_fv_cut:
                     fv_branch = _resolve_fv_branch(available, args.fv_branch)
                     fv_branches.add(fv_branch)
                 tank_branches.add(tank_branch)
@@ -1606,8 +1619,8 @@ def main() -> None:
         raise ValueError(
             "Both true-FV target classes are required after the reconstructed "
             "FV selection; counts are "
-            f"{fv_class_counts.tolist()}. Consider --no-fv-cut if the selection "
-            "removes all outside-true-FV events."
+            f"{fv_class_counts.tolist()}. Remove --apply-reco-fv-cut if the "
+            "selection removes all outside-true-FV events."
         )
     indices = np.arange(len(labels))
     joint_targets = labels.astype(np.int64) * 2 + fv_labels.astype(np.int64)
@@ -1725,11 +1738,11 @@ def main() -> None:
         "threshold": args.threshold,
         "fv_threshold": args.fv_threshold,
         "fv_loss_weight": args.fv_loss_weight,
-        "fv_cut_applied": not args.no_fv_cut,
+        "fv_cut_applied": args.apply_reco_fv_cut,
         "fv_cut_branches": arrays["fv_branches"],
         "fv_cut_expression": (
             "resolved_reconstructed_fv_branch != 0"
-            if not args.no_fv_cut
+            if args.apply_reco_fv_cut
             else "none"
         ),
         "tankcluster_branches": arrays["tank_branches"],

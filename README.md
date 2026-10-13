@@ -843,8 +843,8 @@ The only PMT image input is the unfolded detector map built from the
 tank-cluster PE channel. The CC-inclusive trainer does not request reconstructed
 vertex-coordinate branches and does not build the vertex-centered angular
 image. It therefore cannot learn from event-vertex coordinates through its
-inputs. The reconstructed FV flag is used only as the requested event-selection
-cut.
+inputs. No reconstructed FV flag, including `sel_vertex_in_FV`, is read or
+applied by default.
 
 The model also receives a padded set of up to four MRD tracks. Each track has
 `MRDTrackStartX/Y/Z`, `MRDTrackStopX/Y/Z`, `MRDEnergyLoss`, `MRDTrackLength`,
@@ -860,12 +860,13 @@ It also receives these scalar features:
 - `promptMuonTotalPE_filtered`
 - `numMRDTracks`
 
-The six Boolean expressions are inputs, not hard cuts. The only default physics
-cut in this trainer is the reconstructed fiducial-volume requirement. It
-auto-detects `simpleRecoFV`, `recoFV`, or `sel_vertex_in_FV` in that order and
-requires the resolved value to be nonzero. Select a branch explicitly with
-`--fv-branch`, or disable the cut with `--no-fv-cut`. Using a reconstructed FV
-branch keeps the same requirement available when applying the model to data.
+The six Boolean expressions are inputs, not hard cuts. The trainer intentionally
+uses the full valid event sample so `fv_score` can learn from both `trueFV = 0`
+and `trueFV = 1`. If a restricted study is needed later,
+`--apply-reco-fv-cut` enables a reconstructed-FV selection and auto-detects
+`simpleRecoFV`, `recoFV`, or `sel_vertex_in_FV` in that order. Combine it with
+`--fv-branch BRANCH_NAME` to select a specific reconstructed flag. This opt-in
+cut is not recommended when training a general FV classifier.
 
 Train from an MC file list with:
 
