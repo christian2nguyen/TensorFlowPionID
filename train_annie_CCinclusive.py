@@ -60,12 +60,12 @@ FV_BRANCH_ALIASES = ("simpleRecoFV", "recoFV", "sel_vertex_in_FV")
 TRAINING_SELECTION_SPECS = (
     ("sel_clusterHist_tankcluster_branch", "==", 1),
     ("match_found", "==", 1),
-    ("simpleRecoFlag", "==", 1),
+    ("sel_simpleRecoFlag", "==", 1),
     ("trigword", "==", 5),
 )
 TRAINING_SELECTION_EXPRESSION = (
     "sel_clusterHist_tankcluster_branch == true && match_found == true && "
-    "simpleRecoFlag == 1 && trigword == 5"
+    "sel_simpleRecoFlag == true && trigword == 5"
 )
 SELECTION_INPUT_SPECS = (
     ("sel_trigword", "trigword", 5),
@@ -73,7 +73,7 @@ SELECTION_INPUT_SPECS = (
     ("sel_HasMRD", "HasMRD", 1),
     ("sel_TankMRDCoinc", "TankMRDCoinc", 1),
     ("sel_noVeto", "NoVeto", 1),
-    ("sel_simpleRecoFlag", "simpleRecoFlag", 1),
+    ("sel_simpleRecoFlag", "sel_simpleRecoFlag", 1),
 )
 DEFAULT_PROMPT_PE_BRANCH = "promptMuonTotalPE_filtered"
 

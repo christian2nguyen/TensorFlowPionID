@@ -859,7 +859,7 @@ It also receives these scalar features:
 - `HasMRD == 1`
 - `TankMRDCoinc == 1`
 - `NoVeto == 1`
-- `simpleRecoFlag == 1` (also required by the hard training selection)
+- `sel_simpleRecoFlag == true` (also required by the hard training selection)
 - `promptMuonTotalPE_filtered`
 - `numMRDTracks`
 
@@ -868,7 +868,7 @@ The trainer applies this hard event selection before splitting the sample:
 ```text
 sel_clusterHist_tankcluster_branch == true
 && match_found == true
-&& simpleRecoFlag == 1
+&& sel_simpleRecoFlag == true
 && trigword == 5
 ```
 
