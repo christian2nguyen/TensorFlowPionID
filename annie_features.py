@@ -86,6 +86,22 @@ FIT_INDIVIDUAL_PMT_SELECTION_EXPRESSION = (
 NU_MU_CC_CUT_BRANCHES = ["sel_nu_mu_cc"]
 NU_MU_CC_SELECTION_EXPRESSION = "sel_nu_mu_cc == true"
 
+PION_ID_CUT_BRANCHES = [
+    "sel_CCInclusive_reco",
+    "MRDSide",
+    "MRDStop",
+    "MRDThrough",
+    "ccinc_cnn_fv_score_valid",
+    "ccinc_cnn_fv_score",
+]
+
+PION_ID_SELECTION_EXPRESSION = (
+    "sel_CCInclusive_reco && Length$(MRDSide) > 0 && "
+    "Length$(MRDStop) > 0 && Length$(MRDThrough) > 0 && !MRDSide[0] && "
+    "MRDStop[0] && !MRDThrough[0] && ccinc_cnn_fv_score_valid && "
+    "ccinc_cnn_fv_score > 0.65"
+)
+
 TANKCLUSTER_ALIASES = [
     "hitPE_tankcluster",
     "hitPE_tankclusters",
@@ -290,8 +306,55 @@ def build_fit_individual_pmt_selection(arrays) -> np.ndarray:
 
 
 def build_nu_mu_cc_selection(arrays) -> np.ndarray:
-    """Apply the sole physics preselection used by the ring training."""
+    """Apply the legacy muon-neutrino CC selection."""
     return _to_numpy(arrays["sel_nu_mu_cc"]) == 1
+
+
+def build_pion_id_selection(arrays) -> np.ndarray:
+    """Apply the CC-inclusive/MRD/FV-score pion-ID preselection."""
+    def scalar_values(branch: str) -> np.ndarray:
+        values = _to_numpy(arrays[branch])
+        if values.ndim != 1:
+            raise ValueError(f"Selection branch {branch!r} is not event-level")
+        return values
+
+    def vector_counts_and_first(branch: str) -> Tuple[np.ndarray, np.ndarray]:
+        values = arrays[branch]
+        try:
+            counts = ak.to_numpy(ak.num(values, axis=1)).astype(
+                np.int64, copy=False
+            )
+            first = _to_numpy(ak.fill_none(ak.firsts(values, axis=1), 0.0))
+        except ValueError as error:
+            raise ValueError(
+                f"Selection branch {branch!r} must be a per-event vector"
+            ) from error
+        return counts, first
+
+    sel_ccinclusive = scalar_values("sel_CCInclusive_reco")
+    fv_score_valid = scalar_values("ccinc_cnn_fv_score_valid")
+    fv_score = scalar_values("ccinc_cnn_fv_score")
+    side_counts, side_first = vector_counts_and_first("MRDSide")
+    stop_counts, stop_first = vector_counts_and_first("MRDStop")
+    through_counts, through_first = vector_counts_and_first("MRDThrough")
+
+    return (
+        np.isfinite(sel_ccinclusive)
+        & (sel_ccinclusive == 1)
+        & (side_counts > 0)
+        & (stop_counts > 0)
+        & (through_counts > 0)
+        & np.isfinite(side_first)
+        & (side_first == 0)
+        & np.isfinite(stop_first)
+        & (stop_first == 1)
+        & np.isfinite(through_first)
+        & (through_first == 0)
+        & np.isfinite(fv_score_valid)
+        & (fv_score_valid == 1)
+        & np.isfinite(fv_score)
+        & (fv_score > 0.65)
+    )
 
 
 def iterate_root_features(

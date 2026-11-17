@@ -299,7 +299,8 @@ requested when applying a saved model to detector data.
 | Full-event PMT image | `hitPE`, `hitDetID` | Aligned per-event vectors |
 | Tank-cluster PMT image | `hitPE_tankcluster` or `hitPE_tankclusters`, `hitDetID_tankcluster` | Aligned per-event vectors |
 | Image direction | `simpleRecoVtxX`, `simpleRecoVtxY`, `simpleRecoVtxZ` | Event scalars |
-| Default physics selection | `sel_nu_mu_cc` | Boolean or 0/1 event scalar |
+| Pion preselection scalars | `sel_CCInclusive_reco`, `ccinc_cnn_fv_score_valid`, `ccinc_cnn_fv_score` | Event scalars |
+| Pion preselection MRD status | `MRDSide`, `MRDStop`, `MRDThrough` | Non-empty per-event vectors; element 0 is tested |
 | MRD multiplicity | `numMRDTracks` | Event scalar |
 | Veto activity input | `NoVeto` | Integer event scalar; routed only to `numu_score` |
 | MRD track starts | `MRDTrackStartX`, `MRDTrackStartY`, `MRDTrackStartZ` | Per-event vectors; all three lengths must agree with `numMRDTracks` |
@@ -402,11 +403,11 @@ change the training losses. `trueFV` and `mc_neutrino_is_numu` are required
 while training because they supply targets. Neither branch is a network input,
 and neither is needed in detector data during inference.
 
-By default, scoring reapplies the saved `sel_nu_mu_cc == true` selection. Use
+By default, scoring reapplies the event selection stored in the model JSON,
+including the precomputed FV-score requirement used for pion training. Use
 `--all-events` only when the input was already selected elsewhere or when scores
 are intentionally needed for every event. The scoring CSV records all three
-scores, applied thresholds, and independent decisions for every written
-event.
+scores, applied thresholds, and independent decisions for every written event.
 
 For `--output artifacts/annie_ring_pion.keras`, the main artifacts are:
 
@@ -667,10 +668,18 @@ to three events with all four PMT image views and pion-truth annotations.
 The annotations include the truth muon and leading-pion kinetic energies in GeV
 when their truth momentum vectors are available.
 
-By default, Model C applies only this physics event-selection cut:
+By default, Model C applies this pion-ID event preselection:
 
 ```text
-sel_nu_mu_cc == true
+sel_CCInclusive_reco
+&& Length$(MRDSide) > 0
+&& Length$(MRDStop) > 0
+&& Length$(MRDThrough) > 0
+&& !MRDSide[0]
+&& MRDStop[0]
+&& !MRDThrough[0]
+&& ccinc_cnn_fv_score_valid
+&& ccinc_cnn_fv_score > 0.65
 ```
 
 Use `--no-event-cuts` to disable this selection. The older spelling
@@ -854,31 +863,36 @@ The model also receives a padded set of up to four MRD tracks. Each track has
 and `MRDTrackAngle`; `mrd_track_mask` distinguishes real tracks from padding.
 It also receives these scalar features:
 
-- `trigword == 5` (also required by the hard training selection)
+- `trigword == 5`
 - `HasTank == 1`
 - `HasMRD == 1`
 - `TankMRDCoinc == 1`
 - `NoVeto == 1`
-- `sel_simpleRecoFlag == true` (also required by the hard training selection)
-- `promptMuonTotalPE_filtered`
+- `sel_simpleRecoFlag == true`
 - `numMRDTracks`
 
 The trainer applies this hard event selection before splitting the sample:
 
 ```text
-sel_clusterHist_tankcluster_branch == true
-&& match_found == true
-&& sel_simpleRecoFlag == true
-&& trigword == 5
+sel_CCInclusive_reco
+&& Length$(MRDSide) > 0
+&& Length$(MRDStop) > 0
+&& Length$(MRDThrough) > 0
+&& !MRDSide[0]
+&& MRDStop[0]
+&& !MRDThrough[0]
+&& ccinc_cnn_fv_score_valid
+&& ccinc_cnn_fv_score > 0.65
 ```
 
-Consequently, the `sel_trigword` and `sel_simpleRecoFlag` scalar inputs are
-constant at 1 in the selected sample; they are retained for input-schema
-compatibility. The other four Boolean scalar expressions are model inputs, not
-hard cuts. `sel_nu_mu_cc` is the CC-inclusive target and is deliberately not a
-cut, so both signal and background remain available. The trainer also retains
-both `trueFV = 0` and `trueFV = 1` events for the FV head. If a restricted study
-is needed later,
+The three MRD status branches must be per-event vectors. Empty vectors are
+rejected safely before their first element is tested. The precomputed
+`ccinc_cnn_fv_score` and its validity flag are used only for preselection and
+are not model inputs. The six Boolean scalar expressions listed above remain
+model inputs rather than hard cuts. `sel_nu_mu_cc` is the CC-inclusive target
+and is deliberately not a cut, so both signal and background remain available.
+The trainer also retains both `trueFV = 0` and `trueFV = 1` events for the FV
+head. If a restricted study is needed later,
 `--apply-reco-fv-cut` enables a reconstructed-FV selection and auto-detects
 `simpleRecoFV`, `recoFV`, or `sel_vertex_in_FV` in that order. Combine it with
 `--fv-branch BRANCH_NAME` to select a specific reconstructed flag. This opt-in
@@ -889,19 +903,15 @@ Train from an MC file list with:
 ```bash
 python train_annie_CCinclusive.py \
   --file-list ccinclusive_mc_files.txt \
-  --pmt-response tuned \
-  --pmt-response-calibration fitted_calibration.root \
-  --pmt-tune-variant final \
+  --pmt-response raw \
   --threshold 0.50 \
   --fv-threshold 0.50 \
   --batch-size 64 \
   --output artifacts/annie_CCinclusive.keras
 ```
 
-The ROOT branch name for the filtered prompt charge defaults to
-`promptMuonTotalPE_filtered`. Use `--prompt-pe-branch BRANCH_NAME` if a file
-uses a different spelling. Training produces the model and JSON metadata plus
-ROC, precision-recall, score-distribution, confusion-matrix,
+Training produces the model and JSON metadata plus ROC, precision-recall,
+score-distribution, confusion-matrix,
 efficiency/purity, training-history, and held-out prediction files. It also
 produces these held-out diagnostic outputs:
 
@@ -922,14 +932,14 @@ produces these held-out diagnostic outputs:
   false-positive and false-negative detector images in one PDF.
 - `annie_CCinclusive.input_importance_beeswarm.png` gives separate CC and FV
   rankings for every model input: both image channels, all selection-flag
-  inputs, filtered prompt PE, `numMRDTracks`, MRD start and stop coordinates,
-  energy loss, length, and angle.
+  inputs, `numMRDTracks`, MRD start and stop coordinates, energy loss, length,
+  and angle.
 - `annie_CCinclusive.input_importance.csv` records separate CC and FV ranks,
   score impacts, ROC-AUC decreases, and average-precision decreases for every
   input.
 
 Use `--input-importance-repeats N` to change the number of permutations per
-input; the default is 1 because a complete pass covers 19 inputs for both
+input; the default is 1 because a complete pass covers 18 inputs for both
 outputs. The older `--mrd-branch-importance-repeats` spelling remains an alias.
 More repeats reduce random variation but add inference time after training.
 Test prediction and permutation diagnostics are streamed in batches rather than

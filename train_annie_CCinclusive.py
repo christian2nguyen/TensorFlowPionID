@@ -57,15 +57,19 @@ TEST_FRACTION = 0.15
 CCINCLUSIVE_SIGNAL_BRANCH = "sel_nu_mu_cc"
 SUPERVISION_BRANCHES = (CCINCLUSIVE_SIGNAL_BRANCH, "trueFV")
 FV_BRANCH_ALIASES = ("simpleRecoFV", "recoFV", "sel_vertex_in_FV")
-TRAINING_SELECTION_SPECS = (
-    ("sel_clusterHist_tankcluster_branch", "==", 1),
-    ("match_found", "==", 1),
-    ("sel_simpleRecoFlag", "==", 1),
-    ("trigword", "==", 5),
+TRAINING_SELECTION_BRANCHES = (
+    "sel_CCInclusive_reco",
+    "MRDSide",
+    "MRDStop",
+    "MRDThrough",
+    "ccinc_cnn_fv_score_valid",
+    "ccinc_cnn_fv_score",
 )
 TRAINING_SELECTION_EXPRESSION = (
-    "sel_clusterHist_tankcluster_branch == true && match_found == true && "
-    "sel_simpleRecoFlag == true && trigword == 5"
+    "sel_CCInclusive_reco && Length$(MRDSide) > 0 && "
+    "Length$(MRDStop) > 0 && Length$(MRDThrough) > 0 && !MRDSide[0] && "
+    "MRDStop[0] && !MRDThrough[0] && ccinc_cnn_fv_score_valid && "
+    "ccinc_cnn_fv_score > 0.65"
 )
 SELECTION_INPUT_SPECS = (
     ("sel_trigword", "trigword", 5),
@@ -75,7 +79,6 @@ SELECTION_INPUT_SPECS = (
     ("sel_noVeto", "NoVeto", 1),
     ("sel_simpleRecoFlag", "sel_simpleRecoFlag", 1),
 )
-DEFAULT_PROMPT_PE_BRANCH = "promptMuonTotalPE_filtered"
 
 
 def _to_numpy(values, dtype=np.float64) -> np.ndarray:
@@ -120,7 +123,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hitid-branch", default="hitDetID")
     parser.add_argument("--tankcluster-branch")
     parser.add_argument("--tankcluster-id-branch", default="hitDetID_tankcluster")
-    parser.add_argument("--prompt-pe-branch", default=DEFAULT_PROMPT_PE_BRANCH)
     parser.add_argument(
         "--fv-branch",
         help=(
@@ -249,7 +251,7 @@ def _resolve_fv_branch(available: set, requested: Optional[str]) -> str:
 
 
 def _build_scalar_features(
-    arrays, prompt_pe_branch: str, mrd_count_features: np.ndarray
+    arrays, mrd_count_features: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
     columns = []
     valid = np.ones(len(arrays), dtype=bool)
@@ -259,11 +261,6 @@ def _build_scalar_features(
             raise ValueError(f"Scalar input branch {branch!r} is not event-level")
         valid &= np.isfinite(values)
         columns.append((values == required_value).astype(np.float32))
-    prompt_pe = _to_numpy(arrays[prompt_pe_branch])
-    if prompt_pe.ndim != 1:
-        raise ValueError(f"{prompt_pe_branch!r} is not an event-level scalar")
-    valid &= np.isfinite(prompt_pe)
-    columns.append(prompt_pe.astype(np.float32))
     columns.append(mrd_count_features[:, 0].astype(np.float32))
     features = np.column_stack(columns).astype(np.float32, copy=False)
     valid &= np.isfinite(features).all(axis=1)
@@ -272,18 +269,68 @@ def _build_scalar_features(
 
 def _build_training_selection(arrays) -> Tuple[np.ndarray, Dict[str, int]]:
     """Build the requested hard event-selection mask and failure counts."""
-    selected = np.ones(len(arrays), dtype=bool)
-    failed_counts = {}
-    for branch, operator, required_value in TRAINING_SELECTION_SPECS:
+    def scalar_values(branch: str) -> np.ndarray:
         values = _to_numpy(arrays[branch])
         if values.ndim != 1:
             raise ValueError(f"Selection branch {branch!r} is not event-level")
-        finite = np.isfinite(values)
-        if operator == "==":
-            passed = finite & (values == required_value)
-        else:
-            passed = finite & (values != required_value)
-        failed_counts[branch] = int((~passed).sum())
+        return values
+
+    def vector_counts_and_first(branch: str) -> Tuple[np.ndarray, np.ndarray]:
+        values = arrays[branch]
+        try:
+            counts = _to_numpy(ak.num(values, axis=1), dtype=np.int64)
+            first = _to_numpy(
+                ak.fill_none(ak.firsts(values, axis=1), 0.0)
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"Selection branch {branch!r} must be a per-event vector"
+            ) from error
+        return counts, first
+
+    sel_ccinclusive = scalar_values("sel_CCInclusive_reco")
+    fv_score_valid = scalar_values("ccinc_cnn_fv_score_valid")
+    fv_score = scalar_values("ccinc_cnn_fv_score")
+    mrd_side_counts, mrd_side_first = vector_counts_and_first("MRDSide")
+    mrd_stop_counts, mrd_stop_first = vector_counts_and_first("MRDStop")
+    mrd_through_counts, mrd_through_first = vector_counts_and_first("MRDThrough")
+
+    conditions = (
+        ("sel_CCInclusive_reco", np.isfinite(sel_ccinclusive) & (sel_ccinclusive == 1)),
+        ("Length$(MRDSide) > 0", mrd_side_counts > 0),
+        ("Length$(MRDStop) > 0", mrd_stop_counts > 0),
+        ("Length$(MRDThrough) > 0", mrd_through_counts > 0),
+        (
+            "!MRDSide[0]",
+            (mrd_side_counts > 0)
+            & np.isfinite(mrd_side_first)
+            & (mrd_side_first == 0),
+        ),
+        (
+            "MRDStop[0]",
+            (mrd_stop_counts > 0)
+            & np.isfinite(mrd_stop_first)
+            & (mrd_stop_first == 1),
+        ),
+        (
+            "!MRDThrough[0]",
+            (mrd_through_counts > 0)
+            & np.isfinite(mrd_through_first)
+            & (mrd_through_first == 0),
+        ),
+        (
+            "ccinc_cnn_fv_score_valid",
+            np.isfinite(fv_score_valid) & (fv_score_valid == 1),
+        ),
+        (
+            "ccinc_cnn_fv_score > 0.65",
+            np.isfinite(fv_score) & (fv_score > 0.65),
+        ),
+    )
+    selected = np.ones(len(arrays), dtype=bool)
+    failed_counts = {}
+    for expression, passed in conditions:
+        failed_counts[expression] = int((~passed).sum())
         selected &= passed
     return selected, failed_counts
 
@@ -395,9 +442,8 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                     args.hitid_branch,
                     tank_branch,
                     args.tankcluster_id_branch,
-                    *(branch for branch, _, _ in TRAINING_SELECTION_SPECS),
+                    *TRAINING_SELECTION_BRANCHES,
                     *(branch for _, branch, _ in SELECTION_INPUT_SPECS),
-                    args.prompt_pe_branch,
                     "numMRDTracks",
                     *MRD_TRACK_START_BRANCHES,
                     *MRD_TRACK_STOP_BRANCHES,
@@ -446,7 +492,7 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
                     ) = build_ring_event_features(arrays, ["numMRDTracks"])
                     track_stops, valid_stops = _build_track_stops(arrays)
                     scalar_features, valid_scalars = _build_scalar_features(
-                        arrays, args.prompt_pe_branch, mrd_count_features
+                        arrays, mrd_count_features
                     )
                     training_selection, cut_failed_counts = (
                         _build_training_selection(arrays)
@@ -541,7 +587,6 @@ def load_data(args: argparse.Namespace) -> Dict[str, object]:
         "fv_labels": np.concatenate(fv_label_chunks),
         "scalar_feature_names": [
             *(name for name, _, _ in SELECTION_INPUT_SPECS),
-            args.prompt_pe_branch,
             "numMRDTracks",
         ],
         "source_paths": np.concatenate(source_chunks),
@@ -2054,23 +2099,18 @@ def main() -> None:
         "scalar_input_name": "event_features",
         "scalar_feature_names": [
             *(name for name, _, _ in SELECTION_INPUT_SPECS),
-            args.prompt_pe_branch,
             "numMRDTracks",
         ],
         "scalar_feature_definitions": {
             name: f"{branch} == {required_value}"
             for name, branch, required_value in SELECTION_INPUT_SPECS
         },
-        "prompt_pe_branch": args.prompt_pe_branch,
         "training_selection_expression": TRAINING_SELECTION_EXPRESSION,
-        "training_selection_branches": [
-            branch for branch, _, _ in TRAINING_SELECTION_SPECS
-        ],
-        "selection_flags_are_inputs_not_cuts": False,
+        "training_selection_branches": list(TRAINING_SELECTION_BRANCHES),
+        "selection_flags_are_inputs_not_cuts": True,
         "selection_input_notes": {
-            "sel_trigword": "also a hard cut; constant 1 after selection",
-            "sel_simpleRecoFlag": "also a hard cut; constant 1 after selection",
-            "other_selection_flags": "model inputs, not hard cuts",
+            "all_selection_flags": "model inputs, not hard cuts",
+            "ccinc_cnn_fv_score": "preselection only, not a model input",
         },
         "mrd_track_start_branches": MRD_TRACK_START_BRANCHES,
         "mrd_track_stop_branches": list(MRD_TRACK_STOP_BRANCHES),

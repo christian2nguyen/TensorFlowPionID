@@ -37,7 +37,7 @@ from annie_features import (
     MAX_MRD_TRACKS,
     MRD_TRACK_PROPERTY_BRANCHES,
     MRD_TRACK_START_BRANCHES,
-    NU_MU_CC_SELECTION_EXPRESSION,
+    PION_ID_SELECTION_EXPRESSION,
     RING_EVENT_FEATURE_NAMES,
     RING_EVENT_SCALAR_BRANCHES,
 )
@@ -170,7 +170,7 @@ def parse_args() -> argparse.Namespace:
         dest="no_event_cuts",
         action="store_true",
         help=(
-            "Disable the sel_nu_mu_cc == true training selection; "
+            "Disable the CC-inclusive/MRD/FV-score pion-ID preselection; "
             "--no-bdt-cuts is retained as a compatibility alias"
         ),
     )
@@ -359,7 +359,7 @@ def load_data(
             args.detector_height,
             args.detector_width,
             response,
-            "none" if args.no_event_cuts else "nu_mu_cc",
+            "none" if args.no_event_cuts else "pion_id",
             True,
             args.charged_only,
             args.chunk_size,
@@ -3524,9 +3524,9 @@ def main() -> None:
         "requested_muon_pion_opening_angle_degree_branch": (
             args.muon_pion_opening_angle_deg_branch
         ),
-        "event_selection": "nu_mu_cc",
+        "event_selection": "pion_id",
         "event_selection_source": "user_requested_training_preselection",
-        "event_selection_expression": NU_MU_CC_SELECTION_EXPRESSION,
+        "event_selection_expression": PION_ID_SELECTION_EXPRESSION,
         "event_selection_applied": not args.no_event_cuts,
         "bdt_preselection": False,
         "threshold": args.threshold,

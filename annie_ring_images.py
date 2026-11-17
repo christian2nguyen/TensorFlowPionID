@@ -16,11 +16,13 @@ from annie_features import (
     MRD_TRACK_PROPERTY_BRANCHES,
     MRD_TRACK_START_BRANCHES,
     NU_MU_CC_CUT_BRANCHES,
+    PION_ID_CUT_BRANCHES,
     RING_EVENT_FEATURE_NAMES,
     TRUTH_BRANCHES,
     build_bdt_selection,
     build_fit_individual_pmt_selection,
     build_nu_mu_cc_selection,
+    build_pion_id_selection,
     build_pion_labels,
     build_ring_event_features,
     resolve_tankcluster_branch,
@@ -470,6 +472,7 @@ def iterate_ring_images(
     if selection_mode not in {
         "none",
         "nu_mu_cc",
+        "pion_id",
         "fit_individual_pmt",
         "legacy_bdt",
     }:
@@ -492,6 +495,8 @@ def iterate_ring_images(
                 requested[0:0] = [hitpe_branch, hitid_branch]
             if selection_mode == "nu_mu_cc":
                 requested.extend(NU_MU_CC_CUT_BRANCHES)
+            elif selection_mode == "pion_id":
+                requested.extend(PION_ID_CUT_BRANCHES)
             elif selection_mode == "fit_individual_pmt":
                 requested.extend(FIT_INDIVIDUAL_PMT_CUT_BRANCHES)
             elif selection_mode == "legacy_bdt":
@@ -549,6 +554,8 @@ def iterate_ring_images(
                 selected = aligned.copy()
                 if selection_mode == "nu_mu_cc":
                     selected &= build_nu_mu_cc_selection(arrays)
+                elif selection_mode == "pion_id":
+                    selected &= build_pion_id_selection(arrays)
                 elif selection_mode == "fit_individual_pmt":
                     selected &= build_fit_individual_pmt_selection(arrays)
                 elif selection_mode == "legacy_bdt":
