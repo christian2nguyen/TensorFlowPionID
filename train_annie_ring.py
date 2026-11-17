@@ -8,6 +8,7 @@ from collections import Counter
 import csv
 import json
 import random
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -38,8 +39,6 @@ from annie_features import (
     MRD_TRACK_PROPERTY_BRANCHES,
     MRD_TRACK_START_BRANCHES,
     PION_ID_SELECTION_EXPRESSION,
-    RING_EVENT_FEATURE_NAMES,
-    RING_EVENT_SCALAR_BRANCHES,
 )
 from annie_ring_images import (
     DEFAULT_GEOMETRY,
@@ -51,6 +50,8 @@ from annie_ring_images import (
     PMTGeometry,
     iterate_ring_images,
 )
+
+PION_EVENT_FEATURE_NAMES = ["numMRDTracks"]
 
 TRAIN_FRACTION = 0.70
 VALIDATION_FRACTION = 0.15
@@ -218,30 +219,6 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Independent pion-score decision threshold (default: 0.5)",
     )
-    parser.add_argument(
-        "--fv-threshold",
-        type=float,
-        default=0.5,
-        help="Independent true-FV prediction threshold (default: 0.5)",
-    )
-    parser.add_argument(
-        "--fv-loss-weight",
-        type=float,
-        default=0.3,
-        help="Relative weight of the independent FV loss (default: 0.3)",
-    )
-    parser.add_argument(
-        "--numu-threshold",
-        type=float,
-        default=0.5,
-        help="Independent true-numu prediction threshold (default: 0.5)",
-    )
-    parser.add_argument(
-        "--numu-loss-weight",
-        type=float,
-        default=0.3,
-        help="Relative weight of the independent numu loss (default: 0.3)",
-    )
     parser.add_argument("--seed", type=int, default=20260620)
     args = parser.parse_args()
     if args.file_list is not None:
@@ -283,8 +260,6 @@ def parse_args() -> argparse.Namespace:
 def load_data(
     args: argparse.Namespace,
 ) -> Tuple[
-    np.ndarray,
-    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -340,8 +315,6 @@ def load_data(
     mrd_track_property_chunks: List[np.ndarray] = []
     mrd_track_mask_chunks: List[np.ndarray] = []
     label_chunks: List[np.ndarray] = []
-    fv_label_chunks: List[np.ndarray] = []
-    numu_label_chunks: List[np.ndarray] = []
     truth_pion_chunks: List[np.ndarray] = []
     source_path_chunks: List[np.ndarray] = []
     entry_chunks: List[np.ndarray] = []
@@ -351,6 +324,7 @@ def load_data(
     n_misaligned = 0
     n_mrd_tracks_truncated = 0
     group_summaries = []
+    file_summaries: Dict[str, Dict[str, object]] = {}
     for group_name, group_paths, response in input_groups:
         group_read = 0
         group_selected = 0
@@ -372,9 +346,9 @@ def load_data(
             args.charged_only,
             args.chunk_size,
             include_ring_event_features=True,
-            include_fv_truth=True,
-            include_numu_truth=True,
-            ring_event_feature_names=RING_EVENT_FEATURE_NAMES,
+            include_fv_truth=False,
+            include_numu_truth=False,
+            ring_event_feature_names=PION_EVENT_FEATURE_NAMES,
         ):
             image_chunks.append(
                 chunk["images"].astype(np.float16, copy=False)
@@ -387,8 +361,6 @@ def load_data(
             mrd_track_property_chunks.append(chunk["mrd_track_properties"])
             mrd_track_mask_chunks.append(chunk["mrd_track_mask"])
             label_chunks.append(chunk["labels"])
-            fv_label_chunks.append(chunk["fv_labels"])
-            numu_label_chunks.append(chunk["numu_labels"])
             truth_pion_chunks.append(chunk["truth_pion_counts"])
             entries = chunk["entries"]
             entry_chunks.append(entries)
@@ -398,6 +370,31 @@ def load_data(
             tank_branch = str(chunk["tankcluster_branch"])
             chunk_read = int(chunk["n_read"])
             chunk_selected = int(chunk["n_selected"])
+            source_key = str(chunk["path"])
+            file_summary = file_summaries.setdefault(
+                source_key,
+                {
+                    "source": source_key,
+                    "input_group": group_name,
+                    "pmt_response": response.mode,
+                    "events_read": 0,
+                    "events_selected": 0,
+                    "no_pion_selected": 0,
+                    "pion_selected": 0,
+                    "misaligned_events_rejected": 0,
+                },
+            )
+            file_summary["events_read"] += chunk_read
+            file_summary["events_selected"] += chunk_selected
+            file_summary["no_pion_selected"] += int(
+                np.sum(np.asarray(chunk["labels"]) == 0)
+            )
+            file_summary["pion_selected"] += int(
+                np.sum(np.asarray(chunk["labels"]) == 1)
+            )
+            file_summary["misaligned_events_rejected"] += int(
+                chunk["n_misaligned"]
+            )
             n_read += chunk_read
             n_selected += chunk_selected
             group_read += chunk_read
@@ -429,8 +426,6 @@ def load_data(
         np.concatenate(mrd_track_property_chunks),
         np.concatenate(mrd_track_mask_chunks),
         np.concatenate(label_chunks),
-        np.concatenate(fv_label_chunks),
-        np.concatenate(numu_label_chunks),
         np.concatenate(source_path_chunks),
         np.concatenate(entry_chunks),
         np.concatenate(truth_pion_chunks),
@@ -440,6 +435,7 @@ def load_data(
         geometry,
         {
             "groups": group_summaries,
+            "files": list(file_summaries.values()),
             "responses": responses,
         },
     )
@@ -832,8 +828,6 @@ class RingBatchSequence(tf.keras.utils.Sequence):
         mrd_track_properties: np.ndarray,
         mrd_track_mask: np.ndarray,
         pion_labels: np.ndarray,
-        fv_labels: np.ndarray,
-        numu_labels: np.ndarray,
         indices: np.ndarray,
         batch_size: int,
         shuffle: bool,
@@ -848,8 +842,6 @@ class RingBatchSequence(tf.keras.utils.Sequence):
         self.mrd_track_properties = mrd_track_properties
         self.mrd_track_mask = mrd_track_mask
         self.pion_labels = pion_labels
-        self.fv_labels = fv_labels
-        self.numu_labels = numu_labels
         self.indices = np.asarray(indices, dtype=np.int64)
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
@@ -876,8 +868,6 @@ class RingBatchSequence(tf.keras.utils.Sequence):
         }
         targets = {
             "pion_score": self.pion_labels[event_indices],
-            "fv_score": self.fv_labels[event_indices],
-            "numu_score": self.numu_labels[event_indices],
         }
         if self.class_weights is None:
             return inputs, targets
@@ -907,21 +897,16 @@ def build_model(
     mrd_track_starts_train: np.ndarray,
     mrd_track_properties_train: np.ndarray,
     mrd_track_mask_train: np.ndarray,
-    fv_loss_weight: float,
-    numu_loss_weight: float,
 ) -> tf.keras.Model:
     if angular_shape[-1] != 2 or detector_shape[-1] != 2:
         raise ValueError(
-            "Head-specific image routing requires channel 0 = hitPE and "
+            "Pion image inputs require channel 0 = hitPE and "
             "channel 1 = hitPE_tankcluster"
         )
-    if RING_EVENT_FEATURE_NAMES != ["numMRDTracks", "NoVeto"]:
-        raise ValueError(
-            "Head-specific scalar routing requires event features ordered as "
-            "numMRDTracks, NoVeto"
-        )
-    if event_features_train.shape[1] != 2:
-        raise ValueError("Model C requires numMRDTracks and NoVeto inputs")
+    if PION_EVENT_FEATURE_NAMES != ["numMRDTracks"]:
+        raise ValueError("Pion scalar input must contain only numMRDTracks")
+    if event_features_train.shape[1] != 1:
+        raise ValueError("The pion model requires one numMRDTracks input")
     angular_normalizer = tf.keras.layers.Normalization(
         axis=-1,
         mean=angular_mean,
@@ -934,23 +919,8 @@ def build_model(
         variance=detector_variance,
         name="detector_channel_normalization",
     )
-    angular_tank_normalizer = tf.keras.layers.Normalization(
-        axis=-1,
-        mean=angular_mean[1:2],
-        variance=angular_variance[1:2],
-        name="angular_tankcluster_normalization",
-    )
-    detector_tank_normalizer = tf.keras.layers.Normalization(
-        axis=-1,
-        mean=detector_mean[1:2],
-        variance=detector_variance[1:2],
-        name="detector_tankcluster_normalization",
-    )
     mrd_count_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="num_mrd_tracks_normalization"
-    )
-    no_veto_normalizer = tf.keras.layers.Normalization(
-        axis=-1, name="no_veto_normalization"
     )
     mrd_track_normalizer = tf.keras.layers.Normalization(
         axis=-1, name="mrd_track_coordinate_normalization"
@@ -959,7 +929,6 @@ def build_model(
         axis=-1, name="mrd_track_property_normalization"
     )
     mrd_count_normalizer.adapt(event_features_train[:, 0:1])
-    no_veto_normalizer.adapt(event_features_train[:, 1:2])
     valid_track_starts = mrd_track_starts_train[
         mrd_track_mask_train.astype(bool)
     ]
@@ -984,60 +953,13 @@ def build_model(
     mrd_track_mask_inputs = tf.keras.Input(
         shape=(MAX_MRD_TRACKS,), name="mrd_track_mask"
     )
-    tank_selector_kernel = np.zeros((1, 1, 2, 1), dtype=np.float32)
-    tank_selector_kernel[0, 0, 1, 0] = 1.0
-    angular_tank_inputs = tf.keras.layers.Conv2D(
-        1,
-        1,
-        use_bias=False,
-        trainable=False,
-        kernel_initializer=tf.keras.initializers.Constant(tank_selector_kernel),
-        name="angular_tankcluster_channel",
-    )(angular_inputs)
-    detector_tank_inputs = tf.keras.layers.Conv2D(
-        1,
-        1,
-        use_bias=False,
-        trainable=False,
-        kernel_initializer=tf.keras.initializers.Constant(tank_selector_kernel),
-        name="detector_tankcluster_channel",
-    )(detector_inputs)
-    mrd_count_selector_kernel = np.array([[1.0], [0.0]], dtype=np.float32)
-    no_veto_selector_kernel = np.array([[0.0], [1.0]], dtype=np.float32)
-    mrd_count_input = tf.keras.layers.Dense(
-        1,
-        use_bias=False,
-        trainable=False,
-        kernel_initializer=tf.keras.initializers.Constant(
-            mrd_count_selector_kernel
-        ),
-        name="num_mrd_tracks_channel",
-    )(event_feature_inputs)
-    no_veto_input = tf.keras.layers.Dense(
-        1,
-        use_bias=False,
-        trainable=False,
-        kernel_initializer=tf.keras.initializers.Constant(
-            no_veto_selector_kernel
-        ),
-        name="no_veto_channel",
-    )(event_feature_inputs)
+    mrd_count_input = event_feature_inputs
     angular_features = _image_tower(angular_inputs, angular_normalizer, "angular")
     detector_features = _image_tower(detector_inputs, detector_normalizer, "detector")
-    angular_tank_features = _image_tower(
-        angular_tank_inputs, angular_tank_normalizer, "angular_tankcluster"
-    )
-    detector_tank_features = _image_tower(
-        detector_tank_inputs, detector_tank_normalizer, "detector_tankcluster"
-    )
     mrd_count_features = mrd_count_normalizer(mrd_count_input)
     mrd_count_features = tf.keras.layers.Dense(
         8, activation="relu", name="event_feature_embedding"
     )(mrd_count_features)
-    no_veto_features = no_veto_normalizer(no_veto_input)
-    no_veto_features = tf.keras.layers.Dense(
-        4, activation="relu", name="numu_no_veto_embedding"
-    )(no_veto_features)
     normalized_track_starts = mrd_track_normalizer(mrd_track_start_inputs)
     normalized_track_properties = mrd_property_normalizer(
         mrd_track_property_inputs
@@ -1067,63 +989,18 @@ def build_model(
             mrd_track_features,
         ]
     )
-    fv_inputs = tf.keras.layers.Concatenate(
-        name="fv_tankcluster_inputs"
-    )(
-        [
-            angular_tank_features,
-            detector_tank_features,
-            mrd_count_features,
-            mrd_track_features,
-        ]
-    )
-    numu_inputs = tf.keras.layers.Concatenate(
-        name="numu_full_and_tankcluster_inputs"
-    )(
-        [
-            angular_features,
-            detector_features,
-            mrd_count_features,
-            mrd_track_features,
-            no_veto_features,
-        ]
-    )
     pion_shared_features = tf.keras.layers.Dense(
         32, activation="relu", name="pion_event_embedding"
     )(pion_inputs)
     pion_shared_features = tf.keras.layers.Dropout(
         0.30, name="pion_event_dropout"
     )(pion_shared_features)
-    fv_shared_features = tf.keras.layers.Dense(
-        32, activation="relu", name="fv_event_embedding"
-    )(fv_inputs)
-    fv_shared_features = tf.keras.layers.Dropout(
-        0.30, name="fv_event_dropout"
-    )(fv_shared_features)
-    numu_shared_features = tf.keras.layers.Dense(
-        32, activation="relu", name="numu_event_embedding"
-    )(numu_inputs)
-    numu_shared_features = tf.keras.layers.Dropout(
-        0.30, name="numu_event_dropout"
-    )(numu_shared_features)
     pion_features = tf.keras.layers.Dense(
         16, activation="relu", name="pion_head_embedding"
     )(pion_shared_features)
-    fv_features = tf.keras.layers.Dense(
-        16, activation="relu", name="fv_head_embedding"
-    )(fv_shared_features)
-    numu_features = tf.keras.layers.Dense(
-        16, activation="relu", name="numu_head_embedding"
-    )(numu_shared_features)
     pion_output = tf.keras.layers.Dense(
         1, activation="sigmoid", name="pion_score"
     )(pion_features)
-    fv_output = tf.keras.layers.Dense(
-        1, activation="sigmoid", name="fv_score"
-    )(fv_features)
-    numu_output = tf.keras.layers.Dense(
-        1, activation="sigmoid", name="numu_score"
-    )(numu_features)
     model = tf.keras.Model(
         [
             angular_inputs,
@@ -1133,38 +1010,13 @@ def build_model(
             mrd_track_property_inputs,
             mrd_track_mask_inputs,
         ],
-        {
-            "pion_score": pion_output,
-            "fv_score": fv_output,
-            "numu_score": numu_output,
-        },
+        {"pion_score": pion_output},
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss={
-            "pion_score": "binary_crossentropy",
-            "fv_score": "binary_crossentropy",
-            "numu_score": "binary_crossentropy",
-        },
-        loss_weights={
-            "pion_score": 1.0,
-            "fv_score": fv_loss_weight,
-            "numu_score": numu_loss_weight,
-        },
+        loss={"pion_score": "binary_crossentropy"},
         metrics={
             "pion_score": [
-                tf.keras.metrics.AUC(name="roc_auc"),
-                tf.keras.metrics.AUC(curve="PR", name="pr_auc"),
-                tf.keras.metrics.Precision(name="precision"),
-                tf.keras.metrics.Recall(name="recall"),
-            ],
-            "fv_score": [
-                tf.keras.metrics.AUC(name="roc_auc"),
-                tf.keras.metrics.AUC(curve="PR", name="pr_auc"),
-                tf.keras.metrics.Precision(name="precision"),
-                tf.keras.metrics.Recall(name="recall"),
-            ],
-            "numu_score": [
                 tf.keras.metrics.AUC(name="roc_auc"),
                 tf.keras.metrics.AUC(curve="PR", name="pr_auc"),
                 tf.keras.metrics.Precision(name="precision"),
@@ -1247,218 +1099,6 @@ def plot_precision_recall(
     return path.name, average_precision
 
 
-def plot_fv_diagnostics(
-    fv_labels: np.ndarray,
-    fv_scores: np.ndarray,
-    output: Path,
-    threshold: float,
-) -> Dict[str, object]:
-    """Write independent fiducial-volume classifier diagnostics."""
-    fig, axis = plt.subplots(figsize=(7, 5))
-    bins = np.linspace(0.0, 1.0, 41)
-    axis.hist(
-        fv_scores[fv_labels == 0],
-        bins=bins,
-        alpha=0.6,
-        density=True,
-        label="Outside FV (truth)",
-        color="C0",
-    )
-    axis.hist(
-        fv_scores[fv_labels == 1],
-        bins=bins,
-        alpha=0.6,
-        density=True,
-        label="Inside FV (truth)",
-        color="C1",
-    )
-    axis.axvline(
-        threshold,
-        color="black",
-        linestyle="--",
-        label=f"FV cut = {threshold:.2f}",
-    )
-    axis.set_xlim(0.0, 1.0)
-    axis.set_xlabel("Model fv_score")
-    axis.set_ylabel("Normalized event density")
-    axis.set_title("Test-set FV signal separation")
-    axis.legend()
-    fig.tight_layout()
-    separation_path = output.with_suffix(".fv_score_distribution.png")
-    fig.savefig(separation_path, dpi=160)
-    plt.close(fig)
-
-    fpr, tpr, _ = roc_curve(fv_labels, fv_scores)
-    roc_auc_value = float(auc(fpr, tpr))
-    fig, axis = plt.subplots(figsize=(6, 6))
-    axis.plot(fpr, tpr, label=f"FV ROC (AUC = {roc_auc_value:.4f})")
-    axis.plot([0, 1], [0, 1], color="gray", linestyle="--", label="Chance")
-    axis.set_xlabel("False positive rate (outside FV classified inside)")
-    axis.set_ylabel("True positive rate (true-FV efficiency)")
-    axis.set_title("Independent FV prediction ROC curve")
-    axis.legend(loc="lower right")
-    fig.tight_layout()
-    roc_path = output.with_suffix(".fv_roc_curve.png")
-    fig.savefig(roc_path, dpi=160)
-    plt.close(fig)
-
-    precision, recall, _ = precision_recall_curve(fv_labels, fv_scores)
-    average_precision = float(average_precision_score(fv_labels, fv_scores))
-    fig, axis = plt.subplots(figsize=(6, 6))
-    axis.plot(
-        recall,
-        precision,
-        color="C2",
-        label=f"FV PR (AP = {average_precision:.4f})",
-    )
-    axis.set_xlabel("Recall (true-FV efficiency)")
-    axis.set_ylabel("Precision (true-FV purity)")
-    axis.set_title("Independent FV prediction precision-recall curve")
-    axis.legend(loc="lower left")
-    fig.tight_layout()
-    pr_path = output.with_suffix(".fv_precision_recall_curve.png")
-    fig.savefig(pr_path, dpi=160)
-    plt.close(fig)
-
-    return {
-        "fv_score_distribution": separation_path.name,
-        "fv_roc_curve": roc_path.name,
-        "fv_roc_auc": roc_auc_value,
-        "fv_precision_recall_curve": pr_path.name,
-        "fv_average_precision": average_precision,
-        "fv_brier_score": float(brier_score_loss(fv_labels, fv_scores)),
-        "fv_operating_point": pion_operating_point(
-            fv_labels, fv_scores, threshold
-        ),
-        "fv_confusion_matrix": plot_confusion_matrix(
-            fv_labels,
-            fv_scores,
-            threshold,
-            output,
-            filename_suffix=".fv_confusion_matrix.png",
-            negative_label="outside FV",
-            positive_label="inside FV",
-            score_name="fv_score",
-        ),
-        "fv_confusion_matrix_normalized": plot_confusion_matrix(
-            fv_labels,
-            fv_scores,
-            threshold,
-            output,
-            normalize=True,
-            filename_suffix=".fv_confusion_matrix_normalized.png",
-            negative_label="outside FV",
-            positive_label="inside FV",
-            score_name="fv_score",
-        ),
-    }
-
-
-def plot_numu_diagnostics(
-    numu_labels: np.ndarray,
-    numu_scores: np.ndarray,
-    output: Path,
-    threshold: float,
-) -> Dict[str, object]:
-    """Write independent muon-neutrino classifier diagnostics."""
-    fig, axis = plt.subplots(figsize=(7, 5))
-    bins = np.linspace(0.0, 1.0, 41)
-    axis.hist(
-        numu_scores[numu_labels == 0],
-        bins=bins,
-        alpha=0.6,
-        density=True,
-        label="Not numu (truth)",
-        color="C0",
-    )
-    axis.hist(
-        numu_scores[numu_labels == 1],
-        bins=bins,
-        alpha=0.6,
-        density=True,
-        label="Numu (truth)",
-        color="C1",
-    )
-    axis.axvline(
-        threshold,
-        color="black",
-        linestyle="--",
-        label=f"numu cut = {threshold:.2f}",
-    )
-    axis.set_xlim(0.0, 1.0)
-    axis.set_xlabel("Model numu_score")
-    axis.set_ylabel("Normalized event density")
-    axis.set_title("Test-set numu signal separation")
-    axis.legend()
-    fig.tight_layout()
-    separation_path = output.with_suffix(".numu_score_distribution.png")
-    fig.savefig(separation_path, dpi=160)
-    plt.close(fig)
-
-    fpr, tpr, _ = roc_curve(numu_labels, numu_scores)
-    roc_auc_value = float(auc(fpr, tpr))
-    fig, axis = plt.subplots(figsize=(6, 6))
-    axis.plot(fpr, tpr, label=f"numu ROC (AUC = {roc_auc_value:.4f})")
-    axis.plot([0, 1], [0, 1], color="gray", linestyle="--", label="Chance")
-    axis.set_xlabel("False positive rate (non-numu classified as numu)")
-    axis.set_ylabel("True positive rate (numu efficiency)")
-    axis.set_title("Independent numu prediction ROC curve")
-    axis.legend(loc="lower right")
-    fig.tight_layout()
-    roc_path = output.with_suffix(".numu_roc_curve.png")
-    fig.savefig(roc_path, dpi=160)
-    plt.close(fig)
-
-    precision, recall, _ = precision_recall_curve(numu_labels, numu_scores)
-    average_precision = float(average_precision_score(numu_labels, numu_scores))
-    fig, axis = plt.subplots(figsize=(6, 6))
-    axis.plot(
-        recall,
-        precision,
-        color="C2",
-        label=f"numu PR (AP = {average_precision:.4f})",
-    )
-    axis.set_xlabel("Recall (numu efficiency)")
-    axis.set_ylabel("Precision (numu purity)")
-    axis.set_title("Independent numu prediction precision-recall curve")
-    axis.legend(loc="lower left")
-    fig.tight_layout()
-    pr_path = output.with_suffix(".numu_precision_recall_curve.png")
-    fig.savefig(pr_path, dpi=160)
-    plt.close(fig)
-
-    return {
-        "numu_score_distribution": separation_path.name,
-        "numu_roc_curve": roc_path.name,
-        "numu_roc_auc": roc_auc_value,
-        "numu_precision_recall_curve": pr_path.name,
-        "numu_average_precision": average_precision,
-        "numu_brier_score": float(brier_score_loss(numu_labels, numu_scores)),
-        "numu_operating_point": pion_operating_point(
-            numu_labels, numu_scores, threshold
-        ),
-        "numu_confusion_matrix": plot_confusion_matrix(
-            numu_labels,
-            numu_scores,
-            threshold,
-            output,
-            filename_suffix=".numu_confusion_matrix.png",
-            negative_label="not numu",
-            positive_label="numu",
-            score_name="numu_score",
-        ),
-        "numu_confusion_matrix_normalized": plot_confusion_matrix(
-            numu_labels,
-            numu_scores,
-            threshold,
-            output,
-            normalize=True,
-            filename_suffix=".numu_confusion_matrix_normalized.png",
-            negative_label="not numu",
-            positive_label="numu",
-            score_name="numu_score",
-        ),
-    }
 
 
 def plot_efficiency_rejection_vs_threshold(
@@ -1545,20 +1185,10 @@ def _ablation_metrics(
     pion_labels: np.ndarray,
     pion_scores: np.ndarray,
     pion_threshold: float,
-    fv_labels: np.ndarray,
-    fv_scores: np.ndarray,
-    fv_threshold: float,
-    numu_labels: np.ndarray,
-    numu_scores: np.ndarray,
-    numu_threshold: float,
 ) -> Dict[str, float]:
-    """Summarize all output heads for an MRD permutation trial."""
+    """Summarize the pion output for an MRD permutation trial."""
     pion_fpr, pion_tpr, _ = roc_curve(pion_labels, pion_scores)
-    fv_fpr, fv_tpr, _ = roc_curve(fv_labels, fv_scores)
-    numu_fpr, numu_tpr, _ = roc_curve(numu_labels, numu_scores)
     pion_point = pion_operating_point(pion_labels, pion_scores, pion_threshold)
-    fv_point = pion_operating_point(fv_labels, fv_scores, fv_threshold)
-    numu_point = pion_operating_point(numu_labels, numu_scores, numu_threshold)
     return {
         "pion_roc_auc": float(auc(pion_fpr, pion_tpr)),
         "pion_average_precision": float(
@@ -1570,22 +1200,6 @@ def _ablation_metrics(
         "pion_efficiency_x_purity": float(
             pion_point["efficiency_x_purity"]
         ),
-        "fv_roc_auc": float(auc(fv_fpr, fv_tpr)),
-        "fv_average_precision": float(
-            average_precision_score(fv_labels, fv_scores)
-        ),
-        "fv_brier_score": float(brier_score_loss(fv_labels, fv_scores)),
-        "fv_efficiency": float(fv_point["efficiency"]),
-        "fv_purity": float(fv_point["purity"]),
-        "numu_roc_auc": float(auc(numu_fpr, numu_tpr)),
-        "numu_average_precision": float(
-            average_precision_score(numu_labels, numu_scores)
-        ),
-        "numu_brier_score": float(
-            brier_score_loss(numu_labels, numu_scores)
-        ),
-        "numu_efficiency": float(numu_point["efficiency"]),
-        "numu_purity": float(numu_point["purity"]),
     }
 
 
@@ -1598,14 +1212,8 @@ def evaluate_mrd_permutation_importance(
     mrd_track_properties_test: np.ndarray,
     mrd_track_mask_test: np.ndarray,
     pion_labels: np.ndarray,
-    fv_labels: np.ndarray,
-    numu_labels: np.ndarray,
     full_pion_scores: np.ndarray,
-    full_fv_scores: np.ndarray,
-    full_numu_scores: np.ndarray,
     pion_threshold: float,
-    fv_threshold: float,
-    numu_threshold: float,
     output: Path,
     seed: int,
     repeats: int,
@@ -1615,12 +1223,6 @@ def evaluate_mrd_permutation_importance(
         pion_labels,
         full_pion_scores,
         pion_threshold,
-        fv_labels,
-        full_fv_scores,
-        fv_threshold,
-        numu_labels,
-        full_numu_scores,
-        numu_threshold,
     )
     rng = np.random.default_rng(seed + 104729)
     trial_rows = []
@@ -1643,12 +1245,6 @@ def evaluate_mrd_permutation_importance(
             pion_labels,
             np.asarray(outputs["pion_score"]).reshape(-1),
             pion_threshold,
-            fv_labels,
-            np.asarray(outputs["fv_score"]).reshape(-1),
-            fv_threshold,
-            numu_labels,
-            np.asarray(outputs["numu_score"]).reshape(-1),
-            numu_threshold,
         )
         trial_rows.append(
             {"mode": "mrd_permuted", "repeat": repeat + 1, **trial_metrics}
@@ -1685,19 +1281,11 @@ def evaluate_mrd_permutation_importance(
         "pion_roc_auc",
         "pion_average_precision",
         "pion_efficiency_x_purity",
-        "fv_roc_auc",
-        "fv_average_precision",
-        "numu_roc_auc",
-        "numu_average_precision",
     ]
     plotted_labels = [
         "Pion ROC AUC",
         "Pion average precision",
         "Pion efficiency × purity",
-        "FV ROC AUC",
-        "FV average precision",
-        "numu ROC AUC",
-        "numu average precision",
     ]
     positions = np.arange(len(plotted_metrics))
     width = 0.36
@@ -1742,7 +1330,7 @@ def evaluate_mrd_permutation_importance(
             "method": (
                 "All MRD inputs, including numMRDTracks, track positions, track "
                 "properties, and masks, were permuted together across held-out "
-                "events while PMT images, NoVeto, and truth labels stayed fixed."
+                "events while PMT images and truth labels stayed fixed."
             ),
             "interpretation": (
                 "A positive performance_drop means performance worsened when the "
@@ -2292,10 +1880,6 @@ def plot_training_curves(history_path: Path, output: Path) -> str:
         ("loss", "val_loss"),
         ("pion_score_roc_auc", "val_pion_score_roc_auc"),
         ("pion_score_pr_auc", "val_pion_score_pr_auc"),
-        ("fv_score_roc_auc", "val_fv_score_roc_auc"),
-        ("fv_score_pr_auc", "val_fv_score_pr_auc"),
-        ("numu_score_roc_auc", "val_numu_score_roc_auc"),
-        ("numu_score_pr_auc", "val_numu_score_pr_auc"),
     ]
     pairs = [pair for pair in pairs if pair[0] in rows[0] and pair[1] in rows[0]]
     if not pairs:
@@ -2328,10 +1912,7 @@ def _format_event_features(
 ) -> Tuple[str, str]:
     """Format the MRD multiplicity and retained exact start positions."""
     num_mrd_tracks = feature_values[0]
-    no_veto = feature_values[1]
-    scalar_text = (
-        f"numMRDTracks={num_mrd_tracks:.0f}, NoVeto={no_veto:.0f}"
-    )
+    scalar_text = f"numMRDTracks={num_mrd_tracks:.0f}"
     valid_positions = track_starts[track_mask.astype(bool)]
     valid_properties = track_properties[track_mask.astype(bool)]
     if len(valid_positions) == 0:
@@ -2340,7 +1921,8 @@ def _format_event_features(
         position_text = "MRD tracks: " + "; ".join(
             (
                 f"{index}: start=({x:.3f}, {y:.3f}, {z:.3f}), "
-                f"dE={energy_loss:.3f}, L={length:.3f}, angle={angle:.3f}"
+                f"dE={energy_loss:.3f}, L={length:.3f}, "
+                f"MRD angle={np.degrees(angle):.1f}°"
             )
             for index, ((x, y, z), (energy_loss, length, angle)) in enumerate(
                 zip(valid_positions, valid_properties)
@@ -2623,185 +2205,266 @@ def plot_pion_example_pages(
     truth_pion_kinetic_energy_test: np.ndarray,
     output: Path,
     threshold: float,
-    examples_per_page: int = 3,
-) -> List[str]:
-    """Draw charged-, high-, boundary-, and low-score truth-pion pages."""
+    examples_per_category: int = 5,
+    max_examples: int = 20,
+) -> Tuple[List[str], int]:
+    """Write up to 20 readable truth-pion examples to one multipage PDF."""
     pion_indices = np.flatnonzero(y_test == 1)
     if len(pion_indices) == 0:
-        return []
+        return [], 0
 
     charged_pion_indices = pion_indices[
-        (truth_pion_counts_test[pion_indices, 0]
-         + truth_pion_counts_test[pion_indices, 1]) > 0
+        (
+            truth_pion_counts_test[pion_indices, 0]
+            + truth_pion_counts_test[pion_indices, 1]
+        )
+        > 0
     ]
     ranking_options = [
         (
-            "charged_pions",
-            "Held-out truth charged-pion events",
+            "Charged-pion example",
             charged_pion_indices[
                 np.argsort(test_scores[charged_pion_indices])[::-1]
             ],
         ),
         (
-            "high_score",
-            "Highest-scoring held-out truth-pion events",
+            "High pion-score example",
             pion_indices[np.argsort(test_scores[pion_indices])[::-1]],
         ),
         (
-            "boundary_score",
-            f"Truth-pion events closest to score threshold {threshold:.2f}",
+            "Decision-boundary example",
             pion_indices[
                 np.argsort(np.abs(test_scores[pion_indices] - threshold))
             ],
         ),
         (
-            "low_score",
-            "Lowest-scoring held-out truth-pion events",
+            "Low pion-score example",
             pion_indices[np.argsort(test_scores[pion_indices])],
         ),
     ]
+
+    used_indices = set()
+    selected_categories = []
+    for category_title, candidates in ranking_options:
+        category_indices = []
+        for event_index in candidates:
+            integer_index = int(event_index)
+            if integer_index in used_indices:
+                continue
+            category_indices.append(integer_index)
+            used_indices.add(integer_index)
+            if len(category_indices) == examples_per_category:
+                break
+        if category_indices:
+            selected_categories.append((category_title, category_indices))
+        if len(used_indices) >= max_examples:
+            break
+
+    target_count = min(max_examples, len(pion_indices))
+    if len(used_indices) < target_count:
+        additional_indices = []
+        for event_index in pion_indices[np.argsort(test_scores[pion_indices])[::-1]]:
+            integer_index = int(event_index)
+            if integer_index in used_indices:
+                continue
+            additional_indices.append(integer_index)
+            used_indices.add(integer_index)
+            if len(used_indices) == target_count:
+                break
+        if additional_indices:
+            selected_categories.append(
+                ("Additional representative pion example", additional_indices)
+            )
+
     raw_column_titles = [
         "Angular full hitPE",
         "Angular tank-cluster hitPE",
         "Unfolded full hitPE",
         "Unfolded tank-cluster hitPE",
     ]
-    used_indices = set()
-    output_names = []
-    for page_tag, page_title, candidates in ranking_options:
-        order = []
-        for event_index in candidates:
-            integer_index = int(event_index)
-            if integer_index in used_indices:
-                continue
-            order.append(integer_index)
-            used_indices.add(integer_index)
-            if len(order) == examples_per_page:
-                break
-        if not order:
-            continue
+    pdf_path = output.with_suffix(".pion_examples.pdf")
+    example_number = 0
+    with PdfPages(
+        pdf_path,
+        metadata={
+            "Title": "ANNIE held-out truth-pion examples",
+            "Subject": (
+                "Readable event information plus PMT images and Grad-CAM maps"
+            ),
+        },
+    ) as pdf:
+        for category_title, order in selected_categories:
+            angular_batch = images_test[order]
+            detector_batch = detector_images_test[order]
+            model_inputs = {
+                "pmt_angular_image": angular_batch,
+                "pmt_unfolded_image": detector_batch,
+                "event_features": event_features_test[order],
+                "mrd_track_starts": mrd_track_starts_test[order],
+                "mrd_track_properties": mrd_track_properties_test[order],
+                "mrd_track_mask": mrd_track_mask_test[order],
+            }
+            angular_heatmaps = _grad_cam_heatmaps(
+                model,
+                "angular_conv3",
+                model_inputs,
+                (angular_batch.shape[1], angular_batch.shape[2]),
+            )
+            detector_heatmaps = _grad_cam_heatmaps(
+                model,
+                "detector_conv3",
+                model_inputs,
+                (detector_batch.shape[1], detector_batch.shape[2]),
+            )
 
-        angular_batch = images_test[order]
-        detector_batch = detector_images_test[order]
-        model_inputs = {
-            "pmt_angular_image": angular_batch,
-            "pmt_unfolded_image": detector_batch,
-            "event_features": event_features_test[order],
-            "mrd_track_starts": mrd_track_starts_test[order],
-            "mrd_track_properties": mrd_track_properties_test[order],
-            "mrd_track_mask": mrd_track_mask_test[order],
-        }
-        angular_heatmaps = _grad_cam_heatmaps(
-            model,
-            "angular_conv3",
-            model_inputs,
-            (angular_batch.shape[1], angular_batch.shape[2]),
-        )
-        detector_heatmaps = _grad_cam_heatmaps(
-            model,
-            "detector_conv3",
-            model_inputs,
-            (detector_batch.shape[1], detector_batch.shape[2]),
-        )
-
-        fig, axes = plt.subplots(
-            len(order), 6, figsize=(23, 3.8 * len(order)), squeeze=False
-        )
-        for row_index, event_index in enumerate(order):
-            angular = angular_batch[row_index][:, 1:-1, :]
-            detector = detector_batch[row_index]
-            panels = [
-                (angular[:, :, 0], "auto"),
-                (angular[:, :, 1], "auto"),
-                (detector[:, :, 0], "equal"),
-                (detector[:, :, 1], "equal"),
-            ]
-            for column, ((panel, aspect), title) in enumerate(
-                zip(panels, raw_column_titles)
-            ):
-                axes[row_index, column].imshow(
-                    panel, origin="lower", aspect=aspect, cmap="magma"
+            for row_index, event_index in enumerate(order):
+                example_number += 1
+                angular = angular_batch[row_index][:, 1:-1, :]
+                detector = detector_batch[row_index]
+                fig = plt.figure(figsize=(17, 9.5))
+                grid = fig.add_gridspec(
+                    2,
+                    6,
+                    height_ratios=(1.45, 4.5),
+                    left=0.035,
+                    right=0.985,
+                    bottom=0.07,
+                    top=0.91,
+                    hspace=0.20,
+                    wspace=0.28,
                 )
-                axes[row_index, column].set_title(title, fontsize=9)
+                info_axis = fig.add_subplot(grid[0, :])
+                info_axis.axis("off")
+                panel_axes = [fig.add_subplot(grid[1, column]) for column in range(6)]
 
-            angular_heat = angular_heatmaps[row_index][:, 1:-1]
-            axes[row_index, 4].imshow(
-                angular[:, :, 0], origin="lower", aspect="auto", cmap="gray"
-            )
-            axes[row_index, 4].imshow(
-                angular_heat,
-                origin="lower",
-                aspect="auto",
-                cmap="jet",
-                alpha=0.55,
-                vmin=0.0,
-                vmax=1.0,
-            )
-            axes[row_index, 4].set_title(
-                "Angular Grad-CAM\n(red = strongest influence)", fontsize=9
-            )
+                panels = [
+                    (angular[:, :, 0], "auto"),
+                    (angular[:, :, 1], "auto"),
+                    (detector[:, :, 0], "equal"),
+                    (detector[:, :, 1], "equal"),
+                ]
+                for axis, (panel, aspect), title in zip(
+                    panel_axes[:4], panels, raw_column_titles
+                ):
+                    axis.imshow(panel, origin="lower", aspect=aspect, cmap="magma")
+                    axis.set_title(title, fontsize=9)
 
-            axes[row_index, 5].imshow(
-                detector[:, :, 0], origin="lower", aspect="equal", cmap="gray"
-            )
-            axes[row_index, 5].imshow(
-                detector_heatmaps[row_index],
-                origin="lower",
-                aspect="equal",
-                cmap="jet",
-                alpha=0.55,
-                vmin=0.0,
-                vmax=1.0,
-            )
-            axes[row_index, 5].set_title(
-                "Unfolded Grad-CAM\n(red = strongest influence)", fontsize=9
-            )
-            pi_plus, pi_minus, pi_zero = (
-                int(value) for value in truth_pion_counts_test[event_index]
-            )
-            source_name = Path(str(source_paths_test[event_index])).name
-            opening_angle = truth_muon_pion_angles_test[event_index]
-            angle_text = (
-                f"truth leading π–μ angle={opening_angle:.1f}°"
-                if np.isfinite(opening_angle)
-                else "truth leading π–μ angle=n/a"
-            )
-            muon_kinetic_energy = truth_muon_kinetic_energy_test[event_index]
-            pion_kinetic_energy = truth_pion_kinetic_energy_test[event_index]
-            muon_energy_text = (
-                f"Tμ={muon_kinetic_energy:.3f} GeV"
-                if np.isfinite(muon_kinetic_energy)
-                else "Tμ=n/a"
-            )
-            pion_energy_text = (
-                f"Tπ={pion_kinetic_energy:.3f} GeV"
-                if np.isfinite(pion_kinetic_energy)
-                else "Tπ=n/a"
-            )
-            scalar_text, position_text = _format_event_features(
-                event_features_test[event_index],
-                mrd_track_starts_test[event_index],
-                mrd_track_properties_test[event_index],
-                mrd_track_mask_test[event_index],
-            )
-            axes[row_index, 0].set_ylabel(
-                f"{source_name}\nentry {int(entries_test[event_index])}\n"
-                f"score={test_scores[event_index]:.3f}\n"
-                f"π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}\n{angle_text}\n"
-                f"{scalar_text}\n{position_text}\n"
-                f"truth {muon_energy_text}, {pion_energy_text}",
-                fontsize=8,
-            )
-        fig.suptitle(
-            f"{page_title} (truth information is annotation only)",
-            fontsize=12,
+                angular_heat = angular_heatmaps[row_index][:, 1:-1]
+                panel_axes[4].imshow(
+                    angular[:, :, 0], origin="lower", aspect="auto", cmap="gray"
+                )
+                panel_axes[4].imshow(
+                    angular_heat,
+                    origin="lower",
+                    aspect="auto",
+                    cmap="jet",
+                    alpha=0.55,
+                    vmin=0.0,
+                    vmax=1.0,
+                )
+                panel_axes[4].set_title(
+                    "Angular Grad-CAM\n(red = strongest influence)", fontsize=9
+                )
+
+                panel_axes[5].imshow(
+                    detector[:, :, 0], origin="lower", aspect="equal", cmap="gray"
+                )
+                panel_axes[5].imshow(
+                    detector_heatmaps[row_index],
+                    origin="lower",
+                    aspect="equal",
+                    cmap="jet",
+                    alpha=0.55,
+                    vmin=0.0,
+                    vmax=1.0,
+                )
+                panel_axes[5].set_title(
+                    "Unfolded Grad-CAM\n(red = strongest influence)", fontsize=9
+                )
+
+                pi_plus, pi_minus, pi_zero = (
+                    int(value) for value in truth_pion_counts_test[event_index]
+                )
+                source_name = Path(str(source_paths_test[event_index])).name
+                opening_angle = truth_muon_pion_angles_test[event_index]
+                angle_text = (
+                    f"truth leading π–μ angle={opening_angle:.1f}°"
+                    if np.isfinite(opening_angle)
+                    else "truth leading π–μ angle=n/a"
+                )
+                muon_kinetic_energy = truth_muon_kinetic_energy_test[event_index]
+                pion_kinetic_energy = truth_pion_kinetic_energy_test[event_index]
+                muon_energy_text = (
+                    f"Tμ={muon_kinetic_energy:.3f} GeV"
+                    if np.isfinite(muon_kinetic_energy)
+                    else "Tμ=n/a"
+                )
+                pion_energy_text = (
+                    f"Tπ={pion_kinetic_energy:.3f} GeV"
+                    if np.isfinite(pion_kinetic_energy)
+                    else "Tπ=n/a"
+                )
+                scalar_text, position_text = _format_event_features(
+                    event_features_test[event_index],
+                    mrd_track_starts_test[event_index],
+                    mrd_track_properties_test[event_index],
+                    mrd_track_mask_test[event_index],
+                )
+                track_text = position_text.replace(
+                    "MRD tracks: ", "MRD tracks:\n"
+                ).replace("; ", "\n")
+                prediction_text = (
+                    "pion-like"
+                    if test_scores[event_index] >= threshold
+                    else "non-pion-like"
+                )
+                info_text = (
+                    f"File: {source_name}    Entry: {int(entries_test[event_index])}    "
+                    f"pion_score={test_scores[event_index]:.3f} "
+                    f"(threshold={threshold:.3f}, {prediction_text})\n"
+                    f"Truth: π⁺={pi_plus}, π⁻={pi_minus}, π⁰={pi_zero}    "
+                    f"{angle_text}    {muon_energy_text}    {pion_energy_text}\n"
+                    f"{scalar_text}\n{track_text}"
+                )
+                info_axis.text(
+                    0.01,
+                    0.98,
+                    info_text,
+                    transform=info_axis.transAxes,
+                    va="top",
+                    ha="left",
+                    fontsize=9.5,
+                    linespacing=1.25,
+                    family="monospace",
+                    bbox={
+                        "boxstyle": "round,pad=0.55",
+                        "facecolor": "#f4f4f4",
+                        "edgecolor": "#777777",
+                        "linewidth": 0.8,
+                    },
+                )
+                fig.suptitle(
+                    (
+                        f"{category_title} — event {example_number} of "
+                        f"{target_count} (truth information is annotation only)"
+                    ),
+                    fontsize=13,
+                )
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+    print(
+        f"Wrote {example_number} readable pion examples to {pdf_path}"
+        + (
+            ""
+            if example_number >= 15
+            else " (fewer than 15 truth-pion test events were available)"
         )
-        fig.tight_layout()
-        path = output.with_suffix(f".pion_examples_{page_tag}.png")
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
-        output_names.append(path.name)
-    return output_names
+    )
+    return [pdf_path.name], example_number
+
+
+
 
 
 def _grad_cam_heatmaps(
@@ -2935,16 +2598,12 @@ def evaluate_and_plot(
     mrd_track_properties_test: np.ndarray,
     mrd_track_mask_test: np.ndarray,
     y_test: np.ndarray,
-    fv_labels_test: np.ndarray,
-    numu_labels_test: np.ndarray,
     source_paths_test: np.ndarray,
     entries_test: np.ndarray,
     truth_pion_counts_test: np.ndarray,
     history_path: Path,
     output: Path,
     threshold: float,
-    fv_threshold: float,
-    numu_threshold: float,
     tree_name: str,
     opening_angle_degree_branch: str = "",
     seed: int = 0,
@@ -2963,8 +2622,6 @@ def evaluate_and_plot(
         verbose=0,
     )
     test_scores = np.asarray(prediction_outputs["pion_score"]).reshape(-1)
-    fv_scores = np.asarray(prediction_outputs["fv_score"]).reshape(-1)
-    numu_scores = np.asarray(prediction_outputs["numu_score"]).reshape(-1)
     mrd_ablation = evaluate_mrd_permutation_importance(
         model,
         images_test,
@@ -2974,14 +2631,8 @@ def evaluate_and_plot(
         mrd_track_properties_test,
         mrd_track_mask_test,
         y_test,
-        fv_labels_test,
-        numu_labels_test,
         test_scores,
-        fv_scores,
-        numu_scores,
         threshold,
-        fv_threshold,
-        numu_threshold,
         output,
         seed,
         mrd_ablation_repeats,
@@ -3070,8 +2721,6 @@ def evaluate_and_plot(
                 "source_file",
                 "tree_entry",
                 "true_label",
-                "trueFV",
-                "mc_is_numu_cc",
                 "truePiPlusCher",
                 "truePiMinusCher",
                 "truePi0",
@@ -3080,17 +2729,11 @@ def evaluate_and_plot(
                 "truth_leading_pion_total_energy_GeV",
                 "truth_muon_kinetic_energy_GeV",
                 "truth_leading_pion_kinetic_energy_GeV",
-                *RING_EVENT_FEATURE_NAMES,
+                *PION_EVENT_FEATURE_NAMES,
                 *track_column_names,
                 "pion_score",
                 "pion_threshold",
                 "pion_prediction",
-                "fv_score",
-                "fv_threshold",
-                "fv_prediction",
-                "numu_score",
-                "numu_threshold",
-                "numu_prediction",
             ]
         )
         for event_index in range(len(y_test)):
@@ -3112,8 +2755,6 @@ def evaluate_and_plot(
                     source_paths_test[event_index],
                     int(entries_test[event_index]),
                     int(y_test[event_index]),
-                    int(fv_labels_test[event_index]),
-                    int(numu_labels_test[event_index]),
                     *truth_pion_counts_test[event_index].astype(int),
                     float(truth_leading_pion_pdg[event_index]),
                     float(truth_muon_pion_angles[event_index]),
@@ -3125,12 +2766,6 @@ def evaluate_and_plot(
                     float(test_scores[event_index]),
                     float(threshold),
                     int(test_scores[event_index] >= threshold),
-                    float(fv_scores[event_index]),
-                    float(fv_threshold),
-                    int(fv_scores[event_index] >= fv_threshold),
-                    float(numu_scores[event_index]),
-                    float(numu_threshold),
-                    int(numu_scores[event_index] >= numu_threshold),
                 ]
             )
 
@@ -3148,7 +2783,7 @@ def evaluate_and_plot(
     ) = plot_efficiency_purity_vs_threshold(
         y_test, test_scores, output, threshold
     )
-    pion_example_pages = plot_pion_example_pages(
+    pion_example_pages, pion_example_event_count = plot_pion_example_pages(
         model,
         images_test,
         detector_images_test,
@@ -3267,6 +2902,7 @@ def evaluate_and_plot(
             threshold,
         ),
         "pion_example_pages": pion_example_pages,
+        "pion_example_event_count": pion_example_event_count,
         "gradcam_examples": plot_gradcam_examples(
             model,
             images_test,
@@ -3280,35 +2916,120 @@ def evaluate_and_plot(
             output,
             threshold,
         ),
-        **plot_fv_diagnostics(
-            fv_labels_test,
-            fv_scores,
-            output,
-            fv_threshold,
-        ),
-        **plot_numu_diagnostics(
-            numu_labels_test,
-            numu_scores,
-            output,
-            numu_threshold,
-        ),
         **mrd_ablation,
         **mrd_branch_importance,
     }
 
 
+def write_training_summary(output: Path, summary: Dict[str, object]) -> Tuple[str, str]:
+    """Write compact machine-readable and human-readable run summaries."""
+    json_path = output.with_suffix(".training_summary.json")
+    text_path = output.with_suffix(".training_summary.txt")
+    json_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+
+    lines = [
+        "ANNIE pion-ID training summary",
+        "===============================",
+        f"Model: {output}",
+        f"Output: pion_score only",
+        f"Selection: {summary['event_selection_expression']}",
+        f"PMT response: {summary['training_pmt_response']}",
+        "",
+        "Input files",
+        "-----------",
+    ]
+    for file_info in summary["input_files"]:
+        lines.extend(
+            [
+                f"- {file_info['source']}",
+                (
+                    f"  response={file_info['pmt_response']}; "
+                    f"read={file_info['events_read']}; "
+                    f"selected={file_info['events_selected']}; "
+                    f"no_pion={file_info['no_pion_selected']}; "
+                    f"pion={file_info['pion_selected']}; "
+                    "misaligned_rejected="
+                    f"{file_info['misaligned_events_rejected']}"
+                ),
+            ]
+        )
+    split = summary["data_split"]
+    classes = summary["class_counts"]
+    performance = summary["test_performance"]
+    operating_point = performance["configured_operating_point"]
+    lines.extend(
+        [
+            "",
+            "Event counts",
+            "------------",
+            f"Read: {summary['events_read']}",
+            (
+                f"Selected: {summary['events_selected']} "
+                f"({100.0 * summary['selection_efficiency']:.2f}%)"
+            ),
+            (
+                f"Truth classes: no pion={classes['no_pion']}, "
+                f"pion={classes['pion']}"
+            ),
+            (
+                f"Split: train={split['training_events']}, "
+                f"validation={split['validation_events']}, "
+                f"test={split['testing_events']}"
+            ),
+            "",
+            "Training",
+            "--------",
+            (
+                f"Epochs: {summary['epochs_completed']} completed / "
+                f"{summary['epochs_requested']} requested"
+            ),
+            f"Batch size: {summary['batch_size']}",
+            f"Trainable parameters: {summary['trainable_parameters']}",
+            (
+                "Truth pion-muon opening-angle unit: "
+                f"{summary['truth_muon_pion_opening_angle_units']}"
+            ),
+            f"Training time: {summary['training_seconds']:.1f} s",
+            f"Total run time: {summary['total_seconds']:.1f} s",
+            (
+                f"Pion example events: {summary['pion_example_event_count']} "
+                f"({summary['pion_example_pdf']})"
+            ),
+            (
+                "Best validation PR AUC: "
+                f"{summary['best_validation_pr_auc']:.6f} at epoch "
+                f"{summary['best_validation_epoch']}"
+                if summary["best_validation_pr_auc"] is not None
+                else "Best validation PR AUC: unavailable"
+            ),
+            "",
+            "Held-out pion performance",
+            "-------------------------",
+            f"ROC AUC: {performance['roc_auc']:.6f}",
+            f"Average precision: {performance['average_precision']:.6f}",
+            f"Brier score: {performance['brier_score']:.6f}",
+            (
+                f"At pion_score >= {operating_point['threshold']:.3f}: "
+                f"efficiency={operating_point['efficiency']:.6f}, "
+                f"purity={operating_point['purity']:.6f}, "
+                "efficiency*purity="
+                f"{operating_point['efficiency_x_purity']:.6f}, "
+                f"F1={operating_point['f1_score']:.6f}, "
+                "balanced_accuracy="
+                f"{operating_point['balanced_accuracy']:.6f}, "
+                f"MCC={operating_point['matthews_correlation_coefficient']:.6f}"
+            ),
+        ]
+    )
+    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return json_path.name, text_path.name
+
+
 def main() -> None:
     args = parse_args()
+    run_start_time = time.perf_counter()
     if not 0.0 <= args.threshold <= 1.0:
         raise ValueError("--threshold must be between 0 and 1")
-    if not 0.0 <= args.fv_threshold <= 1.0:
-        raise ValueError("--fv-threshold must be between 0 and 1")
-    if not 0.0 <= args.numu_threshold <= 1.0:
-        raise ValueError("--numu-threshold must be between 0 and 1")
-    if args.fv_loss_weight <= 0.0:
-        raise ValueError("--fv-loss-weight must be positive")
-    if args.numu_loss_weight <= 0.0:
-        raise ValueError("--numu-loss-weight must be positive")
     if args.mrd_ablation_repeats < 1:
         raise ValueError("--mrd-ablation-repeats must be at least 1")
     if args.mrd_branch_importance_repeats < 1:
@@ -3321,6 +3042,7 @@ def main() -> None:
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
 
+    data_load_start_time = time.perf_counter()
     (
         images,
         detector_images,
@@ -3329,8 +3051,6 @@ def main() -> None:
         mrd_track_properties,
         mrd_track_mask,
         labels,
-        fv_labels,
-        numu_labels,
         source_paths,
         entries,
         truth_pion_counts,
@@ -3340,6 +3060,7 @@ def main() -> None:
         geometry,
         response_info,
     ) = load_data(args)
+    data_loading_seconds = time.perf_counter() - data_load_start_time
     responses = response_info["responses"]
     response_modes = sorted(responses)
     training_pmt_response = (
@@ -3359,73 +3080,33 @@ def main() -> None:
     counts = np.bincount(labels.astype(np.int64), minlength=2)
     if np.any(counts == 0):
         raise ValueError(f"Both classes are required; class counts are {counts.tolist()}")
-    fv_counts = np.bincount(fv_labels.astype(np.int64), minlength=2)
-    if np.any(fv_counts == 0):
-        raise ValueError(
-            f"Both trueFV classes are required; class counts are {fv_counts.tolist()}"
-        )
-    numu_counts = np.bincount(numu_labels.astype(np.int64), minlength=2)
-    if np.any(numu_counts == 0):
-        raise ValueError(
-            "Both mc_is_numu_cc classes are required; class counts are "
-            f"{numu_counts.tolist()}"
-        )
     indices = np.arange(len(labels))
-    joint_strata = (
-        4 * labels.astype(np.int64)
-        + 2 * fv_labels.astype(np.int64)
-        + numu_labels.astype(np.int64)
-    )
-    joint_values, joint_counts = np.unique(joint_strata, return_counts=True)
-    joint_count_summary = {
-        str(int(value)): int(count)
-        for value, count in zip(joint_values, joint_counts)
-    }
     try:
         train_indices, temp_indices = train_test_split(
             indices,
             test_size=VALIDATION_FRACTION + TEST_FRACTION,
             random_state=args.seed,
-            stratify=joint_strata,
+            stratify=labels,
         )
         val_indices, test_indices = train_test_split(
             temp_indices,
             test_size=TEST_FRACTION / (VALIDATION_FRACTION + TEST_FRACTION),
             random_state=args.seed,
-            stratify=joint_strata[temp_indices],
+            stratify=labels[temp_indices],
         )
     except ValueError as error:
         raise ValueError(
-            "Could not create the 70/15/15 split stratified by the joint "
-            "pion/FV/numu label. Some observed combinations have too few "
-            f"events. Encoded joint counts: {joint_count_summary}"
+            "Could not create the 70/15/15 split stratified by the pion label. "
+            f"Class counts: {counts.tolist()}"
         ) from error
     y_train = labels[train_indices]
     y_test = labels[test_indices]
-    fv_train = fv_labels[train_indices]
-    fv_test = fv_labels[test_indices]
-    numu_train = numu_labels[train_indices]
-    numu_test = numu_labels[test_indices]
     train_counts = np.bincount(y_train.astype(np.int64), minlength=2)
     pion_class_weight = {
         0: len(y_train) / (2.0 * train_counts[0]),
         1: len(y_train) / (2.0 * train_counts[1]),
     }
-    fv_train_counts = np.bincount(fv_train.astype(np.int64), minlength=2)
-    fv_class_weight = {
-        0: len(fv_train) / (2.0 * fv_train_counts[0]),
-        1: len(fv_train) / (2.0 * fv_train_counts[1]),
-    }
-    numu_train_counts = np.bincount(numu_train.astype(np.int64), minlength=2)
-    numu_class_weight = {
-        0: len(numu_train) / (2.0 * numu_train_counts[0]),
-        1: len(numu_train) / (2.0 * numu_train_counts[1]),
-    }
-    training_class_weights = {
-        "pion_score": pion_class_weight,
-        "fv_score": fv_class_weight,
-        "numu_score": numu_class_weight,
-    }
+    training_class_weights = {"pion_score": pion_class_weight}
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     history_path = args.output.with_suffix(".history.csv")
@@ -3444,8 +3125,6 @@ def main() -> None:
         mrd_track_starts[train_indices],
         mrd_track_properties[train_indices],
         mrd_track_mask[train_indices],
-        args.fv_loss_weight,
-        args.numu_loss_weight,
     )
     sequence_arguments = (
         images,
@@ -3455,8 +3134,6 @@ def main() -> None:
         mrd_track_properties,
         mrd_track_mask,
         labels,
-        fv_labels,
-        numu_labels,
     )
     train_sequence = RingBatchSequence(
         *sequence_arguments,
@@ -3485,7 +3162,8 @@ def main() -> None:
         f"Stored PMT images as {images.dtype} using "
         f"{image_storage_gib:.2f} GiB; training batches are loaded on demand."
     )
-    model.fit(
+    training_start_time = time.perf_counter()
+    fit_history = model.fit(
         train_sequence,
         validation_data=validation_sequence,
         epochs=args.epochs,
@@ -3508,6 +3186,7 @@ def main() -> None:
         ],
         verbose=2,
     )
+    training_seconds = time.perf_counter() - training_start_time
     metrics = model.evaluate(
         test_sequence,
         return_dict=True,
@@ -3527,16 +3206,12 @@ def main() -> None:
         mrd_track_properties[test_indices],
         mrd_track_mask[test_indices],
         y_test,
-        fv_test,
-        numu_test,
         source_paths[test_indices],
         entries[test_indices],
         truth_pion_counts[test_indices],
         history_path,
         args.output,
         args.threshold,
-        args.fv_threshold,
-        args.numu_threshold,
         args.tree,
         args.muon_pion_opening_angle_deg_branch or "",
         args.seed,
@@ -3548,22 +3223,113 @@ def main() -> None:
         f"{evaluation_files['roc_auc_sklearn']:.5f}; "
         f"average precision: {evaluation_files['average_precision']:.5f}"
     )
-    print(
-        "FV ROC AUC cross-check: "
-        f"{evaluation_files['fv_roc_auc']:.5f}; "
-        f"average precision: {evaluation_files['fv_average_precision']:.5f}"
+    val_pr_history = fit_history.history.get("val_pion_score_pr_auc", [])
+    best_validation_pr_auc = (
+        float(np.max(val_pr_history)) if val_pr_history else None
     )
-    print(
-        "numu ROC AUC cross-check: "
-        f"{evaluation_files['numu_roc_auc']:.5f}; "
-        f"average precision: {evaluation_files['numu_average_precision']:.5f}"
+    best_validation_epoch = (
+        int(np.argmax(val_pr_history) + 1) if val_pr_history else None
+    )
+    split_class_counts = {
+        "training": {
+            "no_pion": int(np.sum(labels[train_indices] == 0)),
+            "pion": int(np.sum(labels[train_indices] == 1)),
+        },
+        "validation": {
+            "no_pion": int(np.sum(labels[val_indices] == 0)),
+            "pion": int(np.sum(labels[val_indices] == 1)),
+        },
+        "testing": {
+            "no_pion": int(np.sum(labels[test_indices] == 0)),
+            "pion": int(np.sum(labels[test_indices] == 1)),
+        },
+    }
+    training_summary = {
+        "model_file": args.output.name,
+        "output_heads": ["pion_score"],
+        "input_files": response_info["files"],
+        "input_file_count": len(response_info["files"]),
+        "events_read": int(
+            sum(file_info["events_read"] for file_info in response_info["files"])
+        ),
+        "events_selected": int(len(labels)),
+        "selection_efficiency": float(
+            len(labels)
+            / max(
+                1,
+                sum(
+                    file_info["events_read"]
+                    for file_info in response_info["files"]
+                ),
+            )
+        ),
+        "event_selection_expression": (
+            "none" if args.no_event_cuts else PION_ID_SELECTION_EXPRESSION
+        ),
+        "training_pmt_response": training_pmt_response,
+        "image_branches": [args.hitpe_branch, tank_branch],
+        "scalar_features": PION_EVENT_FEATURE_NAMES,
+        "mrd_track_start_branches": MRD_TRACK_START_BRANCHES,
+        "mrd_track_property_branches": MRD_TRACK_PROPERTY_BRANCHES,
+        "truth_muon_pion_opening_angle_units": "degrees",
+        "class_counts": {"no_pion": int(counts[0]), "pion": int(counts[1])},
+        "split_class_counts": split_class_counts,
+        "data_split": {
+            "training_events": int(len(train_indices)),
+            "validation_events": int(len(val_indices)),
+            "testing_events": int(len(test_indices)),
+            "fractions": [TRAIN_FRACTION, VALIDATION_FRACTION, TEST_FRACTION],
+            "stratified_by": "pion label",
+            "random_seed": args.seed,
+        },
+        "class_weights": {
+            str(class_id): float(weight)
+            for class_id, weight in pion_class_weight.items()
+        },
+        "epochs_requested": int(args.epochs),
+        "epochs_completed": int(len(fit_history.epoch)),
+        "stopped_early": bool(len(fit_history.epoch) < args.epochs),
+        "best_validation_pr_auc": best_validation_pr_auc,
+        "best_validation_epoch": best_validation_epoch,
+        "batch_size": int(args.batch_size),
+        "model_parameters": int(model.count_params()),
+        "trainable_parameters": int(
+            sum(np.prod(variable.shape) for variable in model.trainable_weights)
+        ),
+        "data_loading_seconds": float(data_loading_seconds),
+        "training_seconds": float(training_seconds),
+        "total_seconds": float(time.perf_counter() - run_start_time),
+        "pion_example_event_count": int(
+            evaluation_files["pion_example_event_count"]
+        ),
+        "pion_example_pdf": evaluation_files["pion_example_pages"][0]
+        if evaluation_files["pion_example_pages"]
+        else None,
+        "test_keras_metrics": {
+            name: float(value) for name, value in metrics.items()
+        },
+        "test_performance": {
+            "roc_auc": float(evaluation_files["roc_auc_sklearn"]),
+            "average_precision": float(evaluation_files["average_precision"]),
+            "brier_score": float(evaluation_files["brier_score"]),
+            "configured_operating_point": evaluation_files[
+                "pion_metrics_at_configured_threshold"
+            ],
+            "threshold_0p80_operating_point": evaluation_files[
+                "pion_metrics_at_threshold_0p80"
+            ],
+        },
+    }
+    summary_json_name, summary_text_name = write_training_summary(
+        args.output, training_summary
     )
     metadata = {
         "model_type": "annie_pion_ring_cnn",
-        "model_variant": "C_head_specific_image_and_scalar_routing_pion_fv_numu",
+        "model_variant": "pion_only_full_and_tankcluster_images_plus_mrd",
         "tensorflow_version": tf.__version__,
         "training_sources": training_sources,
         "training_source_groups": response_info["groups"],
+        "training_source_files": response_info["files"],
         "tree": args.tree,
         "geometry_file": args.geometry.name,
         "pmt_mask": args.pmt_mask,
@@ -3597,17 +3363,13 @@ def main() -> None:
         "training_data_feeding": "indexed_batches_without_split_copies",
         "batch_size": args.batch_size,
         "root_chunk_size": args.chunk_size,
-        "image_channel_source": "head_specific_full_and_tankcluster",
+        "image_channel_source": "full_event_and_tankcluster",
         "image_channel_count": 2,
         "head_image_channels": {
             "pion_score": [args.hitpe_branch, tank_branch],
-            "fv_score": [tank_branch],
-            "numu_score": [args.hitpe_branch, tank_branch],
         },
         "head_scalar_features": {
             "pion_score": ["numMRDTracks"],
-            "fv_score": ["numMRDTracks"],
-            "numu_score": ["numMRDTracks", "NoVeto"],
         },
         "channels": [
             (
@@ -3634,8 +3396,8 @@ def main() -> None:
             "annotation_free_unfolded_barrel_top_bottom",
         ],
         "event_feature_input_name": "event_features",
-        "event_feature_names": RING_EVENT_FEATURE_NAMES,
-        "event_feature_scalar_branches": RING_EVENT_SCALAR_BRANCHES,
+        "event_feature_names": PION_EVENT_FEATURE_NAMES,
+        "event_feature_scalar_branches": PION_EVENT_FEATURE_NAMES,
         "mrd_track_start_input_name": "mrd_track_starts",
         "mrd_track_property_input_name": "mrd_track_properties",
         "mrd_track_mask_input_name": "mrd_track_mask",
@@ -3650,22 +3412,16 @@ def main() -> None:
         "mrd_track_overflow_policy": "first_four_in_stored_branch_order",
         "mrd_track_overflow_events": n_mrd_tracks_truncated,
         "event_feature_preprocessing": (
-            "numMRDTracks_and_NoVeto_scalars_plus_zero_padded_mrd_xyz_and_"
+            "numMRDTracks_scalar_plus_zero_padded_mrd_xyz_and_"
             "energy_loss_length_angle_track_set_and_mask;_separate_"
             "normalization_adapted_on_training_values_and_valid_tracks_only;_"
-            "fixed_head_specific_scalar_routing_plus_masked_permutation_"
-            "invariant_max_pooling"
+            "masked_permutation_invariant_max_pooling"
         ),
         "label": "charged_pion_present" if args.charged_only else "any_pion_present",
-        "output_heads": ["pion_score", "fv_score", "numu_score"],
-        "fv_label": "trueFV",
-        "fv_truth_used_as_input": False,
-        "fv_loss_weight": args.fv_loss_weight,
-        "numu_label": "mc_is_numu_cc",
-        "numu_truth_used_as_input": False,
-        "numu_loss_weight": args.numu_loss_weight,
+        "output_heads": ["pion_score"],
         "truth_branches": ["truePiPlusCher", "truePiMinusCher", "truePi0"],
         "truth_muon_pion_opening_angle_annotation_only": True,
+        "truth_muon_pion_opening_angle_units": "degrees",
         "truth_muon_pion_kinetic_energy_annotation_only": True,
         "hadronic_p4_annotation_only": True,
         "hadronic_p4_component_order": ["px", "py", "pz", "E"],
@@ -3695,8 +3451,6 @@ def main() -> None:
         "event_selection_applied": not args.no_event_cuts,
         "bdt_preselection": False,
         "threshold": args.threshold,
-        "fv_threshold": args.fv_threshold,
-        "numu_threshold": args.numu_threshold,
         "data_split": {
             "training_fraction": TRAIN_FRACTION,
             "validation_fraction": VALIDATION_FRACTION,
@@ -3704,31 +3458,24 @@ def main() -> None:
             "training_events": int(len(train_indices)),
             "validation_events": int(len(val_indices)),
             "testing_events": int(len(test_indices)),
-            "stratified_by_joint_pion_trueFV_and_numu_label": True,
-            "joint_label_encoding": "4*pion + 2*trueFV + mc_is_numu_cc",
-            "joint_label_counts": joint_count_summary,
+            "stratified_by_pion_label": True,
             "random_seed": args.seed,
         },
         "class_counts": {"no_pion": int(counts[0]), "pion": int(counts[1])},
-        "fv_class_counts": {
-            "outside_fv": int(fv_counts[0]),
-            "inside_fv": int(fv_counts[1]),
-        },
-        "numu_class_counts": {
-            "not_numu": int(numu_counts[0]),
-            "numu": int(numu_counts[1]),
-        },
         "misaligned_events_rejected": n_misaligned,
         "test_metrics": {name: float(value) for name, value in metrics.items()},
         "training_history": history_path.name,
         "evaluation": evaluation_files,
+        "training_summary": training_summary,
+        "training_summary_json": summary_json_name,
+        "training_summary_text": summary_text_name,
     }
     args.output.with_suffix(".json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
     print(
         f"Saved {args.output}, {args.output.with_suffix('.json')}, "
-        f"and {history_path}"
+        f"{history_path}, {summary_json_name}, and {summary_text_name}"
     )
     print("Evaluation outputs:")
     for name, value in evaluation_files.items():
@@ -3757,22 +3504,6 @@ def main() -> None:
             f"F1={point['f1_score']:.5f}, "
             f"MCC={point['matthews_correlation_coefficient']:.5f}"
         )
-    fv_point = evaluation_files["fv_operating_point"]
-    print(
-        f"FV operating point at threshold={fv_point['threshold']:.2f}: "
-        f"efficiency={fv_point['efficiency']:.5f}, "
-        f"purity={fv_point['purity']:.5f}, "
-        f"specificity={fv_point['specificity']:.5f}, "
-        f"balanced_accuracy={fv_point['balanced_accuracy']:.5f}"
-    )
-    numu_point = evaluation_files["numu_operating_point"]
-    print(
-        f"numu operating point at threshold={numu_point['threshold']:.2f}: "
-        f"efficiency={numu_point['efficiency']:.5f}, "
-        f"purity={numu_point['purity']:.5f}, "
-        f"specificity={numu_point['specificity']:.5f}, "
-        f"balanced_accuracy={numu_point['balanced_accuracy']:.5f}"
-    )
     mrd_report = evaluation_files["mrd_permutation_importance"]
     mrd_drop = mrd_report["performance_drop"]
     print(
@@ -3781,8 +3512,7 @@ def main() -> None:
         f"pion average-precision drop="
         f"{mrd_drop['pion_average_precision']:.5f}, "
         f"pion efficiency*purity drop="
-        f"{mrd_drop['pion_efficiency_x_purity']:.5f}, "
-        f"numu ROC-AUC drop={mrd_drop['numu_roc_auc']:.5f}"
+        f"{mrd_drop['pion_efficiency_x_purity']:.5f}"
     )
     print("MRD branch ranking by mean absolute pion-score impact:")
     for rank, branch_result in enumerate(

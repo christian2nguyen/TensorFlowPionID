@@ -1,10 +1,10 @@
 # PionID
 
 This repository contains a generic tabular pion-ID baseline and the recommended
-ANNIE Model C workflow. Model C is a supervised, three-head TensorFlow
-classifier that predicts pion presence, fiducial-volume membership, and whether
-the simulated neutrino is a muon neutrino from PMT images and reconstructed MRD
-information.
+ANNIE Model C workflow. Model C is a supervised, pion-only TensorFlow
+classifier that predicts pion presence from PMT images and reconstructed MRD
+information. Fiducial-volume and CC-inclusive models are trained separately
+with `train_annie_CCinclusive.py`.
 
 ## Expected data for the generic tabular baseline
 
@@ -208,8 +208,7 @@ information:
    `Draw_ANNIE_Single_Event_Detector_Image.cpp`.
 5. Full-event `hitPE` and tank-cluster `hitPE` form two channels in both views.
 6. Two convolutional towers combine the ring-centered and detector-layout
-   information with the MRD inputs before making independent event-level
-   `pion_score`, `fv_score`, and `numu_score` predictions.
+   information with the MRD inputs before making one event-level `pion_score`.
 
 Before training, render several pion and no-pion events and confirm that the
 projection is sensible:
@@ -285,9 +284,9 @@ the extra preview is assigned to the pion class; therefore `--preview-count 1`
 requests one pion example.
 
 `build_annie_training_images.py` is the inspectable Model A image-builder path;
-it does not train the three-head Model C network. Model C reads the ROOT files
-directly with `train_annie_ring.py` so it can also load MRD inputs and the
-training-only truth targets.
+it does not train Model C. Model C reads the ROOT files directly with
+`train_annie_ring.py` so it can also load MRD inputs and the training-only pion
+truth target.
 
 ### Model C ROOT branches
 
@@ -302,19 +301,14 @@ requested when applying a saved model to detector data.
 | Pion preselection scalars | `sel_CCInclusive_reco`, `ccinc_cnn_fv_score_valid`, `ccinc_cnn_fv_score` | Event scalars |
 | Pion preselection MRD status | `MRDSide`, `MRDStop`, `MRDThrough` | Non-empty per-event vectors; element 0 is tested |
 | MRD multiplicity | `numMRDTracks` | Event scalar |
-| Veto activity input | `NoVeto` | Integer event scalar; routed only to `numu_score` |
 | MRD track starts | `MRDTrackStartX`, `MRDTrackStartY`, `MRDTrackStartZ` | Per-event vectors; all three lengths must agree with `numMRDTracks` |
 | MRD track properties | `MRDEnergyLoss`, `MRDTrackLength`, `MRDTrackAngle` | Per-track vectors or event scalars |
 | Pion supervision | `truePiPlusCher`, `truePiMinusCher`, `truePi0` | Training-only event scalars |
-| FV supervision | `trueFV` | Training-only Boolean or 0/1 event scalar |
-| Numu supervision | `mc_is_numu_cc` | Training-only Boolean or 0/1 event scalar |
 
 The default pion label is true when any of the three pion truth counts is
 positive. `--charged-only` changes it to require `truePiPlusCher` or
-`truePiMinusCher`; it does not alter the FV label. The FV label is true exactly
-when `trueFV` is true. The numu label is true exactly when
-`mc_is_numu_cc` is true. Both classes for all three labels must remain
-after selection so every head can be trained and evaluated.
+`truePiMinusCher`. Both pion classes must remain after selection. `trueFV` and
+`mc_is_numu_cc` are not read or required by this trainer.
 
 Truth momentum or opening-angle branches are optional. The preferred pion
 fallback uses aligned `hadronic_pdgs` and `hadronic_p4`, where each p4 is
@@ -327,18 +321,12 @@ Train and score the ring model:
 python train_annie_ring.py simulation_*.root \
   --tree phaseIITriggerTree \
   --pion-threshold 0.70 \
-  --fv-threshold 0.50 \
-  --fv-loss-weight 0.30 \
-  --numu-threshold 0.50 \
-  --numu-loss-weight 0.30 \
   --epochs 100 \
   --batch-size 64 \
   --output artifacts/annie_ring_pion.keras
 
 python score_annie_ring.py artifacts/annie_ring_pion.keras sample.root \
   --pion-threshold 0.70 \
-  --fv-threshold 0.50 \
-  --numu-threshold 0.50 \
   --output annie_ring_scores.csv
 ```
 
@@ -364,69 +352,54 @@ the selected events. A CUDA `cuInit` error followed by CPU training is normally
 informational on a node without a usable GPU; a final bare `Killed` message is
 the sign that the operating system terminated the process for memory use.
 
-### Independent pion, fiducial-volume, and numu predictions
+### Pion-only prediction
 
-The three output heads use enforced head-specific image/scalar routing and have
-separate dense layers, binary-cross-entropy losses, truth labels, metrics, and
-decision thresholds:
+The saved ring model has one output head, one binary-cross-entropy loss, and one
+decision threshold:
 
 ```text
 pion_prediction = pion_score >= pion_threshold
-fv_prediction   = fv_score   >= fv_threshold
-numu_prediction = numu_score >= numu_threshold
-total_loss      = pion_loss + fv_loss_weight * fv_loss + numu_loss_weight * numu_loss
+total_loss      = pion_loss
 ```
 
-`--fv-loss-weight` controls how strongly learning the FV task changes the
-shared representation. `--numu-loss-weight` does the same for the numu task.
-Both default to `0.30`, and neither multiplies an output score. Training sample
-weights balance the two classes independently for each head. Early stopping and
-learning-rate reduction continue to monitor validation pion PR AUC, so the
-primary training objective remains pion identification.
-
-No correlation penalty, score multiplication, or conditional gate is applied.
-The scores can naturally be correlated if the underlying event populations are
-correlated, but the model is not required to make them agree. A later physics
-selection may require both predictions, for example:
-
-```python
-selected = (
-    (pion_score >= 0.70)
-    & (fv_score >= 0.50)
-    & (numu_score >= 0.50)
-)
-```
-
-Omit any scoring threshold option to use its value stored in the model JSON.
-Changing a threshold changes only the binary decision and does not require
-retraining. The threshold options control evaluation and inference; they do not
-change the training losses. `trueFV` and `mc_is_numu_cc` are required
-while training because they supply targets. Neither branch is a network input,
-and neither is needed in detector data during inference.
+Training sample weights balance pion and no-pion events. Early stopping and
+learning-rate reduction monitor validation pion PR AUC. Omit the scoring
+threshold option to use the value stored in the model JSON. Changing the
+threshold changes only the binary decision and does not require retraining.
 
 By default, scoring reapplies the event selection stored in the model JSON,
 including the precomputed FV-score requirement used for pion training. Use
 `--all-events` only when the input was already selected elsewhere or when scores
-are intentionally needed for every event. The scoring CSV records all three
-scores, applied thresholds, and independent decisions for every written event.
+are intentionally needed for every event. The scoring CSV records only
+`pion_score`, its applied threshold, and the pion decision.
 
 For `--output artifacts/annie_ring_pion.keras`, the main artifacts are:
 
 | Artifact | Contents |
 | --- | --- |
-| `annie_ring_pion.keras` | Keras Model C network and adapted normalization layers |
-| `annie_ring_pion.json` | Inputs, PMT response provenance, three thresholds, split/class counts, metrics, and diagnostic filenames |
-| `annie_ring_pion.history.csv` | Per-epoch training and validation losses and metrics for all heads |
-| `annie_ring_pion.test_predictions.csv` | Held-out provenance, truth, model inputs, all three scores, thresholds, and decisions |
-| `annie_ring_pion.training_curves.png` | Total loss plus pion/FV/numu ROC-AUC and PR-AUC histories |
+| `annie_ring_pion.keras` | Pion-only Keras network and adapted normalization layers |
+| `annie_ring_pion.json` | Inputs, PMT response provenance, threshold, split/class counts, metrics, and diagnostic filenames |
+| `annie_ring_pion.training_summary.txt` | Human-readable file/event/training/performance summary |
+| `annie_ring_pion.training_summary.json` | Machine-readable copy of the training summary |
+| `annie_ring_pion.history.csv` | Per-epoch pion training and validation losses and metrics |
+| `annie_ring_pion.test_predictions.csv` | Held-out provenance, truth, model inputs, pion score, threshold, and decision |
+| `annie_ring_pion.training_curves.png` | Pion loss, ROC-AUC, and PR-AUC histories |
 | `annie_ring_pion.mrd_permutation_ablation.png` | Full-model performance compared with the same test events after their MRD information is shuffled |
 | `annie_ring_pion.mrd_permutation_ablation.csv` | Full metrics and every MRD-shuffling repeat for quantitative comparisons |
 | `annie_ring_pion.mrd_branch_importance_beeswarm.png` | SHAP-style event-level impact plot and global ranking for each MRD branch |
 | `annie_ring_pion.mrd_branch_importance.csv` | Ranked MRD branch impacts and ROC-AUC/average-precision decreases |
 | `annie_ring_pion.misclassified_events.pdf` | Up to 20 annotated pion-head false positives and false negatives in one PDF |
+| `annie_ring_pion.pion_examples.pdf` | Up to 20 readable held-out truth-pion events, one event per page with all PMT and Grad-CAM panels |
 | `annie_ring_pion.gradcam_examples.png` | Pion-head Grad-CAM examples for both image towers |
 
-The pion and FV validation figures described below are written beside these
+The two training-summary files list every input ROOT file and its response mode,
+events read and selected, selected pion/no-pion counts, overall selection
+efficiency, 70/15/15 split counts, class weights, requested and completed
+epochs, best validation PR AUC, model size, run times, and held-out pion ROC
+AUC, average precision, Brier score, efficiency, purity, F1, balanced accuracy,
+and MCC.
+
+The other pion validation figures described below are written beside these
 files with the same model stem.
 
 ### Measuring whether the MRD inputs help
@@ -435,8 +408,8 @@ Training now automatically runs an MRD permutation-ablation test on the held-out
 test events. For each repeat, it keeps the PMT images and truth labels fixed but
 shuffles all MRD inputs together between events: `numMRDTracks`, track-start
 positions, energy loss, track length, track angle, and the track mask. It then
-recalculates pion, FV, and numu ROC-AUC, average precision, Brier score,
-efficiency, and purity. `NoVeto` remains fixed during this MRD-only test.
+recalculates pion ROC-AUC, average precision, Brier score, efficiency, and
+purity.
 
 The terminal prints the decreases in pion ROC-AUC, average precision, and
 efficiency × purity. A clearly positive decrease means the trained network is
@@ -490,10 +463,9 @@ the ranking together with the all-MRD ablation, not as a causal ordering.
 
 Export the trained hybrid model for C++ inference with the exporter in this
 project. Its serving signature includes both image tensors, the ordered
-`event_features` tensor, and the padded MRD track tensors. Its outputs are the
-continuous `pion_score`, `fv_score`, and `numu_score` tensors. Downstream C++
-should read the three thresholds from the neighboring JSON and apply them
-independently:
+`event_features` tensor, and the padded MRD track tensors. Its only output is
+the continuous `pion_score` tensor. Downstream C++ should read the pion
+threshold from the neighboring JSON:
 
 ```bash
 python export_annie_ring_saved_model.py \
@@ -502,8 +474,7 @@ python export_annie_ring_saved_model.py \
 ```
 
 The scalar feature order is saved in the JSON metadata and currently contains
-`numMRDTracks`, followed by `NoVeto`. Fixed selectors route `numMRDTracks` to
-all heads and `NoVeto` only to `numu_score`. The exact MRD start positions are a separate
+only `numMRDTracks`. The exact MRD start positions are a separate
 `mrd_track_starts` tensor with shape `(batch, 4, 3)` in X/Y/Z order. A
 `mrd_track_properties` tensor with shape `(batch, 4, 3)` contains
 `MRDEnergyLoss`, `MRDTrackLength`, and `MRDTrackAngle` for those same tracks. A
@@ -565,15 +536,11 @@ current event-level random split could place one copy in training and the other
 in validation or testing, producing overly optimistic metrics. Use independent
 event samples in the two lists.
 
-This command is **Model C**, a hybrid three-head classifier with head-specific
-image routing. `pion_score` uses both the full-event `hitPE` channel and the
-`hitPE_tankcluster` (or `hitPE_tankclusters`) channel in the angular and
-unfolded image views. `numu_score` also uses both image channels, while
-`fv_score` uses dedicated image towers that receive only the tank-cluster
-channel. The full-event channel therefore has no path into the FV prediction.
-The scalar tensor contains `numMRDTracks` and integer `NoVeto`; `NoVeto` is
-routed only to `numu_score` and is not used as an event-selection cut. A second
-input preserves up to four exact start positions
+This command is **Model C**, a hybrid pion-only classifier. `pion_score` uses
+both the full-event `hitPE` channel and the `hitPE_tankcluster` (or
+`hitPE_tankclusters`) channel in the angular and unfolded image views. The
+scalar tensor contains only `numMRDTracks`. A second input preserves up to four
+exact start positions
 from `MRDTrackStartX`, `MRDTrackStartY`, and `MRDTrackStartZ`. A third input
 provides the aligned per-track `MRDEnergyLoss`, `MRDTrackLength`, and
 `MRDTrackAngle` values. Starts and properties are normalized separately, then
@@ -589,26 +556,15 @@ through `numMRDTracks`, and the truncated-event count is saved in the model JSON
 metadata. `clusterChargeBalance_tankcluster_pmt_filtered` is neither a model
 input nor an event-selection cut.
 
-The MRD representation is available to all three heads. The pion and numu heads
-receive the full-event-plus-tank-cluster image representation, while FV receives
-the separate tank-cluster-only image representation. The numu head additionally
-receives `NoVeto`. Each prediction then has an independent dense pathway.
-`pion_score` is supervised by the pion truth label, while `fv_score` is
-supervised by `trueFV` and `numu_score` by
-`mc_is_numu_cc`. The FV and numu truth branches are never supplied as
-model inputs. No
-correlation loss, score multiplication, or conditional gating is applied. The
-three decisions use separate options, `--pion-threshold` (also accepted as
-`--threshold`) for pion ID, `--fv-threshold` for FV classification, and
-`--numu-threshold` for numu classification. The auxiliary losses have relative
-weights `--fv-loss-weight` and `--numu-loss-weight`, both defaulting to `0.3`.
-Scoring CSVs and the exported SavedModel contain all three scores.
+The MRD representation and both image channels feed the one pion head.
+`pion_score` is supervised only by the pion truth label. The only decision
+option is `--pion-threshold` (also accepted as `--threshold`). Scoring CSVs and
+the exported SavedModel contain only `pion_score`.
 
 Training also writes `annie_ring_pion.history.csv`, containing the per-epoch
 training and validation metrics used to identify the best stopping point.
-Events are split reproducibly and stratified by the joint pion/`trueFV`/numu
-truth category into 70% training, 15% validation, and 15% testing. Joint
-stratification preserves the observed combinations of the three binary labels.
+Events are split reproducibly and stratified by the pion truth label into 70%
+training, 15% validation, and 15% testing.
 Evaluation includes count and true-class-normalized confusion
 matrices at the requested `--pion-threshold`. A separate confidence-band matrix
 classifies `score < 0.20` as non-pion-like and `score > 0.80` as pion-like;
@@ -625,49 +581,15 @@ record specificity, balanced accuracy, ordinary accuracy, F1, and the Matthews
 correlation coefficient at each evaluated operating point. A Brier score
 provides a threshold-independent check of probability calibration.
 
-### Fiducial-volume validation outputs
-
-The held-out test set produces a separate FV validation suite:
-
-- `annie_ring_pion.fv_score_distribution.png` compares normalized `fv_score`
-  distributions for `trueFV = 0` and `trueFV = 1`, with `--fv-threshold` drawn
-  as a dashed line. This is the main FV signal-separation figure.
-- `annie_ring_pion.fv_roc_curve.png` reports the outside-FV false-positive rate,
-  inside-FV efficiency, and ROC AUC.
-- `annie_ring_pion.fv_precision_recall_curve.png` reports inside-FV efficiency,
-  FV purity, and average precision.
-- `annie_ring_pion.fv_confusion_matrix.png` and
-  `annie_ring_pion.fv_confusion_matrix_normalized.png` show count and
-  truth-class-normalized decisions at the configured FV threshold.
-- The model JSON records `fv_roc_auc`, `fv_average_precision`, `fv_brier_score`,
-  and the FV operating point. The operating point includes efficiency, purity,
-  efficiency times purity, specificity, balanced accuracy, accuracy, F1, MCC,
-  and the four confusion-matrix counts.
-
-The FV plots are independent of the pion confidence-band plots. The FV
-confusion matrix always uses `fv_score >= fv_threshold`; it does not use the
-special pion score bands of 0.20/0.80 or 0.30/0.70.
-
-### Muon-neutrino validation outputs
-
-The numu head writes an equivalent independent validation suite:
-
-- `annie_ring_pion.numu_score_distribution.png` compares `numu_score` for
-  `mc_is_numu_cc = 0` and `1`.
-- `annie_ring_pion.numu_roc_curve.png` and
-  `annie_ring_pion.numu_precision_recall_curve.png` report ROC AUC and average
-  precision.
-- `annie_ring_pion.numu_confusion_matrix.png` and its normalized companion use
-  `numu_score >= numu_threshold`.
-- The model JSON records numu AUC, average precision, Brier score, class counts,
-  loss weight, threshold, and the configured operating point.
-
-Four held-out truth-pion image pages are produced for visual validation: a
-dedicated charged-pion page, the highest-scoring pions, pions nearest the
-configured decision threshold, and the lowest-scoring pions. Each page shows up
-to three events with all four PMT image views and pion-truth annotations.
-The annotations include the truth muon and leading-pion kinetic energies in GeV
-when their truth momentum vectors are available.
+One multipage PDF contains up to 20 unique held-out truth-pion events for visual
+validation. It samples charged pions, the highest-scoring pions, events nearest
+the configured decision threshold, the lowest-scoring pions, and additional
+events when necessary to reach 20. Each event gets its own page with all four
+PMT image views, both Grad-CAM views, and a dedicated information box. The box
+keeps the filename, entry, score, truth counts, opening angle, kinetic energies,
+MRD multiplicity, and every retained MRD track readable without clipping. If
+the test set contains fewer than 20 truth-pion events, all available events are
+included and the terminal reports the smaller count.
 
 By default, Model C applies this pion-ID event preselection:
 
@@ -695,12 +617,10 @@ Training also writes test-set diagnostic products beside the model: ROC and
 precision-recall curves, score distributions, efficiency/background rejection
 versus threshold, a confusion matrix, a probability-calibration curve, training
 history plots, the most confident misclassified events, Grad-CAM examples for
-the pion image towers, and four pion-example pages. The pion-example pages show
-the full-event and tank-cluster PE channels in both angular and unfolded views for
-charged-pion, high-scoring, threshold-boundary, and low-scoring held-out pion
-events; each row includes the source file, tree entry, model score, and the
-truth counts for pi+, pi-, and pi0. Every row also includes angular and unfolded
-Grad-CAM heatmaps. These pion-head maps use both PE channels and are overlaid on
+the pion image towers, and the multipage pion-example PDF. Each event page shows
+the full-event and tank-cluster PE channels in both angular and unfolded views,
+plus angular and unfolded Grad-CAM heatmaps. These pion-head maps use both PE
+channels and are overlaid on
 full-event `hitPE` for detector-coordinate context. The annotation also reports the truth
 opening angle in degrees between the muon and leading pion. The leading pion is
 the highest-momentum `211`, `-211`, or `111` entry in aligned `hadronic_pdgs`
@@ -710,15 +630,16 @@ back to `trueFSLMomentum_X/Y/Z`, converted from MeV to GeV and restricted to
 values is supplied to the CNN. Leading-pion kinetic energy is calculated as
 `E - m`; the existing momentum-and-mass calculation is retained as a fallback.
 Muon kinetic energy uses `T = sqrt(p^2 + m^2) - m`. Energies are reported in
-GeV. If the ROOT file instead contains a scalar angle in
+GeV. The pion-muon opening angle is always written in degrees: radian truth
+branches and angles derived with `arccos` are converted before plotting or CSV
+output. This truth angle is separate from the reconstructed `MRDTrackAngle`
+model input. If the ROOT file instead contains a scalar angle in
 degrees, select it explicitly with
 `--muon-pion-opening-angle-deg-branch BRANCH_NAME`. The test CSV contains the
 same truth counts, opening angle, muon kinetic energy, and leading-pion kinetic
 energy together with each event's source and entry. It also records the pion
-truth label, `trueFV`, `mc_is_numu_cc`, all scalar and padded MRD inputs, `pion_score`,
-`pion_threshold`, `pion_prediction`, `fv_score`, `fv_threshold`, and
-`fv_prediction`, plus `numu_score`, `numu_threshold`, and `numu_prediction`.
-Its filename and all summary metrics are stored under
+truth label, all scalar and padded MRD inputs, `pion_score`, `pion_threshold`,
+and `pion_prediction`. Its filename and all summary metrics are stored under
 `evaluation` in the model JSON.
 
 The misclassified-event output keeps the combined gallery and writes the
@@ -730,7 +651,10 @@ positives and 10 of the most confident false negatives, then fills unused slots
 from the other category.
 Every example includes its source file, tree entry, true and predicted classes,
 pion score, truth pion counts, truth muon-pion opening angle, and truth muon and
-leading-pion kinetic energies. Unavailable truth values are shown as `n/a`.
+leading-pion kinetic energies. The reconstructed `MRDTrackAngle` shown in the
+event annotation is converted from radians to degrees and labeled with `°`;
+the model still receives the original branch value before its learned
+normalization. Unavailable truth values are shown as `n/a`.
 
 The unfolded tensor deliberately does not copy presentation-only objects from
 the C++ event display. It excludes PMT number labels, titles, axes, legends,
@@ -975,9 +899,9 @@ artifacts/annie_ring_pion.json
 ```
 
 The `.keras` file contains the network and normalization layers. The `.json` file
-stores preprocessing settings, all output-head definitions and decision
-thresholds, the FV and numu loss weights, response-tuning provenance, class counts, data
-split, test metrics, and diagnostic filenames. Keep the
+stores preprocessing settings, the pion output definition and decision
+threshold, response-tuning provenance, class counts, data split, test metrics,
+and diagnostic filenames. Keep the
 bundled `PMT_position_id_info.cvs` beside the Python files when moving the ring
 model. ROOT itself is not required on the target because `uproot` reads the
 files in Python.
