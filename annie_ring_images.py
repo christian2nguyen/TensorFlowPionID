@@ -38,7 +38,7 @@ DEFAULT_DETECTOR_WIDTH = 32
 BEAM_SPLIT_Z = 1.681
 VERTEX_BRANCHES = ["simpleRecoVtxX", "simpleRecoVtxY", "simpleRecoVtxZ"]
 TRUE_FV_BRANCH = "trueFV"
-TRUE_NUMU_BRANCH = "mc_neutrino_is_numu"
+TRUE_NUMU_BRANCH = "mc_is_numu_cc"
 
 # Synchronized with PMTPositionInfo::ShutoffRecords and UsePMTForTankBDT in
 # stv-analysis-Joint. PMT 358 is intentionally retained by the BDT workflow.

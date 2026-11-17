@@ -69,6 +69,14 @@ OPENING_ANGLE_RADIAN_BRANCHES = (
 )
 TRUTH_MUON_VECTOR_BASES = ("mc_p3_mu",)
 TRUTH_PION_VECTOR_BASES = ("mc_p3_lead_pi", "mc_p3_lead_pion")
+HADRONIC_PDGS_BRANCH = "hadronic_pdgs"
+HADRONIC_P4_BRANCH = "hadronic_p4"
+TRUE_FSL_MOMENTUM_BRANCHES = (
+    "trueFSLMomentum_X",
+    "trueFSLMomentum_Y",
+    "trueFSLMomentum_Z",
+)
+TRUE_FSL_PDG_BRANCH = "trueFSLPdg"
 MUON_MASS_GEV = 0.1056583755
 CHARGED_PION_MASS_GEV = 0.13957039
 NEUTRAL_PION_MASS_GEV = 0.1349768
@@ -484,9 +492,60 @@ def _read_vector3(tree, spec: Tuple[str, ...]) -> np.ndarray:
     )
 
 
+def _read_leading_hadronic_pion(
+    tree,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return leading-pion [px,py,pz], total energy, and PDG from GENIE p4."""
+    pdgs = tree[HADRONIC_PDGS_BRANCH].array(library="ak")
+    p4 = tree[HADRONIC_P4_BRANCH].array(library="ak")
+    if len(pdgs) != len(p4):
+        raise ValueError("hadronic_pdgs and hadronic_p4 event counts differ")
+    pdg_counts = ak.num(pdgs, axis=1)
+    p4_counts = ak.num(p4, axis=1)
+    if not bool(ak.all(pdg_counts == p4_counts)):
+        raise ValueError("hadronic_pdgs and hadronic_p4 particle counts differ")
+
+    component_counts = ak.num(p4, axis=2)
+    padded_p4 = ak.fill_none(
+        ak.pad_none(p4, 4, axis=2, clip=True), np.nan, axis=2
+    )
+    valid_p4 = (component_counts >= 4) & ak.all(np.isfinite(padded_p4), axis=2)
+    pion_mask = ((abs(pdgs) == 211) | (pdgs == 111)) & valid_p4
+    pion_p4 = padded_p4[pion_mask]
+    pion_pdgs = pdgs[pion_mask]
+    momentum_squared = (
+        pion_p4[:, :, 0] ** 2
+        + pion_p4[:, :, 1] ** 2
+        + pion_p4[:, :, 2] ** 2
+    )
+    leading_indices = ak.argmax(
+        momentum_squared, axis=1, keepdims=True, mask_identity=True
+    )
+
+    def leading_component(values) -> np.ndarray:
+        return np.asarray(
+            ak.to_numpy(ak.fill_none(ak.firsts(values[leading_indices]), np.nan)),
+            dtype=np.float64,
+        )
+
+    vectors = np.column_stack(
+        [leading_component(pion_p4[:, :, component]) for component in range(3)]
+    )
+    energies = leading_component(pion_p4[:, :, 3])
+    leading_pdgs = leading_component(pion_pdgs)
+    return vectors, energies, leading_pdgs
+
+
 def _truth_kinematics_for_tree(
     tree, scalar_degree_branch: str = ""
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    str,
+]:
     """Read truth momenta and obtain the leading-pion/muon opening angle."""
     available = set(tree.keys(recursive=True))
     entry_count = int(tree.num_entries)
@@ -494,9 +553,13 @@ def _truth_kinematics_for_tree(
     pion_vectors = None
     muon_momentum = np.full(entry_count, np.nan, dtype=np.float64)
     pion_momentum = np.full(entry_count, np.nan, dtype=np.float64)
+    pion_total_energy = np.full(entry_count, np.nan, dtype=np.float64)
+    leading_pion_pdg = np.full(entry_count, np.nan, dtype=np.float64)
 
     muon_spec = _resolve_vector3_spec(available, TRUTH_MUON_VECTOR_BASES)
     pion_spec = _resolve_vector3_spec(available, TRUTH_PION_VECTOR_BASES)
+    muon_source = ""
+    pion_source = ""
     vector_descriptions = []
     if muon_spec:
         try:
@@ -505,7 +568,29 @@ def _truth_kinematics_for_tree(
                 raise ValueError("Muon truth-vector length differs from tree length")
             muon_momentum = np.linalg.norm(muon_vectors, axis=1)
             muon_momentum[~np.isfinite(muon_vectors).all(axis=1)] = np.nan
-            vector_descriptions.append(f"muon momentum from {muon_spec[0]}")
+            muon_source = muon_spec[0]
+            vector_descriptions.append(f"muon momentum from {muon_source}")
+        except Exception as error:
+            vector_descriptions.append(f"muon momentum unavailable ({error})")
+            muon_vectors = None
+    elif all(name in available for name in TRUE_FSL_MOMENTUM_BRANCHES):
+        try:
+            muon_vectors = np.column_stack(
+                [
+                    np.asarray(tree[name].array(library="np"), dtype=np.float64)
+                    for name in TRUE_FSL_MOMENTUM_BRANCHES
+                ]
+            ) / 1000.0
+            if TRUE_FSL_PDG_BRANCH in available:
+                muon_pdgs = np.asarray(
+                    tree[TRUE_FSL_PDG_BRANCH].array(library="np"),
+                    dtype=np.float64,
+                )
+                muon_vectors[np.abs(muon_pdgs) != 13] = np.nan
+            muon_momentum = np.linalg.norm(muon_vectors, axis=1)
+            muon_momentum[~np.isfinite(muon_vectors).all(axis=1)] = np.nan
+            muon_source = "trueFSLMomentum_X/Y/Z (MeV converted to GeV)"
+            vector_descriptions.append(f"muon momentum from {muon_source}")
         except Exception as error:
             vector_descriptions.append(f"muon momentum unavailable ({error})")
             muon_vectors = None
@@ -520,7 +605,27 @@ def _truth_kinematics_for_tree(
                 )
             pion_momentum = np.linalg.norm(pion_vectors, axis=1)
             pion_momentum[~np.isfinite(pion_vectors).all(axis=1)] = np.nan
-            vector_descriptions.append(f"leading-pion momentum from {pion_spec[0]}")
+            pion_source = pion_spec[0]
+            vector_descriptions.append(f"leading-pion momentum from {pion_source}")
+        except Exception as error:
+            vector_descriptions.append(f"leading-pion momentum unavailable ({error})")
+            pion_vectors = None
+    elif {
+        HADRONIC_PDGS_BRANCH,
+        HADRONIC_P4_BRANCH,
+    }.issubset(available):
+        try:
+            (
+                pion_vectors,
+                pion_total_energy,
+                leading_pion_pdg,
+            ) = _read_leading_hadronic_pion(tree)
+            pion_momentum = np.linalg.norm(pion_vectors, axis=1)
+            pion_momentum[~np.isfinite(pion_vectors).all(axis=1)] = np.nan
+            pion_source = "leading pion in aligned hadronic_pdgs/hadronic_p4"
+            vector_descriptions.append(
+                f"leading-pion momentum and energy from {pion_source}"
+            )
         except Exception as error:
             vector_descriptions.append(f"leading-pion momentum unavailable ({error})")
             pion_vectors = None
@@ -577,8 +682,8 @@ def _truth_kinematics_for_tree(
                     np.arccos(np.clip(cosine[valid], -1.0, 1.0))
                 )
                 description = (
-                    f"opening angle derived from {muon_spec[0]} and "
-                    f"{pion_spec[0]} truth vectors"
+                    f"opening angle derived from {muon_source} and "
+                    f"{pion_source} truth vectors"
                 )
 
     angles = np.asarray(angles, dtype=np.float64).reshape(-1)
@@ -590,6 +695,8 @@ def _truth_kinematics_for_tree(
         np.where(valid_angle, angles, np.nan),
         muon_momentum,
         pion_momentum,
+        pion_total_energy,
+        leading_pion_pdg,
         full_description,
     )
 
@@ -599,11 +706,20 @@ def load_truth_muon_pion_kinematics(
     entries: np.ndarray,
     tree_name: str,
     scalar_degree_branch: str = "",
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    str,
+]:
     """Load truth angle and momenta for selected events in multiple ROOT files."""
     angles = np.full(len(entries), np.nan, dtype=np.float64)
     muon_momenta = np.full(len(entries), np.nan, dtype=np.float64)
     pion_momenta = np.full(len(entries), np.nan, dtype=np.float64)
+    pion_total_energies = np.full(len(entries), np.nan, dtype=np.float64)
+    leading_pion_pdgs = np.full(len(entries), np.nan, dtype=np.float64)
     descriptions = set()
     source_strings = np.asarray(source_paths, dtype=str)
     for source in dict.fromkeys(source_strings.tolist()):
@@ -615,6 +731,8 @@ def load_truth_muon_pion_kinematics(
                     file_angles,
                     file_muon_momenta,
                     file_pion_momenta,
+                    file_pion_total_energies,
+                    file_leading_pion_pdgs,
                     description,
                 ) = _truth_kinematics_for_tree(tree, scalar_degree_branch)
             local_entries = entries[mask].astype(np.int64, copy=False)
@@ -625,6 +743,12 @@ def load_truth_muon_pion_kinematics(
             angles[selected_targets] = file_angles[selected_entries]
             muon_momenta[selected_targets] = file_muon_momenta[selected_entries]
             pion_momenta[selected_targets] = file_pion_momenta[selected_entries]
+            pion_total_energies[selected_targets] = file_pion_total_energies[
+                selected_entries
+            ]
+            leading_pion_pdgs[selected_targets] = file_leading_pion_pdgs[
+                selected_entries
+            ]
             descriptions.add(description)
         except Exception as error:
             if scalar_degree_branch:
@@ -638,6 +762,8 @@ def load_truth_muon_pion_kinematics(
         angles,
         muon_momenta,
         pion_momenta,
+        pion_total_energies,
+        leading_pion_pdgs,
         "; ".join(sorted(descriptions)) or "unavailable",
     )
 
@@ -2878,6 +3004,8 @@ def evaluate_and_plot(
         truth_muon_pion_angles,
         truth_muon_momenta,
         truth_pion_momenta,
+        truth_pion_total_energy,
+        truth_leading_pion_pdg,
         truth_kinematics_source,
     ) = load_truth_muon_pion_kinematics(
         source_paths_test,
@@ -2892,12 +3020,34 @@ def evaluate_and_plot(
         truth_pion_counts_test[:, 0] + truth_pion_counts_test[:, 1]
     ) > 0
     neutral_pion_present = truth_pion_counts_test[:, 2] > 0
-    pion_mass = np.where(
+    fallback_pion_mass = np.where(
         charged_pion_present,
         CHARGED_PION_MASS_GEV,
         np.where(neutral_pion_present, NEUTRAL_PION_MASS_GEV, np.nan),
     )
-    truth_pion_kinetic_energy = _kinetic_energy(truth_pion_momenta, pion_mass)
+    leading_pion_mass = np.where(
+        np.abs(truth_leading_pion_pdg) == 211,
+        CHARGED_PION_MASS_GEV,
+        np.where(
+            truth_leading_pion_pdg == 111,
+            NEUTRAL_PION_MASS_GEV,
+            fallback_pion_mass,
+        ),
+    )
+    momentum_derived_pion_ke = _kinetic_energy(
+        truth_pion_momenta, leading_pion_mass
+    )
+    energy_derived_pion_ke = truth_pion_total_energy - leading_pion_mass
+    valid_total_energy = (
+        np.isfinite(truth_pion_total_energy)
+        & np.isfinite(leading_pion_mass)
+        & (energy_derived_pion_ke >= 0.0)
+    )
+    truth_pion_kinetic_energy = np.where(
+        valid_total_energy,
+        energy_derived_pion_ke,
+        momentum_derived_pion_ke,
+    )
 
     predictions_path = output.with_suffix(".test_predictions.csv")
     track_column_names = [
@@ -2921,11 +3071,13 @@ def evaluate_and_plot(
                 "tree_entry",
                 "true_label",
                 "trueFV",
-                "mc_neutrino_is_numu",
+                "mc_is_numu_cc",
                 "truePiPlusCher",
                 "truePiMinusCher",
                 "truePi0",
+                "truth_leading_pion_pdg",
                 "truth_leading_pion_muon_opening_angle_deg",
+                "truth_leading_pion_total_energy_GeV",
                 "truth_muon_kinetic_energy_GeV",
                 "truth_leading_pion_kinetic_energy_GeV",
                 *RING_EVENT_FEATURE_NAMES,
@@ -2963,7 +3115,9 @@ def evaluate_and_plot(
                     int(fv_labels_test[event_index]),
                     int(numu_labels_test[event_index]),
                     *truth_pion_counts_test[event_index].astype(int),
+                    float(truth_leading_pion_pdg[event_index]),
                     float(truth_muon_pion_angles[event_index]),
+                    float(truth_pion_total_energy[event_index]),
                     float(truth_muon_kinetic_energy[event_index]),
                     float(truth_pion_kinetic_energy[event_index]),
                     *event_features_test[event_index].astype(float),
@@ -3213,7 +3367,7 @@ def main() -> None:
     numu_counts = np.bincount(numu_labels.astype(np.int64), minlength=2)
     if np.any(numu_counts == 0):
         raise ValueError(
-            "Both mc_neutrino_is_numu classes are required; class counts are "
+            "Both mc_is_numu_cc classes are required; class counts are "
             f"{numu_counts.tolist()}"
         )
     indices = np.arange(len(labels))
@@ -3507,12 +3661,23 @@ def main() -> None:
         "fv_label": "trueFV",
         "fv_truth_used_as_input": False,
         "fv_loss_weight": args.fv_loss_weight,
-        "numu_label": "mc_neutrino_is_numu",
+        "numu_label": "mc_is_numu_cc",
         "numu_truth_used_as_input": False,
         "numu_loss_weight": args.numu_loss_weight,
         "truth_branches": ["truePiPlusCher", "truePiMinusCher", "truePi0"],
         "truth_muon_pion_opening_angle_annotation_only": True,
         "truth_muon_pion_kinetic_energy_annotation_only": True,
+        "hadronic_p4_annotation_only": True,
+        "hadronic_p4_component_order": ["px", "py", "pz", "E"],
+        "hadronic_p4_units": "GeV",
+        "leading_pion_definition": (
+            "highest-momentum PDG 211, -211, or 111 entry in aligned "
+            "hadronic_pdgs/hadronic_p4"
+        ),
+        "truth_muon_momentum_fallback": (
+            "trueFSLMomentum_X/Y/Z in MeV, converted to GeV; requires "
+            "abs(trueFSLPdg) == 13 when trueFSLPdg is present"
+        ),
         "truth_momentum_units": "GeV/c",
         "truth_kinetic_energy_units": "GeV",
         "truth_kinetic_energy_formula": "sqrt(p^2 + m^2) - m",
@@ -3540,7 +3705,7 @@ def main() -> None:
             "validation_events": int(len(val_indices)),
             "testing_events": int(len(test_indices)),
             "stratified_by_joint_pion_trueFV_and_numu_label": True,
-            "joint_label_encoding": "4*pion + 2*trueFV + mc_neutrino_is_numu",
+            "joint_label_encoding": "4*pion + 2*trueFV + mc_is_numu_cc",
             "joint_label_counts": joint_count_summary,
             "random_seed": args.seed,
         },

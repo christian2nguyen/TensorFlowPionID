@@ -307,18 +307,19 @@ requested when applying a saved model to detector data.
 | MRD track properties | `MRDEnergyLoss`, `MRDTrackLength`, `MRDTrackAngle` | Per-track vectors or event scalars |
 | Pion supervision | `truePiPlusCher`, `truePiMinusCher`, `truePi0` | Training-only event scalars |
 | FV supervision | `trueFV` | Training-only Boolean or 0/1 event scalar |
-| Numu supervision | `mc_neutrino_is_numu` | Training-only Boolean or 0/1 event scalar |
+| Numu supervision | `mc_is_numu_cc` | Training-only Boolean or 0/1 event scalar |
 
 The default pion label is true when any of the three pion truth counts is
 positive. `--charged-only` changes it to require `truePiPlusCher` or
 `truePiMinusCher`; it does not alter the FV label. The FV label is true exactly
 when `trueFV` is true. The numu label is true exactly when
-`mc_neutrino_is_numu` is true. Both classes for all three labels must remain
+`mc_is_numu_cc` is true. Both classes for all three labels must remain
 after selection so every head can be trained and evaluated.
 
-Truth momentum or opening-angle branches are optional. When available, they
-are used only to annotate held-out diagnostic figures and never enter either
-network head.
+Truth momentum or opening-angle branches are optional. The preferred pion
+fallback uses aligned `hadronic_pdgs` and `hadronic_p4`, where each p4 is
+`[px, py, pz, E]` in GeV. These values are used only to annotate held-out
+diagnostic figures and never enter a network head.
 
 Train and score the ring model:
 
@@ -399,7 +400,7 @@ selected = (
 Omit any scoring threshold option to use its value stored in the model JSON.
 Changing a threshold changes only the binary decision and does not require
 retraining. The threshold options control evaluation and inference; they do not
-change the training losses. `trueFV` and `mc_neutrino_is_numu` are required
+change the training losses. `trueFV` and `mc_is_numu_cc` are required
 while training because they supply targets. Neither branch is a network input,
 and neither is needed in detector data during inference.
 
@@ -594,7 +595,7 @@ the separate tank-cluster-only image representation. The numu head additionally
 receives `NoVeto`. Each prediction then has an independent dense pathway.
 `pion_score` is supervised by the pion truth label, while `fv_score` is
 supervised by `trueFV` and `numu_score` by
-`mc_neutrino_is_numu`. The FV and numu truth branches are never supplied as
+`mc_is_numu_cc`. The FV and numu truth branches are never supplied as
 model inputs. No
 correlation loss, score multiplication, or conditional gating is applied. The
 three decisions use separate options, `--pion-threshold` (also accepted as
@@ -652,7 +653,7 @@ special pion score bands of 0.20/0.80 or 0.30/0.70.
 The numu head writes an equivalent independent validation suite:
 
 - `annie_ring_pion.numu_score_distribution.png` compares `numu_score` for
-  `mc_neutrino_is_numu = 0` and `1`.
+  `mc_is_numu_cc = 0` and `1`.
 - `annie_ring_pion.numu_roc_curve.png` and
   `annie_ring_pion.numu_precision_recall_curve.png` report ROC AUC and average
   precision.
@@ -701,19 +702,20 @@ events; each row includes the source file, tree entry, model score, and the
 truth counts for pi+, pi-, and pi0. Every row also includes angular and unfolded
 Grad-CAM heatmaps. These pion-head maps use both PE channels and are overlaid on
 full-event `hitPE` for detector-coordinate context. The annotation also reports the truth
-opening angle in degrees between the muon and leading pion. This is calculated
-from `mc_p3_mu` and `mc_p3_lead_pi` (or `mc_p3_lead_pion`) when available and is
-never supplied to the CNN. The same truth vectors provide the momentum
-magnitudes used to calculate relativistic kinetic energy as
-`T = sqrt(p^2 + m^2) - m`. The code uses the muon rest mass and selects the
-charged- or neutral-pion rest mass from the event's pion truth counts. Momentum
-is interpreted in GeV/c, matching the source analysis, and kinetic energy is
-reported in GeV. If the ROOT file instead contains a scalar angle in
+opening angle in degrees between the muon and leading pion. The leading pion is
+the highest-momentum `211`, `-211`, or `111` entry in aligned `hadronic_pdgs`
+and `hadronic_p4`; p4 order is `[px, py, pz, E]` in GeV. Muon momentum falls
+back to `trueFSLMomentum_X/Y/Z`, converted from MeV to GeV and restricted to
+`abs(trueFSLPdg) == 13` when that PDG branch is present. None of these truth
+values is supplied to the CNN. Leading-pion kinetic energy is calculated as
+`E - m`; the existing momentum-and-mass calculation is retained as a fallback.
+Muon kinetic energy uses `T = sqrt(p^2 + m^2) - m`. Energies are reported in
+GeV. If the ROOT file instead contains a scalar angle in
 degrees, select it explicitly with
 `--muon-pion-opening-angle-deg-branch BRANCH_NAME`. The test CSV contains the
 same truth counts, opening angle, muon kinetic energy, and leading-pion kinetic
 energy together with each event's source and entry. It also records the pion
-truth label, `trueFV`, `mc_neutrino_is_numu`, all scalar and padded MRD inputs, `pion_score`,
+truth label, `trueFV`, `mc_is_numu_cc`, all scalar and padded MRD inputs, `pion_score`,
 `pion_threshold`, `pion_prediction`, `fv_score`, `fv_threshold`, and
 `fv_prediction`, plus `numu_score`, `numu_threshold`, and `numu_prediction`.
 Its filename and all summary metrics are stored under
