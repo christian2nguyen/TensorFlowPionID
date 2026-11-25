@@ -56,6 +56,8 @@ PION_EVENT_FEATURE_NAMES = ["numMRDTracks"]
 TRAIN_FRACTION = 0.70
 VALIDATION_FRACTION = 0.15
 TEST_FRACTION = 0.15
+AMBIGUOUS_SCORE_LOW = 0.20
+AMBIGUOUS_SCORE_HIGH = 0.80
 
 OPENING_ANGLE_DEGREE_BRANCHES = (
     "trueMuonPionOpeningAngleDeg",
@@ -349,6 +351,7 @@ def load_data(
             include_fv_truth=False,
             include_numu_truth=False,
             ring_event_feature_names=PION_EVENT_FEATURE_NAMES,
+            include_normalized_pe_channels=True,
         ):
             image_chunks.append(
                 chunk["images"].astype(np.float16, copy=False)
@@ -898,10 +901,10 @@ def build_model(
     mrd_track_properties_train: np.ndarray,
     mrd_track_mask_train: np.ndarray,
 ) -> tf.keras.Model:
-    if angular_shape[-1] != 2 or detector_shape[-1] != 2:
+    if angular_shape[-1] != 4 or detector_shape[-1] != 4:
         raise ValueError(
-            "Pion image inputs require channel 0 = hitPE and "
-            "channel 1 = hitPE_tankcluster"
+            "Pion image inputs require absolute full/tankcluster PE plus "
+            "event-normalized full/tankcluster PE channels"
         )
     if PION_EVENT_FEATURE_NAMES != ["numMRDTracks"]:
         raise ValueError("Pion scalar input must contain only numMRDTracks")
@@ -1837,6 +1840,527 @@ def plot_score_band_confusion_matrix(
     fig.savefig(path, dpi=160)
     plt.close(fig)
     return path.name
+
+
+def _detector_channel_observables(
+    detector_images: np.ndarray,
+    channel: int,
+    batch_size: int = 512,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Recover total PE and occupied detector bins from one log1p image channel."""
+    totals = np.zeros(len(detector_images), dtype=np.float64)
+    occupied = np.zeros(len(detector_images), dtype=np.float64)
+    for start in range(0, len(detector_images), batch_size):
+        stop = min(start + batch_size, len(detector_images))
+        linear_pe = np.expm1(
+            detector_images[start:stop, :, :, channel].astype(np.float32)
+        )
+        totals[start:stop] = np.sum(linear_pe, axis=(1, 2), dtype=np.float64)
+        occupied[start:stop] = np.count_nonzero(linear_pe > 0.0, axis=(1, 2))
+    return totals, occupied
+
+
+def _quantile_edges(values: np.ndarray, mask: np.ndarray, bins: int = 8) -> np.ndarray:
+    """Return stable equal-population bin edges for a diagnostic variable."""
+    finite_values = np.asarray(values, dtype=np.float64)[
+        np.asarray(mask, dtype=bool) & np.isfinite(values)
+    ]
+    if len(finite_values) == 0:
+        return np.array([], dtype=np.float64)
+    unique_values = np.unique(finite_values)
+    if len(unique_values) == 1:
+        value = float(unique_values[0])
+        width = max(abs(value) * 1e-6, 1e-6)
+        return np.array([value - width, value + width], dtype=np.float64)
+    edges = np.unique(np.quantile(finite_values, np.linspace(0.0, 1.0, bins + 1)))
+    edges[0] = np.nextafter(edges[0], -np.inf)
+    edges[-1] = np.nextafter(edges[-1], np.inf)
+    return edges
+
+
+def _binned_ambiguity_rows(
+    variable_name: str,
+    values: np.ndarray,
+    base_mask: np.ndarray,
+    edges: np.ndarray,
+    y_test: np.ndarray,
+    test_scores: np.ndarray,
+    threshold: float,
+) -> List[Dict[str, object]]:
+    """Summarize ambiguity and classification performance in variable bins."""
+    rows = []
+    predictions = test_scores >= threshold
+    truth = y_test.astype(bool)
+    ambiguous = (
+        (test_scores >= AMBIGUOUS_SCORE_LOW)
+        & (test_scores <= AMBIGUOUS_SCORE_HIGH)
+    )
+    for bin_index, (low, high) in enumerate(zip(edges[:-1], edges[1:])):
+        selected = (
+            np.asarray(base_mask, dtype=bool)
+            & np.isfinite(values)
+            & (values >= low)
+            & (values < high)
+        )
+        count = int(np.count_nonzero(selected))
+        pion_selected = selected & truth
+        no_pion_selected = selected & ~truth
+        pion_count = int(np.count_nonzero(pion_selected))
+        no_pion_count = int(np.count_nonzero(no_pion_selected))
+        if count:
+            scores = test_scores[selected]
+            ambiguous_count = int(np.count_nonzero(ambiguous[selected]))
+            accuracy = float(np.mean(predictions[selected] == truth[selected]))
+        else:
+            scores = np.array([], dtype=np.float64)
+            ambiguous_count = 0
+            accuracy = float("nan")
+        pion_efficiency = (
+            float(np.mean(predictions[pion_selected]))
+            if pion_count
+            else float("nan")
+        )
+        no_pion_rejection = (
+            float(np.mean(~predictions[no_pion_selected]))
+            if no_pion_count
+            else float("nan")
+        )
+        bin_auc = float("nan")
+        if pion_count and no_pion_count:
+            local_fpr, local_tpr, _ = roc_curve(
+                y_test[selected], test_scores[selected]
+            )
+            bin_auc = float(auc(local_fpr, local_tpr))
+        rows.append(
+            {
+                "variable": variable_name,
+                "bin_index": bin_index,
+                "bin_low": float(low),
+                "bin_high": float(high),
+                "event_count": count,
+                "pion_count": pion_count,
+                "no_pion_count": no_pion_count,
+                "ambiguous_count": ambiguous_count,
+                "ambiguous_fraction": (
+                    ambiguous_count / count if count else float("nan")
+                ),
+                "mean_score": float(np.mean(scores)) if count else float("nan"),
+                "median_score": (
+                    float(np.median(scores)) if count else float("nan")
+                ),
+                "mean_pion_score": (
+                    float(np.mean(test_scores[pion_selected]))
+                    if pion_count
+                    else float("nan")
+                ),
+                "mean_no_pion_score": (
+                    float(np.mean(test_scores[no_pion_selected]))
+                    if no_pion_count
+                    else float("nan")
+                ),
+                "accuracy_at_threshold": accuracy,
+                "pion_efficiency_at_threshold": pion_efficiency,
+                "no_pion_rejection_at_threshold": no_pion_rejection,
+                "roc_auc": bin_auc,
+            }
+        )
+    return rows
+
+
+def _plot_binned_ambiguity_page(
+    pdf: PdfPages,
+    title: str,
+    x_label: str,
+    values: np.ndarray,
+    base_mask: np.ndarray,
+    rows: List[Dict[str, object]],
+    y_test: np.ndarray,
+    test_scores: np.ndarray,
+    threshold: float,
+) -> None:
+    """Add one four-panel variable diagnostic page to a PDF."""
+    selected = np.asarray(base_mask, dtype=bool) & np.isfinite(values)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    if not rows or not np.any(selected):
+        for axis in axes.ravel():
+            axis.axis("off")
+        axes[0, 0].text(
+            0.5,
+            0.5,
+            f"{title}\nNo finite values were available.",
+            ha="center",
+            va="center",
+            fontsize=14,
+        )
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+        return
+
+    selected_indices = np.flatnonzero(selected)
+    if len(selected_indices) > 5000:
+        selected_indices = selected_indices[
+            np.linspace(0, len(selected_indices) - 1, 5000).astype(int)
+        ]
+    truth_colors = np.where(y_test[selected_indices] == 1, "C1", "C0")
+    axes[0, 0].scatter(
+        values[selected_indices],
+        test_scores[selected_indices],
+        c=truth_colors,
+        s=10,
+        alpha=0.35,
+        edgecolors="none",
+    )
+    axes[0, 0].axhspan(
+        AMBIGUOUS_SCORE_LOW,
+        AMBIGUOUS_SCORE_HIGH,
+        color="gray",
+        alpha=0.12,
+        label="ambiguous score band",
+    )
+    axes[0, 0].axhline(threshold, color="black", linestyle="--", linewidth=1)
+    axes[0, 0].set_xlabel(x_label)
+    axes[0, 0].set_ylabel("pion_score")
+    axes[0, 0].set_ylim(-0.02, 1.02)
+    axes[0, 0].set_title("Event scores (orange=pion, blue=no pion)")
+    axes[0, 0].legend(loc="best", fontsize=8)
+
+    centers = np.array(
+        [(row["bin_low"] + row["bin_high"]) / 2.0 for row in rows]
+    )
+    widths = np.array([row["bin_high"] - row["bin_low"] for row in rows])
+    counts = np.array([row["event_count"] for row in rows], dtype=float)
+    axes[0, 1].bar(centers, counts, width=0.9 * widths, color="C7")
+    axes[0, 1].set_xlabel(x_label)
+    axes[0, 1].set_ylabel("Selected test events")
+    axes[0, 1].set_title("Statistics per bin")
+
+    ambiguous_fraction = np.array(
+        [row["ambiguous_fraction"] for row in rows], dtype=float
+    )
+    accuracy = np.array(
+        [row["accuracy_at_threshold"] for row in rows], dtype=float
+    )
+    axes[1, 0].plot(
+        centers, ambiguous_fraction, marker="o", label="Ambiguous fraction"
+    )
+    axes[1, 0].plot(
+        centers,
+        accuracy,
+        marker="o",
+        label=f"Accuracy at score {threshold:.2f}",
+    )
+    axes[1, 0].set_xlabel(x_label)
+    axes[1, 0].set_ylabel("Fraction")
+    axes[1, 0].set_ylim(-0.02, 1.02)
+    axes[1, 0].set_title(
+        f"Ambiguous means {AMBIGUOUS_SCORE_LOW:.2f} ≤ score ≤ "
+        f"{AMBIGUOUS_SCORE_HIGH:.2f}"
+    )
+    axes[1, 0].legend(fontsize=8)
+
+    mean_pion = np.array([row["mean_pion_score"] for row in rows], dtype=float)
+    mean_no_pion = np.array(
+        [row["mean_no_pion_score"] for row in rows], dtype=float
+    )
+    mean_all = np.array([row["mean_score"] for row in rows], dtype=float)
+    if np.any(np.isfinite(mean_pion)):
+        axes[1, 1].plot(centers, mean_pion, marker="o", label="Pion truth")
+    if np.any(np.isfinite(mean_no_pion)):
+        axes[1, 1].plot(
+            centers, mean_no_pion, marker="o", label="No-pion truth"
+        )
+    if not np.any(np.isfinite(mean_no_pion)):
+        axes[1, 1].plot(centers, mean_all, marker="o", label="All selected")
+    axes[1, 1].set_xlabel(x_label)
+    axes[1, 1].set_ylabel("Mean pion_score")
+    axes[1, 1].set_ylim(-0.02, 1.02)
+    axes[1, 1].set_title("Mean score by truth class")
+    axes[1, 1].legend(fontsize=8)
+
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def plot_ambiguity_diagnostics(
+    y_test: np.ndarray,
+    test_scores: np.ndarray,
+    detector_images_test: np.ndarray,
+    source_paths_test: np.ndarray,
+    entries_test: np.ndarray,
+    truth_pion_counts_test: np.ndarray,
+    truth_muon_pion_angles: np.ndarray,
+    truth_pion_kinetic_energy: np.ndarray,
+    output: Path,
+    threshold: float,
+) -> Dict[str, object]:
+    """Write plots and tables that identify difficult pion-ID populations."""
+    ambiguous = (
+        (test_scores >= AMBIGUOUS_SCORE_LOW)
+        & (test_scores <= AMBIGUOUS_SCORE_HIGH)
+    )
+    charged = (
+        truth_pion_counts_test[:, 0] + truth_pion_counts_test[:, 1]
+    ) > 0
+    neutral = truth_pion_counts_test[:, 2] > 0
+    multiplicity = np.sum(truth_pion_counts_test, axis=1).astype(np.int64)
+    tank_total_pe, tank_occupied_bins = _detector_channel_observables(
+        detector_images_test, 1
+    )
+
+    variable_specs = [
+        (
+            "truth_pion_kinetic_energy_GeV",
+            "Pion kinetic energy",
+            "Truth leading-pion kinetic energy [GeV]",
+            truth_pion_kinetic_energy,
+            y_test == 1,
+        ),
+        (
+            "truth_muon_pion_opening_angle_deg",
+            "Muon–pion opening angle",
+            "Truth leading π–μ opening angle [degrees]",
+            truth_muon_pion_angles,
+            y_test == 1,
+        ),
+        (
+            "tankcluster_total_pe",
+            "Tank-cluster charge",
+            "Tank-cluster total PE reconstructed from image",
+            tank_total_pe,
+            np.ones(len(y_test), dtype=bool),
+        ),
+        (
+            "tankcluster_occupied_detector_bins",
+            "Tank-cluster image occupancy",
+            "Occupied tank-cluster detector-image bins",
+            tank_occupied_bins,
+            np.ones(len(y_test), dtype=bool),
+        ),
+    ]
+    binned_rows = []
+    variable_rows = []
+    for variable_name, title, x_label, values, base_mask in variable_specs:
+        edges = _quantile_edges(values, base_mask)
+        rows = _binned_ambiguity_rows(
+            variable_name,
+            values,
+            base_mask,
+            edges,
+            y_test,
+            test_scores,
+            threshold,
+        )
+        binned_rows.extend(rows)
+        variable_rows.append((title, x_label, values, base_mask, rows))
+
+    binned_path = output.with_suffix(".ambiguity_binned_metrics.csv")
+    binned_fieldnames = [
+        "variable",
+        "bin_index",
+        "bin_low",
+        "bin_high",
+        "event_count",
+        "pion_count",
+        "no_pion_count",
+        "ambiguous_count",
+        "ambiguous_fraction",
+        "mean_score",
+        "median_score",
+        "mean_pion_score",
+        "mean_no_pion_score",
+        "accuracy_at_threshold",
+        "pion_efficiency_at_threshold",
+        "no_pion_rejection_at_threshold",
+        "roc_auc",
+    ]
+    with binned_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=binned_fieldnames)
+        writer.writeheader()
+        writer.writerows(binned_rows)
+
+    ambiguous_path = output.with_suffix(".ambiguous_events.csv")
+    ambiguous_indices = np.flatnonzero(ambiguous)
+    ambiguous_indices = ambiguous_indices[
+        np.argsort(np.abs(test_scores[ambiguous_indices] - 0.5))
+    ]
+    with ambiguous_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "source_file",
+                "tree_entry",
+                "true_label",
+                "pion_score",
+                "distance_from_0p5",
+                "truePiPlusCher",
+                "truePiMinusCher",
+                "truePi0",
+                "truth_pion_multiplicity",
+                "truth_leading_pion_kinetic_energy_GeV",
+                "truth_leading_pion_muon_opening_angle_deg",
+                "tankcluster_total_pe",
+                "tankcluster_occupied_detector_bins",
+            ]
+        )
+        for event_index in ambiguous_indices:
+            writer.writerow(
+                [
+                    source_paths_test[event_index],
+                    int(entries_test[event_index]),
+                    int(y_test[event_index]),
+                    float(test_scores[event_index]),
+                    float(abs(test_scores[event_index] - 0.5)),
+                    *truth_pion_counts_test[event_index].astype(int),
+                    int(multiplicity[event_index]),
+                    float(truth_pion_kinetic_energy[event_index]),
+                    float(truth_muon_pion_angles[event_index]),
+                    float(tank_total_pe[event_index]),
+                    int(tank_occupied_bins[event_index]),
+                ]
+            )
+
+    pdf_path = output.with_suffix(".ambiguity_diagnostics.pdf")
+    with PdfPages(
+        pdf_path,
+        metadata={
+            "Title": "ANNIE pion-ID ambiguity diagnostics",
+            "Subject": "Pion score separation sliced by truth and detector observables",
+        },
+    ) as pdf:
+        bins = np.linspace(0.0, 1.0, 41)
+        categories = [
+            ("No pion", ~(charged | neutral), "C0"),
+            ("Charged pion only", charged & ~neutral, "C1"),
+            ("π⁰ only", ~charged & neutral, "C2"),
+            ("Charged + π⁰", charged & neutral, "C3"),
+        ]
+        fig, axis = plt.subplots(figsize=(9, 6))
+        for label, mask, color in categories:
+            count = int(np.count_nonzero(mask))
+            if count:
+                axis.hist(
+                    test_scores[mask],
+                    bins=bins,
+                    histtype="step",
+                    linewidth=2,
+                    density=True,
+                    label=f"{label} (n={count})",
+                    color=color,
+                )
+        axis.axvspan(
+            AMBIGUOUS_SCORE_LOW,
+            AMBIGUOUS_SCORE_HIGH,
+            color="gray",
+            alpha=0.12,
+            label="ambiguous score band",
+        )
+        axis.set_xlabel("pion_score")
+        axis.set_ylabel("Normalized event density")
+        axis.set_title("Score separation by pion truth topology")
+        axis.legend()
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        fig, axis = plt.subplots(figsize=(9, 6))
+        multiplicity_categories = [
+            ("0 pions", multiplicity == 0),
+            ("1 pion", multiplicity == 1),
+            ("2 pions", multiplicity == 2),
+            ("3+ pions", multiplicity >= 3),
+        ]
+        for label, mask in multiplicity_categories:
+            count = int(np.count_nonzero(mask))
+            if count:
+                axis.hist(
+                    test_scores[mask],
+                    bins=bins,
+                    histtype="step",
+                    linewidth=2,
+                    density=True,
+                    label=f"{label} (n={count})",
+                )
+        axis.axvspan(
+            AMBIGUOUS_SCORE_LOW,
+            AMBIGUOUS_SCORE_HIGH,
+            color="gray",
+            alpha=0.12,
+        )
+        axis.set_xlabel("pion_score")
+        axis.set_ylabel("Normalized event density")
+        axis.set_title("Score separation by truth pion multiplicity")
+        axis.legend()
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        for title, x_label, values, base_mask, rows in variable_rows:
+            _plot_binned_ambiguity_page(
+                pdf,
+                title,
+                x_label,
+                values,
+                base_mask,
+                rows,
+                y_test,
+                test_scores,
+                threshold,
+            )
+
+        finite_kinematics = (
+            (y_test == 1)
+            & np.isfinite(truth_pion_kinetic_energy)
+            & np.isfinite(truth_muon_pion_angles)
+        )
+        fig, axis = plt.subplots(figsize=(9, 7))
+        if np.any(finite_kinematics):
+            points = axis.scatter(
+                truth_muon_pion_angles[finite_kinematics],
+                truth_pion_kinetic_energy[finite_kinematics],
+                c=test_scores[finite_kinematics],
+                cmap="viridis",
+                vmin=0.0,
+                vmax=1.0,
+                s=24,
+                alpha=0.65,
+                edgecolors="none",
+            )
+            fig.colorbar(points, ax=axis, label="pion_score")
+            axis.set_xlabel("Truth leading π–μ opening angle [degrees]")
+            axis.set_ylabel("Truth leading-pion kinetic energy [GeV]")
+            axis.set_title("Where true-pion events receive ambiguous scores")
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "No events had both finite pion kinetic energy and opening angle.",
+                transform=axis.transAxes,
+                ha="center",
+                va="center",
+            )
+            axis.axis("off")
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    category_counts = {
+        label: int(np.count_nonzero(mask)) for label, mask, _ in categories
+    }
+    return {
+        "ambiguity_diagnostics_pdf": pdf_path.name,
+        "ambiguity_binned_metrics_csv": binned_path.name,
+        "ambiguous_events_csv": ambiguous_path.name,
+        "ambiguous_score_definition": (
+            f"{AMBIGUOUS_SCORE_LOW:.2f} <= pion_score <= "
+            f"{AMBIGUOUS_SCORE_HIGH:.2f}"
+        ),
+        "ambiguous_event_count": int(np.count_nonzero(ambiguous)),
+        "ambiguous_event_fraction": float(np.mean(ambiguous)),
+        "ambiguity_truth_topology_counts": category_counts,
+    }
 
 
 def plot_calibration_curve(
@@ -2802,6 +3326,18 @@ def evaluate_and_plot(
         output,
         threshold,
     )
+    ambiguity_diagnostics = plot_ambiguity_diagnostics(
+        y_test,
+        test_scores,
+        detector_images_test,
+        source_paths_test,
+        entries_test,
+        truth_pion_counts_test,
+        truth_muon_pion_angles,
+        truth_pion_kinetic_energy,
+        output,
+        threshold,
+    )
     return {
         "test_predictions": predictions_path.name,
         "truth_muon_pion_opening_angle_source": truth_kinematics_source,
@@ -2903,6 +3439,7 @@ def evaluate_and_plot(
         ),
         "pion_example_pages": pion_example_pages,
         "pion_example_event_count": pion_example_event_count,
+        **ambiguity_diagnostics,
         "gradcam_examples": plot_gradcam_examples(
             model,
             images_test,
@@ -2994,6 +3531,11 @@ def write_training_summary(output: Path, summary: Dict[str, object]) -> Tuple[st
             (
                 f"Pion example events: {summary['pion_example_event_count']} "
                 f"({summary['pion_example_pdf']})"
+            ),
+            (
+                f"Ambiguous-score events: {summary['ambiguous_event_count']} "
+                f"({100.0 * summary['ambiguous_event_fraction']:.2f}%; "
+                f"{summary['ambiguity_diagnostics_pdf']})"
             ),
             (
                 "Best validation PR AUC: "
@@ -3268,6 +3810,12 @@ def main() -> None:
         ),
         "training_pmt_response": training_pmt_response,
         "image_branches": [args.hitpe_branch, tank_branch],
+        "image_channels": [
+            f"log1p_{args.hitpe_branch}",
+            f"log1p_{tank_branch}",
+            f"{args.hitpe_branch}_over_total_event_pe",
+            f"{tank_branch}_over_total_tankcluster_pe",
+        ],
         "scalar_features": PION_EVENT_FEATURE_NAMES,
         "mrd_track_start_branches": MRD_TRACK_START_BRANCHES,
         "mrd_track_property_branches": MRD_TRACK_PROPERTY_BRANCHES,
@@ -3305,6 +3853,13 @@ def main() -> None:
         "pion_example_pdf": evaluation_files["pion_example_pages"][0]
         if evaluation_files["pion_example_pages"]
         else None,
+        "ambiguous_event_count": int(evaluation_files["ambiguous_event_count"]),
+        "ambiguous_event_fraction": float(
+            evaluation_files["ambiguous_event_fraction"]
+        ),
+        "ambiguity_diagnostics_pdf": evaluation_files[
+            "ambiguity_diagnostics_pdf"
+        ],
         "test_keras_metrics": {
             name: float(value) for name, value in metrics.items()
         },
@@ -3325,7 +3880,9 @@ def main() -> None:
     )
     metadata = {
         "model_type": "annie_pion_ring_cnn",
-        "model_variant": "pion_only_full_and_tankcluster_images_plus_mrd",
+        "model_variant": (
+            "pion_only_absolute_and_event_normalized_pe_images_plus_mrd"
+        ),
         "tensorflow_version": tf.__version__,
         "training_sources": training_sources,
         "training_source_groups": response_info["groups"],
@@ -3363,10 +3920,18 @@ def main() -> None:
         "training_data_feeding": "indexed_batches_without_split_copies",
         "batch_size": args.batch_size,
         "root_chunk_size": args.chunk_size,
-        "image_channel_source": "full_event_and_tankcluster",
-        "image_channel_count": 2,
+        "image_channel_source": (
+            "full_event_and_tankcluster_absolute_and_event_normalized"
+        ),
+        "image_channel_count": 4,
+        "include_normalized_pe_channels": True,
         "head_image_channels": {
-            "pion_score": [args.hitpe_branch, tank_branch],
+            "pion_score": [
+                f"log1p_{args.hitpe_branch}",
+                f"log1p_{tank_branch}",
+                f"{args.hitpe_branch}_over_total_event_pe",
+                f"{tank_branch}_over_total_tankcluster_pe",
+            ],
         },
         "head_scalar_features": {
             "pion_score": ["numMRDTracks"],
@@ -3390,6 +3955,8 @@ def main() -> None:
                     else "log1p_hitPE_tankcluster"
                 )
             ),
+            "hitPE_over_total_event_PE",
+            "hitPE_tankcluster_over_total_tankcluster_PE",
         ],
         "projections": [
             "vertex_centered_equirectangular_with_azimuth_wrap",
@@ -3487,6 +4054,12 @@ def main() -> None:
     print(
         f"Probability calibration: Brier score="
         f"{evaluation_files['brier_score']:.5f} (lower is better)"
+    )
+    print(
+        "Ambiguous score band "
+        f"({evaluation_files['ambiguous_score_definition']}): "
+        f"{evaluation_files['ambiguous_event_count']} events, "
+        f"{evaluation_files['ambiguous_event_fraction']:.1%} of the test set"
     )
     print("Pion operating points (score >= threshold):")
     for name in (

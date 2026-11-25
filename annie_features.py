@@ -99,7 +99,7 @@ PION_ID_SELECTION_EXPRESSION = (
     "sel_CCInclusive_reco && Length$(MRDSide) > 0 && "
     "Length$(MRDStop) > 0 && Length$(MRDThrough) > 0 && !MRDSide[0] && "
     "MRDStop[0] && !MRDThrough[0] && ccinc_cnn_fv_score_valid && "
-    "ccinc_cnn_fv_score > 0.65"
+    "ccinc_cnn_fv_score > 0.85"
 )
 
 TANKCLUSTER_ALIASES = [
@@ -353,7 +353,7 @@ def build_pion_id_selection(arrays) -> np.ndarray:
         & np.isfinite(fv_score_valid)
         & (fv_score_valid == 1)
         & np.isfinite(fv_score)
-        & (fv_score > 0.65)
+        & (fv_score > 0.85)
     )
 
 

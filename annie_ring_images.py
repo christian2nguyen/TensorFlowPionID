@@ -267,6 +267,25 @@ def _accumulate_channel(
     return aligned
 
 
+def _finalize_pe_channels(
+    images: np.ndarray, include_normalized_pe_channels: bool
+) -> np.ndarray:
+    """Keep absolute log-PE and optionally append event-normalized PE channels."""
+    absolute_channels = np.log1p(images)
+    if not include_normalized_pe_channels:
+        return absolute_channels
+    totals = np.sum(images, axis=(1, 2), keepdims=True, dtype=np.float64)
+    normalized_channels = np.divide(
+        images,
+        totals,
+        out=np.zeros_like(images, dtype=np.float32),
+        where=totals > 0.0,
+    )
+    return np.concatenate(
+        [absolute_channels, normalized_channels], axis=-1
+    ).astype(np.float32, copy=False)
+
+
 def build_ring_images(
     arrays,
     geometry: PMTGeometry,
@@ -279,6 +298,7 @@ def build_ring_images(
     response: Optional[PMTResponse] = None,
     entry_numbers: Optional[np.ndarray] = None,
     tankcluster_only: bool = False,
+    include_normalized_pe_channels: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     vertices = np.column_stack([_numpy(arrays[name]) for name in VERTEX_BRANCHES])
     channel_count = 1 if tankcluster_only else 2
@@ -312,7 +332,7 @@ def build_ring_images(
         response_branch_kind=1,
     )
     valid = full_aligned & tank_aligned & np.isfinite(vertices).all(axis=1)
-    images = np.log1p(images)
+    images = _finalize_pe_channels(images, include_normalized_pe_channels)
     # Duplicate the periodic azimuth edge so the first convolution can see rings
     # crossing -pi/+pi as a connected pattern.
     images = np.pad(images, ((0, 0), (0, 0), (1, 1), (0, 0)), mode="wrap")
@@ -404,6 +424,7 @@ def build_unfolded_detector_images(
     response: Optional[PMTResponse] = None,
     entry_numbers: Optional[np.ndarray] = None,
     tankcluster_only: bool = False,
+    include_normalized_pe_channels: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build annotation-free PE rasters matching the C++ unfolded detector layout."""
     channel_count = 1 if tankcluster_only else 2
@@ -439,7 +460,10 @@ def build_unfolded_detector_images(
         entry_numbers,
         response_branch_kind=1,
     )
-    return np.log1p(images), full_aligned & tank_aligned
+    return (
+        _finalize_pe_channels(images, include_normalized_pe_channels),
+        full_aligned & tank_aligned,
+    )
 
 
 def iterate_ring_images(
@@ -464,6 +488,7 @@ def iterate_ring_images(
     include_numu_truth: bool = False,
     tankcluster_only: bool = False,
     ring_event_feature_names: Optional[List[str]] = None,
+    include_normalized_pe_channels: bool = False,
 ) -> Iterator[Dict[str, object]]:
     if isinstance(event_selection, bool):
         selection_mode = "fit_individual_pmt" if event_selection else "none"
@@ -536,6 +561,7 @@ def iterate_ring_images(
                     response,
                     tune_entry_numbers,
                     tankcluster_only=tankcluster_only,
+                    include_normalized_pe_channels=include_normalized_pe_channels,
                 )
                 detector_images, detector_aligned = build_unfolded_detector_images(
                     arrays,
@@ -549,6 +575,7 @@ def iterate_ring_images(
                     response,
                     tune_entry_numbers,
                     tankcluster_only=tankcluster_only,
+                    include_normalized_pe_channels=include_normalized_pe_channels,
                 )
                 aligned &= detector_aligned
                 selected = aligned.copy()

@@ -241,6 +241,9 @@ def main() -> None:
             ),
             tankcluster_only=tankcluster_only,
             ring_event_feature_names=event_feature_names,
+            include_normalized_pe_channels=bool(
+                metadata.get("include_normalized_pe_channels", False)
+            ),
         ):
             n_mrd_tracks_truncated += int(chunk["n_mrd_tracks_truncated"])
             images = chunk["images"]

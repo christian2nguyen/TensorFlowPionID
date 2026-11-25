@@ -206,7 +206,9 @@ information:
 4. A second image unfolds the physical detector into bottom endcap, barrel, and
    top endcap regions, following the geometry in
    `Draw_ANNIE_Single_Event_Detector_Image.cpp`.
-5. Full-event `hitPE` and tank-cluster `hitPE` form two channels in both views.
+5. Full-event `hitPE` and tank-cluster `hitPE` form four channels in both views:
+   absolute `log1p(PE)` for each source plus `PE / total event PE` and
+   `tank-cluster PE / total tank-cluster PE` topology channels.
 6. Two convolutional towers combine the ring-centered and detector-layout
    information with the MRD inputs before making one event-level `pion_score`.
 
@@ -351,6 +353,9 @@ Reducing `--batch-size` lowers TensorFlow activation memory, while reducing
 the selected events. A CUDA `cuInit` error followed by CPU training is normally
 informational on a node without a usable GPU; a final bare `Killed` message is
 the sign that the operating system terminated the process for memory use.
+The pion model now stores four image channels rather than two, so its image RAM
+is approximately doubled. Start with `--batch-size 32 --chunk-size "25 MB"` on
+the CPU worker and reduce the batch size to 16 if the process is still killed.
 
 ### Pion-only prediction
 
@@ -390,6 +395,9 @@ For `--output artifacts/annie_ring_pion.keras`, the main artifacts are:
 | `annie_ring_pion.mrd_branch_importance.csv` | Ranked MRD branch impacts and ROC-AUC/average-precision decreases |
 | `annie_ring_pion.misclassified_events.pdf` | Up to 20 annotated pion-head false positives and false negatives in one PDF |
 | `annie_ring_pion.pion_examples.pdf` | Up to 20 readable held-out truth-pion events, one event per page with all PMT and Grad-CAM panels |
+| `annie_ring_pion.ambiguity_diagnostics.pdf` | Score separation sliced by pion topology, multiplicity, kinetic energy, opening angle, tank-cluster PE, and image occupancy |
+| `annie_ring_pion.ambiguity_binned_metrics.csv` | Counts, ambiguous fractions, score means, efficiency/rejection, accuracy, and AUC in every diagnostic bin |
+| `annie_ring_pion.ambiguous_events.csv` | Events with `0.20 <= pion_score <= 0.80`, ordered from closest to 0.5 |
 | `annie_ring_pion.gradcam_examples.png` | Pion-head Grad-CAM examples for both image towers |
 
 The two training-summary files list every input ROOT file and its response mode,
@@ -537,8 +545,10 @@ in validation or testing, producing overly optimistic metrics. Use independent
 event samples in the two lists.
 
 This command is **Model C**, a hybrid pion-only classifier. `pion_score` uses
-both the full-event `hitPE` channel and the `hitPE_tankcluster` (or
-`hitPE_tankclusters`) channel in the angular and unfolded image views. The
+absolute and event-normalized versions of the full-event `hitPE` channel and
+the `hitPE_tankcluster` (or `hitPE_tankclusters`) channel in the angular and
+unfolded image views. The normalized channels preserve ring topology while the
+absolute channels retain total-light information. The
 scalar tensor contains only `numMRDTracks`. A second input preserves up to four
 exact start positions
 from `MRDTrackStartX`, `MRDTrackStartY`, and `MRDTrackStartZ`. A third input
@@ -556,7 +566,7 @@ through `numMRDTracks`, and the truncated-event count is saved in the model JSON
 metadata. `clusterChargeBalance_tankcluster_pmt_filtered` is neither a model
 input nor an event-selection cut.
 
-The MRD representation and both image channels feed the one pion head.
+The MRD representation and all four image channels feed the one pion head.
 `pion_score` is supervised only by the pion truth label. The only decision
 option is `--pion-threshold` (also accepted as `--threshold`). Scoring CSVs and
 the exported SavedModel contain only `pion_score`.
@@ -581,6 +591,14 @@ record specificity, balanced accuracy, ordinary accuracy, F1, and the Matthews
 correlation coefficient at each evaluated operating point. A Brier score
 provides a threshold-independent check of probability calibration.
 
+The ambiguity diagnostics define `0.20 <= pion_score <= 0.80` as the uncertain
+region and write one multipage PDF. Its pages compare charged-only, pi0-only,
+mixed-pion, and no-pion score distributions; pion multiplicity; leading-pion
+kinetic energy; muon-pion opening angle; tank-cluster total PE; occupied
+tank-cluster image bins; and the joint kinetic-energy/opening-angle plane. The
+companion binned CSV records the statistics behind each curve, while the event
+CSV identifies the exact source file and tree entry for every uncertain event.
+
 One multipage PDF contains up to 20 unique held-out truth-pion events for visual
 validation. It samples charged pions, the highest-scoring pions, events nearest
 the configured decision threshold, the lowest-scoring pions, and additional
@@ -602,7 +620,7 @@ sel_CCInclusive_reco
 && MRDStop[0]
 && !MRDThrough[0]
 && ccinc_cnn_fv_score_valid
-&& ccinc_cnn_fv_score > 0.65
+&& ccinc_cnn_fv_score > 0.85
 ```
 
 Use `--no-event-cuts` to disable this selection. The older spelling
